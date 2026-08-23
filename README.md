@@ -19,9 +19,5 @@ atr 注册：安装完成后自动复制脚本到 /etc/anytls-reality/ 并软链
 其他细节：修改 SNI/端口/密钥/用户后自动重新生成全部客户端配置并提示需同步；删除用户保留至少一个；实时日志 Ctrl+C 优雅返回菜单(SINGINT trap);配置全部用 jq 构建，密码含特殊字符不会破坏 JSON
 
 使用方法
-wget -P /root -N --no-check-certificate "https://github.com/chaos14sm/AnyTLS-Reality/raw/refs/heads/main/anytls-reality.sh"
-chmod 700 /root/anytls-reality.sh
-/root/anytls-reality.sh
-
 wget -P /root -N --no-check-certificate "https://github.com/chaos14sm/AnyTLS-Reality/raw/refs/heads/main/anytls-reality.sh" && chmod 700 /root/anytls-reality.sh && /root/anytls-reality.sh
 # 安装后任意位置输入 atr 打开管理菜单
