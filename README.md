@@ -22,4 +22,6 @@ atr 注册：安装完成后自动复制脚本到 /etc/anytls-reality/ 并软链
 wget -P /root -N --no-check-certificate "https://github.com/chaos14sm/AnyTLS-Reality/raw/refs/heads/main/anytls-reality.sh"
 chmod 700 /root/anytls-reality.sh
 /root/anytls-reality.sh
+
+wget -P /root -N --no-check-certificate "https://github.com/chaos14sm/AnyTLS-Reality/raw/refs/heads/main/anytls-reality.sh" && chmod 700 /root/anytls-reality.sh && /root/anytls-reality.sh
 # 安装后任意位置输入 atr 打开管理菜单
