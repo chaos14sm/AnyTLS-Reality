@@ -158,7 +158,7 @@ atr version | atr help
 | `mihomo-full.yaml` | mihomo / Clash.Meta 完整配置 |
 | `naive-client.json` | NaiveProxy 官方客户端配置（安装了 Naive 时） |
 
-Naive 说明：sing-box 官方发布的二进制不含 cronet，sing-box 客户端无法使用 naive 出站，所以 Naive 只提供 `naive+https://` 链接和 NaiveProxy 客户端 JSON，mihomo 也不支持 Naive。
+Naive 说明：sing-box 的 naive 出站需要 `libcronet.so` 与二进制放在同一目录（官方压缩包里带有；本脚本只安装单个二进制，服务端的 naive 入站不依赖它）。客户端是否带这个库因人而异，所以脚本对 Naive 只提供 `naive+https://` 链接和 NaiveProxy 官方客户端 JSON，不生成 sing-box 出站；mihomo 不支持 Naive。
 
 订阅：菜单 `7` → `2` 启用后（需要 nginx）可用一条链接导入全部节点；订阅令牌可重置，旧链接立即失效。
 
