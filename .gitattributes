@@ -1,0 +1,7 @@
+# 默认: 文本文件交给 git 自动规范化换行，避免无意义的 diff
+# （注意顺序: 同一属性后面的规则会覆盖前面的，所以通配规则放最前，具体规则放后面）
+* text=auto
+
+# Shell 脚本必须使用 LF 换行: Windows 上被 core.autocrlf 转成 CRLF 后，
+# bash 会报 "bad interpreter: /usr/bin/env: bash\r" 或 $'\r': command not found
+*.sh text eol=lf
