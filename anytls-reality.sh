@@ -18,7 +18,22 @@
 # =============================================================================
 export LANG=en_US.UTF-8
 
-ATR_VERSION="v1.2.2"
+# v1.2.3 安全修复：
+# - 旧 peer 布局清理不再把密钥作为外部命令参数；清理后 peer 文件由后续发布重建。
+# - 恢复或服务控制失败会阻止后续修改，保留未完成事务的恢复依据。
+# - 公网模式过滤全部 Xray DNS（包括 DNS 解锁），ForceIP 已迁移到 sockopt。
+# - 候选版本核对 draft/prerelease；升级还需通过互通检查，失败原子恢复旧内核。
+# 可选固定版本（仍核验正式发布属性和 SHA256）：
+#   ATR_XRAY_VERSION=v26.3.27 bash anytls-reality.sh
+#   ATR_SINGBOX_VERSION=v1.14.3 bash anytls-reality.sh
+# 不永久固定某个版本；GitHub 元数据不可核实时中止（核验需要能直连 api.github.com，不经过 GITHUB_PROXY）。
+# v1.2.4：
+# - 撤销收口改为按白名单重建发布目录：被撤销的令牌和旧版布局里的对等密钥不再出现在任何外部命令的参数里，
+#   仍有效的文件不会被先删掉；启动对账撤下旧版 peer 布局后，在同一把锁里立即按新布局重新发布。
+# - 换内核时的互通检查区分"握手失败"（自动恢复旧内核）和"无法自动验证"（保留新内核并列出，只确认了服务启动与端口监听）；
+#   安装验收同理。ATR_ALLOW_UNTESTED_CORE 取消。
+# - 有未完成的事务时 status / show / log 仍可使用；atr recover 重试恢复，atr recover --abandon 放弃恢复（备份保留）。
+ATR_VERSION="v1.2.4"
 ATR_PROJECT_NAME="anytls-reality"
 
 # ----------------------------- 路径与常量 -----------------------------------
@@ -190,7 +205,7 @@ isValidSecret() {
     local s=${1:-}
     [[ -n "${s}" && ${#s} -le 128 ]] && [[ "${s}" != *$'\n'* && "${s}" != *$'\r'* && "${s}" != *$'\t'* ]]
 }
-# 版本号: 只接受稳定版 vX.Y.Z / X.Y.Z / X.Y.Z.W，拒绝带 -alpha/-beta/-rc 的预发布
+# 版本 tag 的数字格式检查（不是发布属性检查）；正式稳定版还必须通过 verifyStableReleaseTag 核验 draft/prerelease。
 isStableVersion() { [[ "${1:-}" =~ ^v?[0-9]+(\.[0-9]+){1,3}$ ]]; }
 
 # ----------------------------- 随机数 ---------------------------------------
@@ -343,6 +358,17 @@ lockRelease() {
     flock -u 9 2>/dev/null
     exec 9>&-
     LOCK_DEPTH=0
+}
+
+# 事务标记: applyStaged 落盘期间存在，内容是本次备份目录；崩溃或回滚失败后保留，作为恢复依据
+TXN_MARK="${ATR_HOME}/.txn"
+# 获锁后检查：未完成的事务不能被新的配置、重启或发布覆盖。
+_requireCleanTransaction() {
+    if [[ -e "${TXN_MARK}" || -L "${TXN_MARK}" ]]; then
+        echoContent red " ---> 存在尚未恢复完成的事务: ${TXN_MARK}。已拒绝修改/重启/发布。排除问题后执行 ${ATR_CMD} recover 重试恢复，或 ${ATR_CMD} recover --abandon 放弃这次恢复（status / show / log 仍可使用）"
+        return 1
+    fi
+    return 0
 }
 
 # ----------------------------- 日志跟随 -------------------------------------
@@ -928,6 +954,15 @@ applyHomePerms() { # applyHomePerms <是否需要 nginx: 0|1>
 nginxModelCurrent() { grep -q "^user $(ngxWorkerUser);" "${NGX_CONF}" 2>/dev/null; }
 
 stateInit() {
+    local rc
+    lockAcquire || return 1
+    if ! _requireCleanTransaction; then lockRelease; return 1; fi
+    _stateInitLocked
+    rc=$?
+    lockRelease
+    return "${rc}"
+}
+_stateInitLocked() {
     mkdir -p "${ATR_HOME}" "${TLS_DIR}" "${CLIENT_DIR}" "${BACKUP_DIR}" "${SB_DIR}/conf" "${XRAY_DIR}/conf" "${WEB_ROOT}" "${SUB_DIR}"
     chmod 700 "${TLS_DIR}" "${CLIENT_DIR}" "${BACKUP_DIR}" 2>/dev/null
     chmod 755 "${WEB_ROOT}" 2>/dev/null
@@ -1148,36 +1183,64 @@ askManualVersion() { # askManualVersion <core>
     return 1
 }
 
-# 解析某核心的最新稳定版 tag；成功时打印 tag，来源用 lastResolveSource 读取
-resolveLatestVersion() { # resolveLatestVersion <core>
-    local core=$1 repo tag="" eff=""
-    repo=$(coreRepo "${core}")
+# 数字格式不是 stable 属性；所有候选都必须核对 GitHub 正式发布元数据。
+_stableTagFromRelease() {
+    local tag
+    tag=$(jq -er 'select(type=="object" and .draft==false and .prerelease==false) | .tag_name | select(type=="string")') || return 1
+    isStableVersion "${tag}" || return 1
+    printf 'v%s\n' "${tag#v}"
+}
+verifyStableReleaseTag() { # <core> <tag>
+    local core=$1 tag=$2 got
+    isStableVersion "${tag}" || return 1
+    tag="v${tag#v}"
+    got=$(curl -fsSL -m 15 -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$(coreRepo "${core}")/releases/tags/${tag}" 2>/dev/null | _stableTagFromRelease) || return 1
+    [[ "${got}" == "${tag}" ]]
+}
+coreRequestedVersion() {
+    case "$1" in
+    sing-box) printf '%s' "${ATR_SINGBOX_VERSION:-}" ;;
+    xray) printf '%s' "${ATR_XRAY_VERSION:-}" ;;
+    *) return 1 ;;
+    esac
+}
 
-    # 1) GitHub releases/latest API（该接口本身不返回预发布版；仍用正则二次过滤 beta/rc）
+# 解析最新正式稳定版；显式固定版本也要验证发布属性及下载摘要。
+resolveLatestVersion() { # resolveLatestVersion <core>
+    local core=$1 repo tag="" eff="" pinned
+    repo=$(coreRepo "${core}")
+    pinned=$(coreRequestedVersion "${core}") || return 1
+    if [[ -n "${pinned}" ]]; then
+        if verifyStableReleaseTag "${core}" "${pinned}"; then
+            _setResolveSource "管理员固定版本"
+            printf 'v%s\n' "${pinned#v}"
+            return 0
+        fi
+        echoContent red " ---> 固定版本格式无效、不是正式稳定发布，或无法核实元数据: ${pinned}" >&2
+        return 1
+    fi
     tag=$(curl -fsSL -m 15 -H 'Accept: application/vnd.github+json' \
-        "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
-    if isStableVersion "${tag}"; then
-        _setResolveSource "GitHub API"
-        echo "v${tag#v}"
+        "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | _stableTagFromRelease)
+    if [[ -n "${tag}" ]]; then
+        _setResolveSource "GitHub API（正式稳定发布）"
+        printf '%s\n' "${tag}"
         return 0
     fi
-    [[ -n "${tag}" ]] && atrLog "releases/latest returned non-stable tag '${tag}' for ${repo}, falling back"
-
-    # 2) 重定向探测: github.com/<repo>/releases/latest -> .../releases/tag/<tag>
+    # 网页 latest 可能指向没有 beta/rc 后缀的 Pre-release，必须再查该 tag 的正式发布属性。
     eff=$(curl -fsSIL -m 15 -o /dev/null -w '%{url_effective}' "$(ghURL "https://github.com/${repo}/releases/latest")" 2>/dev/null)
     tag=${eff##*/}
-    if [[ "${eff}" == *"/releases/tag/"* ]] && isStableVersion "${tag}"; then
-        _setResolveSource "重定向探测"
-        echo "v${tag#v}"
+    if [[ "${eff}" == *"/releases/tag/"* ]] && verifyStableReleaseTag "${core}" "${tag}"; then
+        _setResolveSource "重定向探测 + 正式发布核验"
+        printf 'v%s\n' "${tag#v}"
         return 0
     fi
-
-    # 3) 手动输入
-    if tag=$(askManualVersion "${core}"); then
-        _setResolveSource "手动输入"
-        echo "${tag}"
+    if tag=$(askManualVersion "${core}") && verifyStableReleaseTag "${core}" "${tag}"; then
+        _setResolveSource "手动指定 + 正式发布核验"
+        printf '%s\n' "${tag}"
         return 0
     fi
+    echoContent red " ---> 无法核实正式稳定发布，已中止。核验需要能直连 api.github.com（不经过 GITHUB_PROXY，纯 IPv6 或被限流的机器会失败）；请稍后重试，或用 ATR_XRAY_VERSION / ATR_SINGBOX_VERSION 指定版本（同样需要核验）" >&2
     return 1
 }
 
@@ -1233,7 +1296,22 @@ fetchExpectedSha256() { # fetchExpectedSha256 <core> <tag> <资产名>
 # ----------------------------- 安装二进制 ------------------------------------
 # installCoreBinary <core> <tag>  —— 下载、校验、验证可运行后原子替换；旧版本保留为 .prev
 installCoreBinary() {
+    local rc
+    lockAcquire || return 1
+    if ! _requireCleanTransaction; then lockRelease; return 1; fi
+    _installCoreBinaryLocked "$@"
+    rc=$?
+    lockRelease
+    return "${rc}"
+}
+_installCoreBinaryLocked() {
     local core=$1 tag=$2 ver=${2#v} work url asset newbin dest expected actual
+    _requireCleanTransaction || return 1
+    if ! verifyStableReleaseTag "${core}" "${tag}"; then
+        echoContent red " ---> 无法确认 ${tag} 是正式稳定发布，已拒绝下载/执行（核验需要能直连 api.github.com）"
+        return 1
+    fi
+    tag="v${tag#v}"
     work=$(mktemp -d "${ATR_TMP:-/tmp}/core.XXXXXX") || return 1
     dest=$(coreBin "${core}")
     mkdir -p "$(dirname "${dest}")"
@@ -1253,8 +1331,9 @@ installCoreBinary() {
             echoContent red " ---> 警告: 未能取得官方校验值，按 ATR_ALLOW_UNVERIFIED=1 的要求跳过校验，下载内容的完整性与来源无法保证！"
         else
             echoContent red " ---> 未能取得官方 SHA256 校验值，已中止安装（不会运行未经校验的程序）"
-            echoContent yellow "      常见原因: GitHub API 限流或网络受限，请稍后重试。"
-            echoContent yellow "      也可以先从可信渠道核对该文件的 SHA256，再用 ATR_EXPECTED_SHA256=<64位十六进制> 重新运行。"
+            echoContent yellow "      常见原因: GitHub API 限流，或 API 返回的数据里没有这个文件的摘要，请稍后重试。"
+            echoContent yellow "      也可以先从可信渠道核对该文件的 SHA256，再用 ATR_EXPECTED_SHA256=<64位十六进制> 重新运行"
+            echoContent yellow "      （它只补充摘要，不能代替正式发布核验：仍然需要能直连 api.github.com）。"
             rm -rf "${work}"
             return 1
         fi
@@ -1299,8 +1378,17 @@ installCoreBinary() {
         return 1
     fi
 
-    [[ -f "${dest}" ]] && cp -f "${dest}" "${dest}.prev"
-    cp -f "${newbin}" "${dest}.new" && chmod 755 "${dest}.new" && mv -f "${dest}.new" "${dest}"
+    if [[ -f "${dest}" ]] && ! cp -p "${dest}" "${dest}.prev"; then
+        echoContent red " ---> 无法备份旧内核，已中止替换"
+        rm -rf "${work}"
+        return 1
+    fi
+    if ! { cp -f "${newbin}" "${dest}.new" && chmod 755 "${dest}.new" && mv -f "${dest}.new" "${dest}"; }; then
+        echoContent red " ---> 无法替换内核文件，未报告安装成功"
+        rm -f "${dest}.new"
+        rm -rf "${work}"
+        return 1
+    fi
     rm -rf "${work}"
     atrLog "installed ${core} ${tag}"
     echoContent green " ---> $(coreLabel "${core}") 安装完成: $(coreVersion "${core}")"
@@ -1347,44 +1435,123 @@ coreCheckConfig() { # coreCheckConfig <core> [配置文件]
 }
 
 # upgradeCore <core> [指定版本]  —— 升级(或回退)并在失败时恢复旧二进制
-upgradeCore() {
-    local core=$1 want=${2:-} tag cur
-    cur=$(coreVersion "${core}")
-    if [[ -n "${want}" ]]; then
-        tag=${want}
-    else
-        tag=$(resolveLatestVersion "${core}") || {
-            echoContent red " ---> 无法确定最新稳定版本"
-            return 1
-        }
-        echoContent green " ---> 当前版本: ${cur:-未安装}   最新稳定版: ${tag}（来源: $(lastResolveSource)）"
-        if [[ -n "${cur}" && "v${cur}" == "${tag}" ]]; then
-            confirm "当前已是最新稳定版，是否仍要重新安装？" n || return 0
-        else
-            confirm "是否升级到 ${tag}？" y || return 0
-        fi
+# 回退同样采用原子替换，避免向仍在运行的可执行文件直接 cp。
+_restorePreviousCore() {
+    local bin
+    bin=$(coreBin "$1")
+    [[ -f "${bin}.prev" ]] || { echoContent red " ---> 没有旧内核备份可恢复"; return 1; }
+    atomicWrite "${bin}" 755 <"${bin}.prev" && cmp -s "${bin}.prev" "${bin}"
+}
+# 换内核后的互通检查: 用本机 sing-box 作客户端，对该核心承载的协议逐个做回环握手（selfCheckProtocol）。
+# 返回 1 = 至少一个协议握手失败，调用方恢复旧内核。无法自动验证的协议（本机没有 sing-box，或 sing-box 客户端
+# 不支持该协议: Naive、VLESS+Reality+XHTTP、VLESS+XHTTP+TLS）不算失败，只列出来——它们只确认了服务启动与端口监听。
+# 注意: 升级 sing-box 时客户端就是新的 sing-box 本身，只能证明自洽，不能证明旧版客户端 / mihomo / Xray 客户端仍然兼容。
+_checkCoreInterop() {
+    local core=$1 id user rc ids fail=0 unverified=()
+    stateExists || return 1
+    ids=$(installedProtocolsOfCore "${core}") || return 1
+    [[ -n "${ids}" ]] || return 0
+    user=$(userNames | head -n 1)
+    [[ -n "${user}" ]] || return 1
+    while IFS= read -r id; do
+        [[ -n "${id}" ]] || continue
+        rc=0
+        selfCheckProtocol "${id}" "${user}" || rc=$?
+        case "${rc}" in
+        0) ;;
+        2) unverified+=("$(protoName "${id}")") ;;
+        *) fail=1 ;;
+        esac
+    done <<<"${ids}"
+    ((fail == 0)) || return 1
+    if ((${#unverified[@]})); then
+        echoContent yellow " ---> 未自动验证（只确认了服务启动与端口监听，请用实际客户端确认）: ${unverified[*]}"
     fi
+    return 0
+}
+# 该核心承载、但无法用本机 sing-box 自动验证的协议名（判断条件与 selfCheckProtocol 的跳过条件相同）
+coreUncheckableNames() { # coreUncheckableNames <core>
+    local id user names=()
+    stateExists || return 0
+    user=$(userNames | head -n 1)
+    while IFS= read -r id; do
+        [[ -n "${id}" ]] || continue
+        selfCheckSupported "${id}" "${user}" || names+=("$(protoName "${id}")")
+    done < <(installedProtocolsOfCore "$1")
+    ((${#names[@]} == 0)) || printf '%s\n' "${names[*]}"
+}
+# 换内核之前说明哪些协议不能自动验证（在拿锁之前、确认之前调用）
+noteUncheckableProtocols() { # noteUncheckableProtocols <core>
+    local names
+    names=$(coreUncheckableNames "$1")
+    [[ -n "${names}" ]] || return 0
+    echoContent yellow " ---> 以下协议无法用本机 sing-box 自动做互通验证，换内核后只能确认服务启动与端口监听: ${names}"
+    echoContent yellow "      其余协议握手失败会自动恢复旧内核；上面这些请换内核后用实际客户端确认"
+}
+_upgradeCoreLocked() {
+    local core=$1 want=${2:-} tag conf out reason="" wasActive=0 triedRestart=0
+    serviceActive "$(coreUnit "${core}")" && wasActive=1
+    # 版本的解析与确认都在 upgradeCore 里、拿锁之前完成（锁内不提示）
+    if [[ -z "${want}" ]]; then
+        echoContent red " ---> 内部错误: 未指定内核版本"
+        return 1
+    fi
+    tag=${want}
     installCoreBinary "${core}" "${tag}" || return 1
-
-    local conf out
     conf=$(coreConf "${core}")
     if [[ -f "${conf}" ]]; then
         if ! out=$(coreCheckConfig "${core}"); then
-            echoContent red " ---> 新版本无法加载现有配置，已恢复旧版本"
-            echoContent yellow "${out}"
-            [[ -f "$(coreBin "${core}").prev" ]] && cp -f "$(coreBin "${core}").prev" "$(coreBin "${core}")"
-            return 1
-        fi
-        if serviceActive "$(coreUnit "${core}")" || [[ -f "${ATR_SYSTEMD_DIR}/$(coreUnit "${core}").service" ]]; then
-            restartCoreChecked "${core}" || {
-                echoContent red " ---> 新版本启动失败，恢复旧版本"
-                [[ -f "$(coreBin "${core}").prev" ]] && cp -f "$(coreBin "${core}").prev" "$(coreBin "${core}")"
-                restartCoreChecked "${core}" >/dev/null 2>&1
-                return 1
-            }
+            reason="新版本无法加载现有配置"
+            printf '%s\n' "${out}"
+        elif serviceActive "$(coreUnit "${core}")" || [[ -f "${ATR_SYSTEMD_DIR}/$(coreUnit "${core}").service" ]]; then
+            triedRestart=1
+            if ! restartCoreChecked "${core}"; then
+                reason="新版本未能正常启动"
+            elif ! _checkCoreInterop "${core}"; then
+                reason="新版本互通检查未通过"
+            fi
         fi
     fi
+    if [[ -n "${reason}" ]]; then
+        echoContent red " ---> ${reason}，正在恢复旧内核"
+        if ! _restorePreviousCore "${core}"; then
+            echoContent red " ---> 恢复旧内核失败，请立即检查内核文件和服务；未报告升级成功"
+            return 1
+        fi
+        if ((wasActive || triedRestart)) && ! restartCoreChecked "${core}"; then
+            echoContent red " ---> 已恢复旧内核文件，但旧服务未恢复正常"
+        else
+            echoContent yellow " ---> 已恢复旧内核；本次升级失败，兼容性仍需核实"
+        fi
+        return 1
+    fi
     echoContent green " ---> $(coreLabel "${core}") 已更新到 $(coreVersion "${core}")"
+}
+
+upgradeCore() {
+    local core=$1 want=${2:-} rc cur
+    # 网络探测和人工确认不持有事务锁；选定候选后才锁定，锁内重新读取当前配置和版本。
+    # 指定了版本（rollbackCore）时，说明与确认由调用方完成
+    if [[ -z "${want}" ]]; then
+        want=$(resolveLatestVersion "${core}") || return 1
+        cur=$(coreVersion "${core}")
+        echoContent green " ---> 当前版本: ${cur:-未安装}   候选稳定版: ${want}（来源: $(lastResolveSource)）"
+        noteUncheckableProtocols "${core}"
+        if [[ -n "${cur}" && "v${cur#v}" == "${want}" ]]; then
+            confirm "当前版本与候选相同，是否重新安装？" n || return 0
+        else
+            confirm "是否安装 ${want}（可自动验证的协议握手失败时恢复旧内核）？" y || return 0
+        fi
+    fi
+    lockAcquire || return 1
+    if ! _requireCleanTransaction; then
+        lockRelease
+        return 1
+    fi
+    _upgradeCoreLocked "${core}" "${want}"
+    rc=$?
+    lockRelease
+    return "${rc}"
 }
 
 # 回退到历史稳定版: 列出最近稳定版供选择，列表取不到则手动输入
@@ -1413,6 +1580,7 @@ rollbackCore() {
         echoContent red " ---> 输入有误"
         return 1
     fi
+    noteUncheckableProtocols "${core}"
     confirm "回退版本为 ${chosen}，是否继续？" n || return 0
     upgradeCore "${core}" "${chosen}"
 }
@@ -2289,7 +2457,8 @@ read -r -d '' JQ_XRAY <<'EOF'
   # 2) 直连出站改用 ForceIP: 解析失败就直接失败，绝不退回去按域名拨号（退回去就是交给系统解析器再解析一次，等于绕过了过滤）。
   def xpublic: ($S.egress.mode // "") == "public";
   def egress_xip: (egress_cidrs - ["::ffff:0:0/96"]) + ($S.egress.local_ips // []);
-  def xdns($a): if xpublic then {address: $a, unexpectedIPs: egress_xip} else $a end;
+  def xdns($a): ($a | if type == "object" then . else {address: .} end)
+      | if xpublic then . + {unexpectedIPs: ((.unexpectedIPs // []) + egress_xip | unique)} else . end;
   def egress_x: if xpublic then
       ([ ($S.extra_ports // [])[] | "dokodemo-door-newPort-" + tostring ]) as $dk
       | (if ($dk | length) > 0 and ($PR.vless_vision_tls.core // "") == "xray" then [{type: "field", inboundTag: $dk, outboundTag: "direct"}] else [] end)
@@ -2370,7 +2539,7 @@ read -r -d '' JQ_XRAY <<'EOF'
       log: {loglevel: (if $debug == "1" then "debug" else "warning" end)},
       policy: {levels: {"0": {handshake: 4, connIdle: 300}}},
       dns: (if (($R.dns_unlock.server // "") != "" and ((($R.dns_unlock.domains // []) | length) > 0)) then
-              {servers: [{address: $R.dns_unlock.server, port: 53, domains: xdomains($R.dns_unlock.domains)}, xdns("localhost")]}
+              {servers: [xdns({address: $R.dns_unlock.server, port: 53, domains: xdomains($R.dns_unlock.domains)}), xdns("localhost")]}
             elif (($R.sni_proxy.ip // "") != "" and ((($R.sni_proxy.domains // []) | length) > 0)) then
               {hosts: (reduce xdomains($R.sni_proxy.domains)[] as $d ({}; .[$d] = $R.sni_proxy.ip)), servers: [xdns("8.8.8.8"), xdns("1.1.1.1")]}
             else {servers: [xdns("localhost")]} end),
@@ -2379,16 +2548,16 @@ read -r -d '' JQ_XRAY <<'EOF'
                       peers: [{publicKey: $W.public_key, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: "162.159.192.1:2408"}], reserved: $W.reserved, mtu: 1280}}]
                    elif $G == "warp_v6" and $haveWarp then [{protocol: "wireguard", tag: "warp_v6", settings: {secretKey: $W.private_key, address: [($W.address_v6 + "/128")],
                       peers: [{publicKey: $W.public_key, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: "162.159.192.1:2408"}], reserved: $W.reserved, mtu: 1280}}]
-                   elif $G == "ipv6" then [{protocol: "freedom", tag: "IPv6_out", settings: {domainStrategy: "ForceIPv6"}}]
+                   elif $G == "ipv6" then [{protocol: "freedom", tag: "IPv6_out", streamSettings: {sockopt: {domainStrategy: "ForceIPv6"}}}]
                    elif $G == "socks5" and $useS5 then [{protocol: "socks", tag: "socks5_outbound", settings: {servers: [{address: $R.socks5_out.server, port: $R.socks5_out.port,
                       users: [{user: ($R.socks5_out.user // ""), pass: ($R.socks5_out.pass // "")}]}]}}]
                    else [] end)
-                  + [{protocol: "freedom", tag: "direct", settings: {domainStrategy: (if xpublic then "ForceIP" else "UseIP" end)}}, {protocol: "blackhole", tag: "block"}]
+                  + [{protocol: "freedom", tag: "direct", streamSettings: {sockopt: {domainStrategy: (if xpublic then "ForceIP" else "UseIP" end)}}}, {protocol: "blackhole", tag: "block"}]
                   + (if ($haveWarp and $useW4 and $G != "warp_v4") then [{protocol: "wireguard", tag: "warp_v4", settings: {secretKey: $W.private_key, address: ["172.16.0.2/32"],
                       peers: [{publicKey: $W.public_key, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: "162.159.192.1:2408"}], reserved: $W.reserved, mtu: 1280}}] else [] end)
                   + (if ($haveWarp and $useW6 and $G != "warp_v6") then [{protocol: "wireguard", tag: "warp_v6", settings: {secretKey: $W.private_key, address: [($W.address_v6 + "/128")],
                       peers: [{publicKey: $W.public_key, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: "162.159.192.1:2408"}], reserved: $W.reserved, mtu: 1280}}] else [] end)
-                  + (if ($useV6 and $G != "ipv6") then [{protocol: "freedom", tag: "IPv6_out", settings: {domainStrategy: "ForceIPv6"}}] else [] end)
+                  + (if ($useV6 and $G != "ipv6") then [{protocol: "freedom", tag: "IPv6_out", streamSettings: {sockopt: {domainStrategy: "ForceIPv6"}}}] else [] end)
                   + (if ($useS5 and $G != "socks5") then [{protocol: "socks", tag: "socks5_outbound", settings: {servers: [{address: $R.socks5_out.server, port: $R.socks5_out.port,
                       users: [{user: ($R.socks5_out.user // ""), pass: ($R.socks5_out.pass // "")}]}]}}] else [] end)),
       routing: {
@@ -2690,16 +2859,24 @@ installFakeSite() {
 UNIT_REWRITTEN=0
 _writeUnitFile() { # _writeUnitFile <单元名> (内容来自 stdin)
     local name=$1 f="${ATR_SYSTEMD_DIR}/$1.service" tmp
-    mkdir -p "${ATR_SYSTEMD_DIR}"
+    mkdir -p "${ATR_SYSTEMD_DIR}" || return 1
     tmp=$(mktemp "${ATR_TMP:-/tmp}/unit.XXXXXX") || return 1
-    cat >"${tmp}"
+    if ! cat >"${tmp}"; then rm -f "${tmp}"; return 1; fi
     if [[ -f "${f}" ]] && cmp -s "${tmp}" "${f}"; then
         rm -f "${tmp}"
         return 0
     fi
-    install -m 644 "${tmp}" "${f}" && rm -f "${tmp}"
-    UNIT_REWRITTEN=1 # 单元内容变了（例如升级脚本）：正在运行的进程还带着旧的沙箱，调用方必须重启它
-    systemctl daemon-reload >/dev/null 2>&1
+    if ! { atomicWrite "${f}" 644 <"${tmp}" && cmp -s "${tmp}" "${f}"; }; then
+        rm -f "${tmp}"
+        echoContent red " ---> 无法写入 systemd 单元: ${f}"
+        return 1
+    fi
+    rm -f "${tmp}"
+    UNIT_REWRITTEN=1
+    systemctl daemon-reload >/dev/null 2>&1 || {
+        echoContent red " ---> systemd daemon-reload 失败"
+        return 1
+    }
 }
 
 writeUnit() { # writeUnit <sing-box|xray|nginx>
@@ -2807,7 +2984,7 @@ EOF
 #   从根本上避免"客户端公钥与服务端私钥不匹配"。
 # =============================================================================
 
-TXN_MARK="${ATR_HOME}/.txn"
+# TXN_MARK 与 _requireCleanTransaction 定义在 01-util（03 / 04 段已经要用到它们）
 
 # ----------------------------- 服务控制 --------------------------------------
 serviceActive() { systemctl is-active --quiet "$1" >/dev/null 2>&1; }
@@ -3015,7 +3192,7 @@ restoreFromBackup() { # restoreFromBackup <备份目录>  —— 任何一个文
             fi
         fi
     done <"${bdir}/manifest"
-    systemctl daemon-reload >/dev/null 2>&1
+    systemctl daemon-reload >/dev/null 2>&1 || rc=1
     return "${rc}"
 }
 
@@ -3027,7 +3204,7 @@ _commitFile() { # _commitFile <源> <目标> <模式>
 # 删除并确认确实没了
 _removeLive() { # _removeLive <目标>
     rm -f -- "$1"
-    [[ ! -e "$1" ]]
+    [[ ! -e "$1" && ! -L "$1" ]]
 }
 # 把候选配置落到 live 位置（先配置，后 state）。每一步都检查，任何一步失败返回 1，由调用方回滚
 _commitLive() { # _commitLive <stage 目录> <候选 state 文件>
@@ -3075,24 +3252,67 @@ pruneBackups() { # 只保留最近 10 份（目录名是时间戳，glob 展开�
 
 # 若上次事务在落盘途中被中断（.txn 仍存在），自动从备份恢复
 recoverIfNeeded() {
-    [[ -f "${TXN_MARK}" ]] || return 0
-    local bdir
-    # 标记文件是另一个进程在事务中途写的，也可能正是它还在运行。先拿锁（等它结束），再重新确认标记是否还在，
-    # 否则会把别人进行中的事务"恢复"掉。拿不到锁就什么都不动。
-    lockAcquire || return 0
-    if [[ -f "${TXN_MARK}" ]]; then
-        bdir=$(cat "${TXN_MARK}")
+    [[ -e "${TXN_MARK}" || -L "${TXN_MARK}" ]] || return 0
+    local bdir rc=0
+    lockAcquire || return 1
+    if [[ -e "${TXN_MARK}" || -L "${TXN_MARK}" ]]; then
+        bdir=$(cat "${TXN_MARK}" 2>/dev/null) || rc=1
         echoContent yellow "\n ---> 检测到上次操作未完成，正在从备份恢复: ${bdir}"
-        if [[ -d "${bdir}" ]] && restoreFromBackup "${bdir}"; then
-            rm -f "${TXN_MARK}"
-            applyServices "${ATR_STATE}" >/dev/null 2>&1
-            atrLog "recovered interrupted transaction from ${bdir}"
-            echoContent green " ---> 已恢复到上次可用配置"
+        if ((rc == 0)) && [[ -d "${bdir}" ]] && restoreFromBackup "${bdir}"; then
+            SB_CHANGED=1
+            X_CHANGED=1
+            if ! applyServices "${ATR_STATE}" force || ! verifyRuntime "${ATR_STATE}"; then
+                echoContent red " ---> 文件已恢复，但服务没有恢复正常；事务标记和备份仍保留"
+                rc=1
+            elif ! _removeLive "${TXN_MARK}"; then
+                echoContent red " ---> 恢复后无法清除事务标记，已停止后续操作"
+                rc=1
+            else
+                atrLog "recovered interrupted transaction from ${bdir}"
+                echoContent green " ---> 已恢复到上次可用配置"
+            fi
         else
-            echoContent red " ---> 自动恢复失败，请手动检查 ${ATR_HOME}（备份目录: ${bdir}）"
+            echoContent red " ---> 自动恢复失败，事务标记和备份仍保留；请检查 ${ATR_HOME}（备份目录: ${bdir}）"
+            rc=1
         fi
     fi
     lockRelease
+    return "${rc}"
+}
+
+# 放弃未完成的事务（atr recover --abandon）: 不再自动恢复，事务标记改名归档，备份目录原样保留。
+# 之后以磁盘上现有的配置为准——它可能是变更前、变更后或恢复到一半的状态，所以必须由管理员确认
+abandonTransaction() {
+    local bdir arch
+    if [[ ! -e "${TXN_MARK}" && ! -L "${TXN_MARK}" ]]; then
+        echoContent green " ---> 没有未完成的事务"
+        return 0
+    fi
+    bdir=$(cat "${TXN_MARK}" 2>/dev/null)
+    echoContent yellow "\n ---> 未完成的事务，备份目录: ${bdir:-<标记无法读取>}"
+    echoContent yellow "      放弃后不再自动恢复，之后以磁盘上现有的配置为准（可能是变更前、变更后或恢复到一半的状态）。"
+    echoContent yellow "      备份目录不会因此删除（之后的修改只保留最近 10 份备份），需要时可以手动对照。"
+    confirm "确认放弃这次恢复？" n || return 0
+    lockAcquire || return 1
+    # 确认期间没有持锁: 重新确认标记还在、而且还是刚才那一份
+    if [[ ! -e "${TXN_MARK}" && ! -L "${TXN_MARK}" ]] || [[ "$(cat "${TXN_MARK}" 2>/dev/null)" != "${bdir}" ]]; then
+        lockRelease
+        echoContent yellow " ---> 事务标记在确认期间发生了变化（可能已被另一个操作处理），没有做任何改动，请重新查看"
+        return 1
+    fi
+    arch="${ATR_HOME}/.txn.abandoned.$(date +%Y%m%d-%H%M%S)"
+    if ! mv -f -- "${TXN_MARK}" "${arch}" || [[ -e "${TXN_MARK}" || -L "${TXN_MARK}" ]]; then
+        lockRelease
+        echoContent red " ---> 无法移走事务标记 ${TXN_MARK}"
+        return 1
+    fi
+    atrLog "transaction ABANDONED by the administrator: marker archived as ${arch}, backup=${bdir}"
+    lockRelease
+    echoContent green " ---> 已放弃恢复，事务标记已归档为 ${arch}"
+    if [[ -e "${ATR_STATE}" ]] && ! jq -e . "${ATR_STATE}" >/dev/null 2>&1; then
+        echoContent red " ---> 注意: ${ATR_STATE} 不是合法的 JSON，需要先从备份目录手动恢复它"
+    fi
+    echoContent yellow "      建议先执行 ${ATR_CMD} status 检查，再执行 ${ATR_CMD} restart 按当前配置重新应用全部服务"
 }
 
 # ----------------------------- 资源准备 / 校验 --------------------------------
@@ -3191,10 +3411,14 @@ activateNginx() { # activateNginx <state.json>
         return 1
     fi
     selinuxAllowNginxPorts "${st}"
-    writeNginxMainConf
-    writeUnit nginx
-    serviceEnable "${NGX_UNIT}"
-    systemctl restart "${NGX_UNIT}" >/dev/null 2>&1
+    writeNginxMainConf || return 1
+    writeUnit nginx || return 1
+    serviceEnable "${NGX_UNIT}" || return 1
+    systemctl restart "${NGX_UNIT}" >/dev/null 2>&1 || {
+        echoContent red " ---> 重启服务失败: ${NGX_UNIT}（未能启动），最近日志:"
+        serviceLogTail "${NGX_UNIT}" 8
+        return 1
+    }
 }
 
 # 把已安装的 nginx 迁移到"专用账号 + 受限权限"模型（旧版安装升级用）并确认它起来了。失败返回 1，
@@ -3211,45 +3435,66 @@ migrateNginxModel() {
 }
 
 # ----------------------------- 服务应用 / 验证 --------------------------------
+# 停止并确认停止；未安装的单元不必 disable。
+_stopManagedService() {
+    local unit=$1
+    if serviceActive "${unit}"; then
+        serviceStop "${unit}" || {
+            echoContent red " ---> 停止服务失败: ${unit}"
+            return 1
+        }
+    fi
+    if serviceActive "${unit}"; then
+        echoContent red " ---> 服务仍在运行，应当停止: ${unit}"
+        return 1
+    fi
+    if [[ -f "${ATR_SYSTEMD_DIR}/${unit}.service" ]]; then
+        serviceDisable "${unit}" || return 1
+    fi
+    return 0
+}
+
 # 按 state 启停各服务；某核心无协议则停止并禁用
 applyServices() { # applyServices <state.json> [force]
-    local st=$1 force=${2:-}
-    local needNgx=0 needSB=0 needX=0
+    local st=$1 force=${2:-} needNgx=0 needSB=0 needX=0
     stateNeedsNginx "${st}" && needNgx=1
     stateNeedsCore "${st}" sing-box && needSB=1
     stateNeedsCore "${st}" xray && needX=1
-
     if ((needNgx)); then
         activateNginx "${st}" || return 1
     else
-        serviceActive "${NGX_UNIT}" && serviceStop "${NGX_UNIT}"
-        serviceDisable "${NGX_UNIT}"
-        applyHomePerms 0
+        _stopManagedService "${NGX_UNIT}" || return 1
+        applyHomePerms 0 || return 1
     fi
     if ((needSB)); then
         UNIT_REWRITTEN=0
-        writeUnit sing-box
-        serviceEnable "${SB_UNIT}"
+        writeUnit sing-box || return 1
+        serviceEnable "${SB_UNIT}" || return 1
         if [[ -n "${force}" || "${SB_CHANGED:-1}" == "1" || "${UNIT_REWRITTEN}" == "1" ]] || ! serviceActive "${SB_UNIT}"; then
-            systemctl restart "${SB_UNIT}" >/dev/null 2>&1
+            systemctl restart "${SB_UNIT}" >/dev/null 2>&1 || {
+                echoContent red " ---> 重启服务失败: ${SB_UNIT}（未能启动），最近日志:"
+                serviceLogTail "${SB_UNIT}" 12
+                return 1
+            }
         fi
     else
-        serviceActive "${SB_UNIT}" && serviceStop "${SB_UNIT}"
-        serviceDisable "${SB_UNIT}"
+        _stopManagedService "${SB_UNIT}" || return 1
     fi
     if ((needX)); then
         UNIT_REWRITTEN=0
-        writeUnit xray
-        serviceEnable "${XRAY_UNIT}"
+        writeUnit xray || return 1
+        serviceEnable "${XRAY_UNIT}" || return 1
         if [[ -n "${force}" || "${X_CHANGED:-1}" == "1" || "${UNIT_REWRITTEN}" == "1" ]] || ! serviceActive "${XRAY_UNIT}"; then
-            systemctl restart "${XRAY_UNIT}" >/dev/null 2>&1
+            systemctl restart "${XRAY_UNIT}" >/dev/null 2>&1 || {
+                echoContent red " ---> 重启服务失败: ${XRAY_UNIT}（未能启动），最近日志:"
+                serviceLogTail "${XRAY_UNIT}" 12
+                return 1
+            }
         fi
     else
-        serviceActive "${XRAY_UNIT}" && serviceStop "${XRAY_UNIT}"
-        serviceDisable "${XRAY_UNIT}"
+        _stopManagedService "${XRAY_UNIT}" || return 1
     fi
-    # UDP 端口跳跃规则以 state 为准重建（回滚时同样会恢复）
-    declare -F reconcileHopRules >/dev/null && reconcileHopRules "${st}"
+    if declare -F reconcileHopRules >/dev/null; then reconcileHopRules "${st}" || return 1; fi
     return 0
 }
 
@@ -3262,7 +3507,13 @@ verifyRuntime() { # verifyRuntime <state.json>
         nginx) stateNeedsNginx "${st}" && need=1 ;;
         *) stateNeedsCore "${st}" "${c}" && need=1 ;;
         esac
-        ((need)) || continue
+        if ((!need)); then
+            if serviceActive "${u}"; then
+                echoContent red " ---> 服务 ${u} 应当停止但仍在运行"
+                ok=1
+            fi
+            continue
+        fi
         if ! waitServiceActive "${u}" 10; then
             echoContent red " ---> 服务 ${u} 未能启动，最近日志:"
             serviceLogTail "${u}" 12
@@ -3300,8 +3551,61 @@ _closeSubscription() {
 nginxSubLayoutCurrent() {
     grep -q '^# atr-sub-layout 2$' "${NGX_CONFD}/atr_subscribe.conf" 2>/dev/null
 }
+# 撤销收口的实际动作: 按白名单重建发布目录。只把 state 里仍然有效的名字复制进新目录，整体换入，旧目录按固定路径删除。
+# 被撤销的令牌、旧版布局里以对等密钥命名的目录，名字都不会出现在任何外部命令的参数里（rm 只拿到固定的 .old 路径，
+# 在它自己的递归里删除）；仍然有效的文件也不会先被删掉、再等下一次发布。
+# 源文件必须用 < 读: _copyFile 的 cat -- "$1" 会把源路径（也就是有效令牌）放进 cat 的命令行。
+# 由 _pruneRevokedSubscription 在持锁时调用，读取它的 valid / users / peer。
+# 返回后 SUB_PEER_DROPPED=1 表示旧版 peer 布局的内容没有搬过来（含密钥的目录名无法安全处理），调用方应按新布局重新发布
+_rebuildSubDir() {
+    local tmp kind t u k fail=0 old_umask
+    SUB_PEER_DROPPED=0
+    rm -rf "${SUB_DIR}".prune.* 2>/dev/null # 上次崩溃留下的（持锁，所以不会是别人正在用的）
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp -d "${SUB_DIR}.prune.XXXXXX") || {
+        umask "${old_umask}"
+        return 1
+    }
+    for kind in default clashMeta clashMetaProfiles sing-box sing-box_profiles; do
+        mkdir -p "${tmp}/${kind}" || fail=1
+        for t in "${!valid[@]}"; do
+            [[ -f "${SUB_DIR}/${kind}/${t}" && ! -L "${SUB_DIR}/${kind}/${t}" ]] || continue
+            cat <"${SUB_DIR}/${kind}/${t}" >"${tmp}/${kind}/${t}" || fail=1
+        done
+    done
+    if [[ -n "${peer}" && -d "${SUB_DIR}/peer" && ! -L "${SUB_DIR}/peer" ]]; then
+        if [[ -n "$(find "${SUB_DIR}/peer" -mindepth 2 -type d -print -quit 2>/dev/null)" ]]; then
+            SUB_PEER_DROPPED=1 # 旧版 peer/<密钥>/<用户>/ 布局（新布局在第二层只有文件）
+        else
+            for u in "${!users[@]}"; do # 新布局 peer/<用户名>/<类型>: 用户名不是凭据
+                for k in default clashMeta sing-box_profiles; do
+                    [[ -f "${SUB_DIR}/peer/${u}/${k}" && ! -L "${SUB_DIR}/peer/${u}/${k}" ]] || continue
+                    { mkdir -p "${tmp}/peer/${u}" && cat <"${SUB_DIR}/peer/${u}/${k}" >"${tmp}/peer/${u}/${k}"; } || fail=1
+                done
+            done
+        fi
+    fi
+    umask "${old_umask}"
+    if ((fail == 0)) && _applySubTreePerms "${tmp}" && _swapSubDir "${tmp}"; then
+        return 0
+    fi
+    rm -rf "${tmp}"
+    return 1
+}
+# 用 staging 目录整体替换 SUB_DIR（旧令牌对应的文件随旧目录一起消失）
+_swapSubDir() { # _swapSubDir <staging 目录>
+    local stage=$1
+    rm -rf "${SUB_DIR}.old"
+    if [[ -e "${SUB_DIR}" ]]; then mv "${SUB_DIR}" "${SUB_DIR}.old" || return 1; fi
+    if ! mv "${stage}" "${SUB_DIR}"; then
+        [[ -e "${SUB_DIR}.old" ]] && mv "${SUB_DIR}.old" "${SUB_DIR}"
+        return 1
+    fi
+    rm -rf "${SUB_DIR}.old"
+}
 # 撤销收口。按当前 state 清除已发布目录里不再有效的内容：失效令牌对应的文件、已删除用户的文件、对等分享关闭后的 peer/、
-# 以及旧版目录布局的遗留；订阅整体关闭时清空整个目录。只做删除（不渲染、不联网），所以几乎不会失败；
+# 以及旧版目录布局的遗留；订阅整体关闭时清空整个目录。只复制仍有效的文件、整体换入（不渲染、不联网），所以几乎不会失败；
 # 删不掉（或删完复查仍有）就改为停止 nginx。必须持锁调用：applyStaged 提交之后、每次发布之前、启动对账都会用到。
 #   _pruneRevokedSubscription        清除。0=已确认干净  1=删不掉，已改为停止 nginx（旧订阅不会再被提供）  2=连 nginx 也没能停止
 #   _pruneRevokedSubscription check  只检查不动。0=干净  10=存在应被撤销的内容
@@ -3322,29 +3626,29 @@ _pruneRevokedSubscription() {
         [[ -n "${t}" ]] && valid["${t}"]=1
     done < <(S '.users[]? | "\(.name)\t\(.sub_token // "")"')
     peer=$(S '.nginx.subscribe.peer_key // ""')
+    # 先只检查: 这里只用 shell 内建的测试，不把任何条目名交给外部命令
     for kind in default clashMeta clashMetaProfiles sing-box sing-box_profiles; do
         for f in "${SUB_DIR}/${kind}"/*; do
             [[ -e "${f}" || -L "${f}" ]] || continue
             name=${f##*/}
-            [[ "${name}" =~ ^[A-Za-z0-9]+$ && -n "${valid[${name}]:-}" ]] && continue
+            [[ "${name}" =~ ^[A-Za-z0-9]+$ && -n "${valid[${name}]:-}" && -f "${f}" && ! -L "${f}" ]] && continue
             stale=1
-            [[ "${mode}" == check ]] || rm -rf -- "${f}"
         done
     done
     if [[ -d "${SUB_DIR}/peer" || -L "${SUB_DIR}/peer" ]]; then
         if [[ -z "${peer}" ]]; then
             stale=1
-            [[ "${mode}" == check ]] || rm -rf -- "${SUB_DIR}/peer"
         else
             for d in "${SUB_DIR}/peer"/*; do
                 [[ -e "${d}" || -L "${d}" ]] || continue
                 name=${d##*/}
-                # 只认 peer/<现存用户>/ 下的普通文件；旧版 peer/<密钥>/<用户>/ 的目录布局整个视为过期
-                if [[ -d "${d}" && ! -L "${d}" && -n "${users[${name}]:-}" && -z "$(find "${d}" -mindepth 1 \( -type d -o -type l \) -print -quit 2>/dev/null)" ]]; then
+                # 只认 peer/<现存用户>/ 下的普通文件。条件的顺序不能改: 先确认 name 是现存用户名，find 才会拿到这个路径
+                # （旧版 peer/<密钥>/<用户>/ 布局里 name 就是对等密钥，绝不能出现在 find 的参数里）
+                if [[ -n "${users[${name}]:-}" && -d "${d}" && ! -L "${d}" && -z "$(find "${d}" -mindepth 1 \( -type d -o -type l \) -print -quit 2>/dev/null)" ]]; then
                     continue
                 fi
                 stale=1
-                [[ "${mode}" == check ]] || rm -rf -- "${d}"
+                break
             done
         fi
     fi
@@ -3353,10 +3657,7 @@ _pruneRevokedSubscription() {
         [[ -e "${f}" || -L "${f}" ]] || continue
         case "${f##*/}" in
         default | clashMeta | clashMetaProfiles | sing-box | sing-box_profiles | peer) ;;
-        *)
-            stale=1
-            [[ "${mode}" == check ]] || rm -rf -- "${f}"
-            ;;
+        *) stale=1 ;;
         esac
     done
     if [[ "${mode}" == check ]]; then
@@ -3364,13 +3665,17 @@ _pruneRevokedSubscription() {
         return 0
     fi
     ((stale)) || return 0
-    # 删完再扫一遍，确认真的干净了；否则改为停止 nginx
-    _pruneRevokedSubscription check && return 0
+    # 按白名单重建（不逐项删除），重建完再扫一遍确认真的干净了；否则改为停止 nginx
+    if _rebuildSubDir && _pruneRevokedSubscription check; then
+        return 0
+    fi
     echoContent red " ---> 无法清除已被撤销的订阅文件（文件系统只读或没有权限？）"
     _closeSubscription
 }
-# 启动时对账：提交之后、清理之前进程被中断，或有人手工动过发布目录，都会留下应被撤销的内容。只读检查不加锁，真有才加锁清除
-reconcileSubscription() {
+# 启动时对账：提交之后、清理之前进程被中断，或有人手工动过发布目录，都会留下应被撤销的内容。只读检查不加锁，真有才加锁清除。
+# 清除时撤下了旧版 peer 布局的内容（SUB_PEER_DROPPED）就在同一把锁里立即按新布局重新发布，不让对等端点一直 404 到下一次发布；
+# 重新发布失败只提示（应撤销的内容已经清除），不阻止本次命令。no-republish: 开机时的 apply-hop 不做发布
+reconcileSubscription() { # reconcileSubscription [no-republish]
     stateExists || return 0
     [[ -d "${SUB_DIR}" ]] || return 0
     _pruneRevokedSubscription check
@@ -3379,9 +3684,26 @@ reconcileSubscription() {
         echoContent red " ---> 发现订阅目录里有应被撤销的内容，但拿不到锁，没有清理。请稍后执行 ${ATR_CMD} restart"
         return 1
     }
-    echoContent yellow "\n ---> 检测到订阅目录里有已被撤销的内容（上次操作可能被中断），正在清除…"
+    if ! _requireCleanTransaction; then
+        lockRelease
+        return 1
+    fi
+    echoContent yellow "\n ---> 检测到订阅目录里有已被撤销的内容或旧版目录布局（上次操作可能被中断，或刚从旧版本升级），正在清除…"
+    SUB_PEER_DROPPED=0
     _pruneRevokedSubscription
     local rc=$?
+    if ((rc == 0 && SUB_PEER_DROPPED == 1)); then
+        if [[ "${1:-}" == no-republish ]] || ! declare -F generateSubscription >/dev/null; then
+            echoContent yellow " ---> 旧版目录布局的对等订阅已撤下，下一次发布（${ATR_CMD} sub / ${ATR_CMD} restart）时按新布局恢复"
+            atrLog "reconcile: legacy peer layout removed, republish deferred"
+        else
+            echoContent yellow " ---> 对等订阅是旧版目录布局，已撤下；正在按新布局重新发布（会重新应用一次配置并重启 nginx）…"
+            if ! generateSubscription; then
+                echoContent red " ---> 重新发布失败（应被撤销的内容已经清除）。排除问题后执行 ${ATR_CMD} restart 重新发布"
+                atrLog "reconcile: republish after the legacy peer cleanup FAILED"
+            fi
+        fi
+    fi
     lockRelease
     return "${rc}"
 }
@@ -3413,8 +3735,9 @@ applyStaged() {
         echoContent red " ---> 内部错误: 没有待应用的状态"
         return 1
     }
-    stateInit
     lockAcquire || return 1
+    if ! _requireCleanTransaction; then lockRelease; return 1; fi
+    stateInit || { lockRelease; return 1; }
     if [[ -n "${STAGED_BASE}" && "$(stateRevision)" != "${STAGED_BASE}" ]]; then
         echoContent red " ---> 本次操作开始之后，配置已被另一个操作修改过（例如另一个终端或定时任务）。为避免覆盖对方的修改，本次操作已取消，请重新进行"
         NEW_STATE=""
@@ -3522,17 +3845,20 @@ applyStaged() {
         SB_CHANGED=1
         X_CHANGED=1
         if ((restored)); then
+            if ! applyServices "${ATR_STATE}" force || ! verifyRuntime "${ATR_STATE}"; then
+                restored=0
+            elif ! _removeLive "${TXN_MARK}"; then
+                restored=0
+            fi
+        fi
+        if ((restored)); then
             if [[ -n "${oldst}" ]]; then
-                applyServices "${ATR_STATE}" force
-                verifyRuntime "${ATR_STATE}" >/dev/null 2>&1 && echoContent green " ---> 已回滚，旧配置运行正常" || echoContent red " ---> 回滚后旧配置也未能正常运行，请检查日志"
+                echoContent green " ---> 已回滚，旧配置运行正常"
             else
-                applyServices "${ATR_STATE}" force
                 echoContent yellow " ---> 首次安装失败，已清理本次改动"
             fi
-            rm -f "${TXN_MARK}"
         else
-            # 恢复本身失败：保留事务标记和备份，这是之后继续恢复的唯一依据（下次运行本脚本会自动再试一次）
-            echoContent red " ---> 回滚没有完整完成！事务标记和备份已保留（${bdir}），下次运行 ${ATR_CMD} 会自动再次尝试恢复；也可以手动检查 ${ATR_HOME}"
+            echoContent red " ---> 回滚没有完整完成！事务标记和备份已保留（${bdir}）；已拒绝后续修改。排除文件或服务错误后执行 ${ATR_CMD} recover 重试（status / show / log 仍可使用）"
         fi
         atrLog "ROLLBACK (${why}) reason=${failWhy} restored=${restored} backup=${bdir}"
         rm -rf "${stage}"
@@ -3585,6 +3911,7 @@ egressAddrsStale() {
 reloadAll() {
     stateExists || return 1
     lockAcquire || return 1
+    if ! _requireCleanTransaction; then lockRelease; return 1; fi
     SB_CHANGED=1
     X_CHANGED=1
     local rc=0
@@ -3612,7 +3939,7 @@ reloadAll() {
 restartCoreChecked() { # restartCoreChecked <core>
     local core=$1 unit proto port rc=0
     unit=$(coreUnit "${core}")
-    systemctl restart "${unit}" >/dev/null 2>&1
+    systemctl restart "${unit}" >/dev/null 2>&1 || return 1
     waitServiceActive "${unit}" 10 || return 1
     while read -r proto port; do
         [[ -z "${port}" ]] && continue
@@ -4050,6 +4377,7 @@ _checkClientFile() { # _checkClientFile <文件> <描述>
 # ----------------------------- 生成全部用户的客户端文件 ------------------------
 # 目录: ${CLIENT_DIR}/<用户>/{links.txt, sing-box.json, sing-box-full.json, mihomo-proxies.yaml, mihomo-full.yaml, naive-client.json}
 _generateClientFilesLocked() { # _generateClientFilesLocked [用户名]
+    _requireCleanTransaction || return 1
     stateExists || return 1
     local only=${1:-} u d n views dir sbouts mhprox rc=0 out
     local -a problems=()
@@ -4238,6 +4566,7 @@ _userSecretsPending() {
     jq -e '(.nginx.subscribe // {}) | has("salt")' "${ATR_STATE}" >/dev/null 2>&1
 }
 _persistUserSecretsLocked() {
+    _requireCleanTransaction || return 1
     local need n st new cnt=0 hadSalt=0
     need=$(jq -r '.users[]? | select((.sub_token // "") == "" or (.api_secret // "") == "") | .name' "${ATR_STATE}" 2>/dev/null)
     jq -e '(.nginx.subscribe // {}) | has("salt")' "${ATR_STATE}" >/dev/null 2>&1 && hadSalt=1
@@ -4392,17 +4721,6 @@ _b64file() { # _b64file <输入文件> <输出文件>
     base64 "$1" 2>/dev/null | tr -d '\n' >"$2"
     [[ "${PIPESTATUS[0]}" == "0" && "${PIPESTATUS[1]}" == "0" ]]
 }
-# 用 staging 目录整体替换 SUB_DIR（旧令牌对应的文件随旧目录一起消失）
-_swapSubDir() { # _swapSubDir <staging 目录>
-    local stage=$1
-    rm -rf "${SUB_DIR}.old"
-    if [[ -e "${SUB_DIR}" ]]; then mv "${SUB_DIR}" "${SUB_DIR}.old" || return 1; fi
-    if ! mv "${stage}" "${SUB_DIR}"; then
-        [[ -e "${SUB_DIR}.old" ]] && mv "${SUB_DIR}.old" "${SUB_DIR}"
-        return 1
-    fi
-    rm -rf "${SUB_DIR}.old"
-}
 
 # 发布订阅文件。顺序不能变：
 #   1) 令牌/密钥落到 state  2) nginx 必须已是"专用账号 + 受限权限"模型（否则先迁移，迁移失败就不发布）
@@ -4410,6 +4728,7 @@ _swapSubDir() { # _swapSubDir <staging 目录>
 # 全程持有事务锁（和 applyStaged 同一把，可重入）：发布期间 state 不会被别的操作改动，两个进程也不会共用暂存目录。
 # 任何一步失败都关闭订阅（并验证确实关闭了），不降级成"所有人可读"，也不留下已被撤销的旧链接。
 _generateSubscriptionLocked() {
+    _requireCleanTransaction || return 1
     [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 0 # 拿到锁之后重新确认（等锁期间可能被关掉）
     # 任何一次发布尝试都先保证"已被撤销的内容不在发布目录里"，不管后面的发布成不成功
     _pruneRevokedSubscription
@@ -4448,7 +4767,7 @@ _generateSubscriptionLocked() {
     base=$(subscriptionBase)
     peer=$(S '.nginx.subscribe.peer_key // ""')
     # 持有锁，所以残留的 .new* / .old 只可能是上次崩溃留下的；本次用独立的 mktemp 暂存目录
-    rm -rf "${SUB_DIR}.new" "${SUB_DIR}".new.* "${SUB_DIR}.old" 2>/dev/null
+    rm -rf "${SUB_DIR}.new" "${SUB_DIR}".new.* "${SUB_DIR}".prune.* "${SUB_DIR}.old" 2>/dev/null
     # 订阅文件含节点凭据: 创建时就只有 root 可读，换入前再统一交给 nginx 专用组
     old_umask=$(umask)
     umask 077
@@ -4579,22 +4898,30 @@ showSubscriptionLinks() { # showSubscriptionLinks [用户名]
 }
 
 # ----------------------------- 自检（回环握手）--------------------------------
+# 本机能否用 sing-box 自检这个协议: 0 能  1 本机没有 sing-box  2 sing-box 客户端不支持该协议（Naive、XHTTP）
+selfCheckSupported() { # selfCheckSupported <协议id> [用户名]
+    local id=$1 user=${2:-}
+    [[ -x "${SB_BIN}" ]] || return 1
+    [[ -n "${user}" ]] || user=$(userNames | head -n 1)
+    [[ "$(nodeViews "${user}" | jq -r --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0] | (.singbox // null) | type')" == "object" ]] || return 2
+}
 # 用刚装好的服务端对应的客户端配置，在本机回环上真实握手一次并访问外网。
 # 能发现: 公私钥不匹配、SNI/short_id 写错、端口未放行到进程、证书问题。
-# 返回: 0 通过  1 失败  2 跳过(无法自检)
+# 返回: 0 通过  1 失败  2 无法自动验证（见 selfCheckSupported）
 selfCheckProtocol() { # selfCheckProtocol <协议id> [用户名]
     local id=$1 user=${2:-} node out cfg cp pid log code url title
     title=$(protoName "${id}")
-    [[ -x "${SB_BIN}" ]] || {
-        echoContent yellow "  - ${title}: 跳过（本机没有 sing-box，仅验证端口监听）"
-        return 2
-    }
     [[ -n "${user}" ]] || user=$(userNames | head -n 1)
-    node=$(nodeViews "${user}" | jq -c --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0]')
-    if [[ -z "${node}" || "${node}" == "null" ]] || [[ "$(jq -r '.singbox // empty|type' <<<"${node}")" != "object" ]]; then
-        echoContent yellow "  - ${title}: 跳过（sing-box 客户端不支持该协议，请用对应客户端验证）"
+    local sc=0
+    selfCheckSupported "${id}" "${user}" || sc=$?
+    if ((sc == 1)); then
+        echoContent yellow "  - ${title}: 未自动验证（本机没有 sing-box，只确认端口监听）"
+        return 2
+    elif ((sc != 0)); then
+        echoContent yellow "  - ${title}: 未自动验证（sing-box 客户端不支持该协议，请用对应客户端确认）"
         return 2
     fi
+    node=$(nodeViews "${user}" | jq -c --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0]')
     cp=$(randomFreePort)
     cfg="${ATR_TMP:-/tmp}/selfcheck.${id}.json"
     log="${ATR_TMP:-/tmp}/selfcheck.${id}.log"
@@ -4634,7 +4961,7 @@ selfCheckProtocol() { # selfCheckProtocol <协议id> [用户名]
     return 1
 }
 
-selfCheckAll() {
+selfCheckAll() { # 返回 1 = 至少一个协议握手失败；无法自动验证的协议只列出，不算失败
     stateExists || {
         echoContent red " ---> 未安装"
         return 1
@@ -4648,7 +4975,8 @@ selfCheckAll() {
         rc=$?
         case ${rc} in 0) pass=$((pass + 1)) ;; 1) fail=$((fail + 1)) ;; *) skip=$((skip + 1)) ;; esac
     done < <(installedProtocols)
-    echoContent yellow " ---> 自检结果: 通过 ${pass}，失败 ${fail}，跳过 ${skip}"
+    echoContent yellow " ---> 自检结果: 通过 ${pass}，失败 ${fail}，未自动验证 ${skip}"
+    ((skip == 0)) || echoContent yellow "      未自动验证的协议只确认了服务启动与端口监听，请用对应客户端确认"
     ((fail == 0))
 }
 
@@ -5283,7 +5611,7 @@ installProtocols() {
     step "${n}" "${total}" "自检并生成客户端配置"
     local gr=0
     regenClients || gr=1
-    selfCheckAll || echoContent yellow " ---> 自检有失败项，请查看上面的提示后再使用对应协议"
+    selfCheckAll || { echoContent red " ---> 配置已生效，但有协议自检失败；请按上面的提示检查日志、目标域名或内核版本"; gr=1; }
     showAccounts "" 0
     return "${gr}"
 }
@@ -5399,7 +5727,7 @@ cliInstallAnyTLSReality() {
     step 5 5 "自检并生成客户端配置"
     local gr=0
     regenClients || gr=1
-    selfCheckAll
+    selfCheckAll || gr=1
     showAccounts "" 0
     return "${gr}"
 }
@@ -7306,12 +7634,32 @@ ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+R
   adduser <用户> [uuid] [密码]     添加用户
         (密码参数写成 - 表示从标准输入读取，避免密码出现在 ps / shell 历史里；passwd 同理)
   deluser <用户>                   删除用户(至少保留一个)
+  recover [--abandon]              上次操作没有恢复完成时: 重试恢复；--abandon 放弃恢复(备份目录保留)
   restart                          重启全部服务
   log [sing-box|xray|nginx|acme]   查看日志(Ctrl+C 返回)
   renew-tls | update-geo | reload-core | apply-hop   (定时任务/钩子使用)
   uninstall                        卸载
   version | help
 EOF
+}
+
+# atr recover: 重试未完成事务的恢复；--abandon 放弃恢复（见 abandonTransaction）
+cliRecover() { # cliRecover [--abandon]
+    case "${1:-}" in
+    "")
+        if [[ ! -e "${TXN_MARK}" && ! -L "${TXN_MARK}" ]]; then
+            echoContent green " ---> 没有未完成的事务"
+        else
+            recoverIfNeeded || return 1
+        fi
+        reconcileSubscription
+        ;;
+    --abandon) abandonTransaction ;;
+    *)
+        echoContent red " ---> 用法: ${ATR_CMD} recover [--abandon]"
+        return 1
+        ;;
+    esac
 }
 
 # ----------------------------- 命令行子命令 ----------------------------------
@@ -7334,8 +7682,10 @@ cliSetSNI() { # cliSetSNI <host[:port]> [--force]
     stagedBegin
     stagedSetReality "${SNI_HOST}" "${SNI_PORT}" no || return 1
     if applyStaged "修改 Reality SNI"; then
-        postChangeShow "" "Reality 目标域名已改为 ${SNI_HOST}:${SNI_PORT}"
-        selfCheckAll
+        local rc=0
+        postChangeShow "" "Reality 目标域名已改为 ${SNI_HOST}:${SNI_PORT}" || rc=1
+        selfCheckAll || rc=1
+        return "${rc}"
     else
         stagedDiscard
         return 1
@@ -7521,7 +7871,7 @@ main() {
     esac
     # 先校验命令是否合法: 输错命令不应该产生任何副作用（装 atr、建目录、装依赖）
     case "${cmd}" in
-    menu | install-anytls-reality | reload-core | restart | renew-tls | update-geo | apply-hop | status | show | sub | selfcheck | sni | passwd | adduser | deluser | log | uninstall) ;;
+    menu | install-anytls-reality | reload-core | restart | renew-tls | update-geo | apply-hop | status | show | sub | selfcheck | sni | passwd | adduser | deluser | log | uninstall | recover) ;;
     *)
         usage
         exit 1
@@ -7536,8 +7886,28 @@ main() {
         chmod 700 "${ATR_HOME}"
     fi
     ensureJq || exit 1
-    recoverIfNeeded
-    reconcileSubscription
+    # 未完成的事务恢复失败时只放行只读命令（status / show / log），其余一律拒绝；recover 自己处理恢复
+    if [[ "${cmd}" != recover ]]; then
+        local degraded=0
+        if ! recoverIfNeeded; then
+            case "${cmd}" in
+            status | show | log)
+                degraded=1
+                echoContent yellow " ---> 存在尚未恢复完成的事务，下面只显示当前状态，任何修改都会被拒绝。排除问题后执行 ${ATR_CMD} recover 重试，或 ${ATR_CMD} recover --abandon 放弃这次恢复"
+                ;;
+            *)
+                echoContent red " ---> 存在尚未恢复完成的事务，已停止。只读命令 status / show / log 仍可使用；排除问题后执行 ${ATR_CMD} recover 重试，或 ${ATR_CMD} recover --abandon 放弃这次恢复"
+                return 1
+                ;;
+            esac
+        fi
+        if ((!degraded)) && ! reconcileSubscription "$([[ "${cmd}" == apply-hop ]] && echo no-republish)"; then
+            case "${cmd}" in
+            status | show | log) echoContent yellow " ---> 订阅目录对账没有完成（见上面的提示），下面只显示当前状态" ;;
+            *) return 1 ;;
+            esac
+        fi
+    fi
     aliasInstall
     if [[ ! -x "${ATR_SCRIPT_PATH}" ]]; then
         echoContent yellow "\n 提示: 脚本没有保存到本机文件(可能是通过管道 curl | bash 运行的)，${ATR_CMD} 命令与证书自动续签后的重载钩子将不可用。"
@@ -7566,6 +7936,7 @@ main() {
     deluser) cliDelUser "${1:-}" ;;
     log) viewLog "${1:-sing-box}" ;;
     uninstall) uninstallAll ;;
+    recover) cliRecover "${1:-}" ;;
     *)
         usage
         exit 1
