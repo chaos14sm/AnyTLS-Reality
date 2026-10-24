@@ -18,7 +18,7 @@
 # =============================================================================
 export LANG=en_US.UTF-8
 
-ATR_VERSION="v1.1.0"
+ATR_VERSION="v1.2.0"
 ATR_PROJECT_NAME="anytls-reality"
 
 # ----------------------------- 路径与常量 -----------------------------------
@@ -208,6 +208,8 @@ randLower() { randStr "${1:-4}" 'a-z'; }
 newPassword() { randStr 20 'A-Za-z0-9'; }
 # 订阅令牌: 每个用户一个独立的随机值（128 位），与节点密码/UUID 没有任何数学关系
 newSubToken() { randHex 32; }
+# 客户端配置里本地控制接口（127.0.0.1:9090）的 secret，每个用户一个
+newApiSecret() { randHex 24; }
 newUUID() {
     if [[ -x "${SB_BIN}" ]]; then
         "${SB_BIN}" generate uuid
@@ -346,6 +348,85 @@ atomicWrite() {
     fi
     rm -f "${tmp}"
     return 1
+}
+
+# ----------------------------- jq: 数据不出现在进程命令行上 ---------------------
+# Linux 默认允许任何本机用户读取其他进程的命令行（/proc/<pid>/cmdline）。脚本里的 jq 经常要带上密码、UUID、
+# 私钥、令牌、对等密钥，甚至整份 state，所以这里接管全部 jq 调用：--arg / --argjson 的"值"先写进只有 root 能进入的
+# 私有临时目录里的文件，再用 --rawfile 交给 jq，命令行上只剩文件路径；--argjson 的值在 jq 程序开头用 fromjson 还原，
+# 对调用方完全透明。用完立即清空文件内容。（改用环境变量并不能代替：它同样会被继承、被子进程看到。）
+_JQ_SEQ=0
+_JQ_DIR=""
+_jqTmpDir() {
+    [[ -n "${_JQ_DIR}" && -d "${_JQ_DIR}" ]] && return 0
+    _JQ_DIR=${ATR_TMP:-}
+    if [[ -z "${_JQ_DIR}" || ! -d "${_JQ_DIR}" ]]; then
+        _JQ_DIR=$(mktemp -d /tmp/atr-jq.XXXXXX 2>/dev/null) || {
+            _JQ_DIR=""
+            return 1
+        }
+    fi
+}
+jq() {
+    local -a in=("$@") out=() used=()
+    local n=${#in[@]} i=0 a name val f pre="" prog_idx=-1 no_prog=0 rc
+    if ! _jqTmpDir; then
+        command jq "$@"
+        return
+    fi
+    while ((i < n)); do
+        a=${in[i]}
+        case "${a}" in
+        --arg | --argjson)
+            name=${in[i + 1]-}
+            val=${in[i + 2]-}
+            _JQ_SEQ=$((_JQ_SEQ + 1))
+            f="${_JQ_DIR}/jq.${BASHPID}.${_JQ_SEQ}"
+            printf '%s' "${val}" >"${f}"
+            used+=("${f}")
+            out+=(--rawfile "${name}" "${f}")
+            [[ "${a}" == "--argjson" ]] && pre+="(\$${name} | fromjson) as \$${name} | "
+            i=$((i + 3))
+            ;;
+        --slurpfile | --rawfile)
+            out+=("${a}" "${in[i + 1]-}" "${in[i + 2]-}")
+            i=$((i + 3))
+            ;;
+        -f | --from-file)
+            out+=("${a}" "${in[i + 1]-}")
+            no_prog=1
+            i=$((i + 2))
+            ;;
+        -L | --indent)
+            out+=("${a}" "${in[i + 1]-}")
+            i=$((i + 2))
+            ;;
+        -?*)
+            out+=("${a}")
+            i=$((i + 1))
+            ;;
+        *)
+            ((prog_idx < 0 && no_prog == 0)) && prog_idx=${#out[@]}
+            out+=("${a}")
+            i=$((i + 1))
+            ;;
+        esac
+    done
+    if ((prog_idx >= 0)); then
+        out[prog_idx]="${pre}${out[prog_idx]}"
+    elif [[ -n "${pre}" ]]; then # 没有可以加前缀的内联程序（例如 -f）：退回原样调用
+        for f in "${used[@]}"; do : >"${f}"; done
+        command jq "$@"
+        return
+    fi
+    command jq "${out[@]}"
+    rc=$?
+    for f in "${used[@]}"; do : >"${f}"; done
+    return "${rc}"
+}
+# 外部命令是否存在（jq 有同名包装函数，所以对 jq 必须只看外部命令）
+_hasCmd() {
+    if [[ "$1" == "jq" ]]; then type -P jq >/dev/null 2>&1; else command -v "$1" >/dev/null 2>&1; fi
 }
 
 # 去掉首尾空白
@@ -491,10 +572,10 @@ toolPkg() {
 # ensureTool <命令> [optional]
 ensureTool() {
     local cmd=$1 optional=${2:-}
-    command -v "${cmd}" >/dev/null 2>&1 && return 0
+    _hasCmd "${cmd}" && return 0
     echoContent green " ---> 安装 ${cmd}"
     pkgInstall "$(toolPkg "${cmd}")"
-    if ! command -v "${cmd}" >/dev/null 2>&1; then
+    if ! _hasCmd "${cmd}"; then
         if [[ "${optional}" == "optional" ]]; then
             echoContent yellow " ---> ${cmd} 安装失败（可选组件，已跳过）"
             return 1
@@ -543,9 +624,9 @@ bootstrapJq() {
 }
 
 ensureJq() {
-    if command -v jq >/dev/null 2>&1 && jqVersionOK; then return 0; fi
+    if _hasCmd jq && jqVersionOK; then return 0; fi
     ensureTool jq optional || true
-    if command -v jq >/dev/null 2>&1 && jqVersionOK; then return 0; fi
+    if _hasCmd jq && jqVersionOK; then return 0; fi
     bootstrapJq || {
         echoContent red " ---> 无法获得可用的 jq(>=1.6)，请手动安装"
         return 1
@@ -725,6 +806,7 @@ stateDefault() {
   "cdn": "",
   "alpn": "h2",
   "extra_ports": [],
+  "egress": {"mode": "", "local_ips": []},
   "nginx": {"subscribe": {"enabled": false, "port": 0, "ssl": true, "peer_key": "", "remotes": []}, "redirect302": ""},
   "routing": {
     "block_bt": false,
@@ -783,6 +865,14 @@ removeNginxAccount() {
     fi
     return 0
 }
+# 订阅目录树（含 peer/）: root:<nginx 组>，目录 750，文件 640。失败返回 1，调用方必须停止发布
+_applySubTreePerms() { # _applySubTreePerms <目录>
+    local d=$1 g
+    g=$(ngxWorkerGroup)
+    [[ -n "${g}" && -d "${d}" ]] || return 1
+    chown -R root:"${g}" "${d}" || return 1
+    find "${d}" -type d -exec chmod 750 {} + && find "${d}" -type f -exec chmod 640 {} +
+}
 # 目录权限模型:
 #   不需要 nginx: ATR_HOME 与 subscribe/ 只有 root 能进入（700）
 #   需要 nginx:   ATR_HOME 为 root:<nginx 组> 710（该组只能"穿越"进去读取 www/ 与 subscribe/，不能列目录）；
@@ -796,9 +886,7 @@ applyHomePerms() { # applyHomePerms <是否需要 nginx: 0|1>
         [[ -n "${g}" ]] || return 1
         chown root:"${g}" "${ATR_HOME}" || return 1
         chmod 710 "${ATR_HOME}"
-        chown -R root:"${g}" "${SUB_DIR}" || return 1
-        find "${SUB_DIR}" -type d -exec chmod 750 {} + 2>/dev/null
-        find "${SUB_DIR}" -type f -exec chmod 640 {} + 2>/dev/null
+        _applySubTreePerms "${SUB_DIR}" || return 1
     else
         chown root:root "${ATR_HOME}" 2>/dev/null
         chown -R root:root "${SUB_DIR}" 2>/dev/null
@@ -869,6 +957,7 @@ userExists() { jq -e --arg n "$1" '.users[]|select(.name==$n)' "${ATR_STATE}" >/
 # 订阅 URL 令牌: 每个用户一个独立的随机令牌（存于 state.json）。重置节点密码/UUID 不会改变它；
 # 需要收回已泄露的订阅链接时，请单独"更换订阅链接"
 subscriptionToken() { S --arg n "$1" '.users[]|select(.name==$n)|.sub_token // empty'; }
+userApiSecret() { S --arg n "$1" '.users[]|select(.name==$n)|.api_secret // empty'; }
 
 # ----------------------------- 状态校验 --------------------------------------
 # 返回错误列表(每行一个)，空表示通过。校验的是"候选状态"（stdin）
@@ -893,7 +982,9 @@ def netof($id): if (udp_ids | index($id)) != null then "udp" else "tcp" end;
     ($U | group_by(.name)[] | select(length > 1) | "用户名重复: \(.[0].name)"),
     # Socks5 入站必须有来源 IP 白名单: 空数组会被 sing-box 当作"不限制来源"，等于对所有来源放行
     (if (.routing.socks5_in.port // null) != null and ((.routing.socks5_in.allow_ips // []) | length) == 0
-     then "Socks5 入站的来源 IP 白名单为空（空白名单等于允许所有来源）；请在 11.分流工具→Socks5入站→3 里重新设置" else empty end)
+     then "Socks5 入站的来源 IP 白名单为空（空白名单等于允许所有来源）；请在 11.分流工具→Socks5入站→3 里重新设置" else empty end),
+    # 出口访问模式只能是 空(未选择) / public / full
+    ((.egress.mode // "") as $m | if (["", "public", "full"] | index($m)) != null then empty else "出口访问模式不合法: \($m)" end)
   ]
 | .[]
 EOF
@@ -946,7 +1037,7 @@ stagedUserAdd() {
         echoContent red " ---> UUID 已被其他用户使用"
         return 1
     fi
-    stagedEdit --arg n "${name}" --arg u "${uuid}" --arg p "${pass}" --arg t "$(newSubToken)" '.users += [{name:$n,uuid:$u,password:$p,sub_token:$t}]'
+    stagedEdit --arg n "${name}" --arg u "${uuid}" --arg p "${pass}" --arg t "$(newSubToken)" --arg a "$(newApiSecret)" '.users += [{name:$n,uuid:$u,password:$p,sub_token:$t,api_secret:$a}]'
 }
 
 # 从候选状态删除用户，至少保留一个
@@ -1930,11 +2021,28 @@ genRealityKeypair() {
     printf '%s %s\n' "${priv}" "${pub}"
 }
 
-# 校验一对密钥是否匹配（需要 Xray 才能由私钥推导公钥）；无法校验时返回 2
+x25519PublicFromPrivate() { # x25519PublicFromPrivate <私钥 base64url 32 字节>  ->  公钥 base64url（无填充）
+    # 用 openssl 推导：私钥只经过管道，不会出现在任何进程的命令行上
+    # （xray x25519 -i <私钥> 会把私钥放进命令行，同机用户可以读到）
+    local b64=$1 raw pub
+    command -v openssl >/dev/null 2>&1 || return 1
+    b64=${b64//-/+}
+    b64=${b64//_//}
+    while ((${#b64} % 4)); do b64+="="; done
+    raw=$(printf '%s' "${b64}" | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [[ "${raw}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    # PKCS#8 外壳 + 32 字节原始私钥 -> 取出 SPKI 的最后 32 字节即公钥
+    # （十六进制 -> 字节用 printf 的 \x 转义完成，不依赖 xxd；它在很多精简系统里没有）
+    pub=$(printf "$(printf '302e020100300506032b656e04220420%s' "${raw}" | sed 's/../\\x&/g')" |
+        openssl pkey -inform DER -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '=')
+    [[ ${#pub} -eq 43 ]] || return 1
+    printf '%s' "${pub}"
+}
+
+# 校验一对密钥是否匹配；无法校验（没有 openssl 等）时返回 2
 verifyRealityKeypair() { # verifyRealityKeypair <priv> <pub>
-    [[ -x "${XRAY_BIN}" ]] || return 2
     local derived
-    derived=$("${XRAY_BIN}" x25519 -i "$1" 2>/dev/null | awk '/[Pp]ublic ?[Kk]ey|Password/{print $NF; exit}')
+    derived=$(x25519PublicFromPrivate "$1") || return 2
     [[ -n "${derived}" ]] || return 2
     [[ "${derived}" == "$2" ]]
 }
@@ -1973,6 +2081,13 @@ stagedSetReality() {
 #      geoip:cn             规则集(IP)      ip:1.2.3.0/24    IP/CIDR
 # =============================================================================
 
+# 「公网出口」模式下，客户端不得访问的地址段（两个核心共用）: 回环、私网、CGNAT、链路本地(含云厂商元数据 169.254.169.254)、
+# 组播/保留、IPv4 映射的 IPv6（::ffff:0:0/96 里的 IPv4 地址不会被 IPv4 段匹配到，必须单独列出）、ULA、IPv6 链路本地。
+# 不含 NAT64(64:ff9b::/96)，否则会让纯 IPv6 主机无法经 NAT64 访问 IPv4 网站。再加上 state.egress.local_ips（本机所有网卡地址）。
+read -r -d '' JQ_EGRESS_DEF <<'EOF'
+def egress_cidrs: ["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","::ffff:0:0/96","100::/64","fc00::/7","fe80::/10","ff00::/8"];
+EOF
+
 # ----------------------------- sing-box --------------------------------------
 read -r -d '' JQ_SINGBOX <<'EOF'
 . as $S
@@ -1980,6 +2095,7 @@ read -r -d '' JQ_SINGBOX <<'EOF'
 | ($S.routing // {}) as $R
 | ($S.domain // "") as $D
 | def cert: {certificate_path: ($tlsdir + "/" + $D + ".crt"), key_path: ($tlsdir + "/" + $D + ".key")};
+  @@EGRESS_DEF@@
   def tlsCert: ({enabled: true, server_name: $D} + cert);
   def tlsReality: {enabled: true, server_name: $S.reality.sni,
       reality: {enabled: true,
@@ -2069,6 +2185,9 @@ read -r -d '' JQ_SINGBOX <<'EOF'
       route: {
         default_domain_resolver: "local",
         rules: ([{action: "sniff"}, {protocol: "dns", action: "hijack-dns"}]
+                # 出口访问模式 = 公网出口: 先把域名解析成 IP（resolve 只补充目的地址，域名规则照常匹配），再拒绝一切指向
+                # 回环/私网/链路本地/本机自身地址的连接。必须排在所有放行规则之前，Socks5 入站的放行规则也不例外
+                + (if ($S.egress.mode // "") == "public" then [{action: "resolve"}, {ip_cidr: (egress_cidrs + ($S.egress.local_ips // [])), action: "reject"}] else [] end)
                 # Socks5 入站: 仅允许指定来源 IP 访问指定目标，其余一律拒绝（它是明文代理，绝不能对外开放）
                 + (if $haveS5in then
                      ((if ($R.socks5_in.ip_strategy // "") != "" then [{inbound: "socks5_inbound", action: "resolve", strategy: $R.socks5_in.ip_strategy}] else [] end)
@@ -2109,6 +2228,7 @@ EOF
 sbListenAddr() { if [[ -e /proc/net/if_inet6 ]]; then echo "::"; else echo "0.0.0.0"; fi; }
 
 # renderSingBox <state.json 路径>  -> stdout: sing-box 配置
+JQ_SINGBOX=${JQ_SINGBOX/@@EGRESS_DEF@@/${JQ_EGRESS_DEF}}
 renderSingBox() {
     jq --arg tlsdir "${TLS_DIR}" --arg rsdir "${SB_RULESET_DIR}" --arg listen "$(sbListenAddr)" \
         --arg debug "$(jq -r 'if .log.debug then "1" else "0" end' "$1")" \
@@ -2122,7 +2242,15 @@ read -r -d '' JQ_XRAY <<'EOF'
 | ($S.routing // {}) as $R
 | ($S.domain // "") as $D
 | ($S.protocols // {}) as $PR
-| def tlsCert: {rejectUnknownSni: true, minVersion: "1.2",
+| @@EGRESS_DEF@@
+  # 公网出口: 先放行"添加新端口"的 dokodemo-door（它只是把流量转给本机 Vision 前置端口，不是客户端的目的地），再拦截内网/本机目的地。
+  # 不用 geoip:private（它需要 geoip.dat 文件）；显式地址段与数据文件无关。Xray 不接受 ::ffff:0:0/96 这种写法，但它会先把 IPv4 映射地址归一成 IPv4 再匹配（见 t_security 的实测）。对域名目标，检查依据的是路由时的解析结果（IPOnDemand）；Xray 的 freedom 出站会再解析一次，没有专门验证过能否防住 DNS rebinding（尤其可能防不住）
+  def egress_x: if ($S.egress.mode // "") == "public" then
+      ([ ($S.extra_ports // [])[] | "dokodemo-door-newPort-" + tostring ]) as $dk
+      | (if ($dk | length) > 0 and ($PR.vless_vision_tls.core // "") == "xray" then [{type: "field", inboundTag: $dk, outboundTag: "direct"}] else [] end)
+        + [{type: "field", ip: ((egress_cidrs - ["::ffff:0:0/96"]) + ($S.egress.local_ips // [])), outboundTag: "block"}]
+    else [] end;
+  def tlsCert: {rejectUnknownSni: true, minVersion: "1.2",
                 certificates: [{certificateFile: ($tlsdir + "/" + $D + ".crt"), keyFile: ($tlsdir + "/" + $D + ".key"), ocspStapling: 3600}]};
   def xusers($p):
     $S.users | map(
@@ -2194,8 +2322,7 @@ read -r -d '' JQ_XRAY <<'EOF'
               settings: {address: "127.0.0.1", port: $PR.vless_vision_tls.port, network: "tcp", followRedirect: false}} ]
         else [] end)) as $inbounds
   | {
-      log: ({loglevel: (if $debug == "1" then "debug" else "warning" end), error: ($logdir + "/error.log")}
-            + (if $debug == "1" then {access: ($logdir + "/access.log")} else {} end)),
+      log: {loglevel: (if $debug == "1" then "debug" else "warning" end)},
       policy: {levels: {"0": {handshake: 4, connIdle: 300}}},
       dns: (if (($R.dns_unlock.server // "") != "" and ((($R.dns_unlock.domains // []) | length) > 0)) then
               {servers: [{address: $R.dns_unlock.server, port: 53, domains: xdomains($R.dns_unlock.domains)}, "localhost"]}
@@ -2221,7 +2348,8 @@ read -r -d '' JQ_XRAY <<'EOF'
                       users: [{user: ($R.socks5_out.user // ""), pass: ($R.socks5_out.pass // "")}]}]}}] else [] end)),
       routing: {
         domainStrategy: "IPOnDemand",
-        rules: ((if ($R.block_bt // false) then [{type: "field", protocol: ["bittorrent"], outboundTag: "block"}] else [] end)
+        rules: (egress_x
+                + (if ($R.block_bt // false) then [{type: "field", protocol: ["bittorrent"], outboundTag: "block"}] else [] end)
                 + (if (($B.allow // []) | length) > 0 then toRule(($B.allow // []); "direct") else [] end)
                 + toRule(($B.domains // []); "block")
                 + (if (xips($B.ips // []) | length) > 0 then [{type: "field", ip: xips($B.ips // []), outboundTag: "block"}] else [] end)
@@ -2235,10 +2363,11 @@ read -r -d '' JQ_XRAY <<'EOF'
 EOF
 
 # renderXray <state.json 路径>  -> stdout: Xray 配置
+JQ_XRAY=${JQ_XRAY/@@EGRESS_DEF@@/${JQ_EGRESS_DEF}}
 renderXray() {
     local needSniff
     needSniff=$(jq -r 'if (.routing.block_bt == true) or ((.routing.blacklist.domains // [])|length > 0) or (.routing.blacklist.cn == true) or ((.routing.warp.v4.domains // [])|length > 0) or ((.routing.warp.v6.domains // [])|length > 0) or ((.routing.ipv6.domains // [])|length > 0) or ((.routing.socks5_out.domains // [])|length > 0) then "1" else "0" end' "$1")
-    jq --arg tlsdir "${TLS_DIR}" --arg logdir "${XRAY_DIR}" \
+    jq --arg tlsdir "${TLS_DIR}" \
         --arg debug "$(jq -r 'if .log.debug then "1" else "0" end' "$1")" --arg sniff "${needSniff}" \
         --argjson ngxPort "${NGX_FALLBACK_PORT}" --argjson ngxH2Port "${NGX_FALLBACK_H2_PORT}" \
         --argjson trojanPort "${XRAY_TROJAN_PORT}" --argjson wsPort "${XRAY_VLESS_WS_PORT}" \
@@ -2501,6 +2630,7 @@ installFakeSite() {
 
 # ----------------------------- systemd 单元 ----------------------------------
 # 仅在内容变化时重写并 daemon-reload
+UNIT_REWRITTEN=0
 _writeUnitFile() { # _writeUnitFile <单元名> (内容来自 stdin)
     local name=$1 f="${ATR_SYSTEMD_DIR}/$1.service" tmp
     mkdir -p "${ATR_SYSTEMD_DIR}"
@@ -2511,6 +2641,7 @@ _writeUnitFile() { # _writeUnitFile <单元名> (内容来自 stdin)
         return 0
     fi
     install -m 644 "${tmp}" "${f}" && rm -f "${tmp}"
+    UNIT_REWRITTEN=1 # 单元内容变了（例如升级脚本）：正在运行的进程还带着旧的沙箱，调用方必须重启它
     systemctl daemon-reload >/dev/null 2>&1
 }
 
@@ -2526,14 +2657,15 @@ After=network.target nss-lookup.target
 [Service]
 User=root
 WorkingDirectory=${SB_DIR}
-# 只保留服务端真正需要的能力（去掉了仅用于按进程名分流的两个能力）
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+# 只保留服务端真正需要的能力。安装目录（脚本、二进制、配置、state）对服务只读：服务被攻陷也改不了管理脚本，
+# 不会借管理员运行 atr、cron 或证书续签钩子在沙箱之外执行被篡改的内容
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=${ATR_HOME}
+ReadOnlyPaths=${ATR_HOME}
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -2568,7 +2700,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=${ATR_HOME}
+ReadOnlyPaths=${ATR_HOME}
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -2924,6 +3056,39 @@ selinuxAllowNginxPorts() { # selinuxAllowNginxPorts <state.json>
     return 0
 }
 
+# 启用/更新 nginx 实例: 专用账号 -> 目录权限 -> 主配置 -> 单元 -> 重启。任何一步失败都返回 1。
+# 权限必须先于配置和重启切换到"专用组可读、其他用户不可读"的模型，且失败不能只警告后继续。
+activateNginx() { # activateNginx <state.json>
+    local st=$1
+    findNginxBin || ensureNginx || return 1
+    if ! ensureNginxAccount; then
+        echoContent red " ---> 无法创建 nginx 专用账号 ${NGX_USER}（需要系统提供 useradd）"
+        return 1
+    fi
+    if ! applyHomePerms 1; then
+        echoContent red " ---> 设置安装目录/订阅目录的权限失败，请检查 ${ATR_HOME} 的属主与权限"
+        return 1
+    fi
+    selinuxAllowNginxPorts "${st}"
+    writeNginxMainConf
+    writeUnit nginx
+    serviceEnable "${NGX_UNIT}"
+    systemctl restart "${NGX_UNIT}" >/dev/null 2>&1
+}
+
+# 把已安装的 nginx 迁移到"专用账号 + 受限权限"模型（旧版安装升级用）并确认它起来了。失败返回 1，
+# 此时调用方不得发布任何含凭据的文件。
+migrateNginxModel() {
+    stateNeedsNginx "${ATR_STATE}" || return 0
+    activateNginx "${ATR_STATE}" || return 1
+    if ! waitServiceActive "${NGX_UNIT}" 10; then
+        echoContent red " ---> nginx 未能以新模型启动，最近日志:"
+        serviceLogTail "${NGX_UNIT}" 8
+        return 1
+    fi
+    atrLog "nginx migrated to the dedicated-account model"
+}
+
 # ----------------------------- 服务应用 / 验证 --------------------------------
 # 按 state 启停各服务；某核心无协议则停止并禁用
 applyServices() { # applyServices <state.json> [force]
@@ -2934,27 +3099,17 @@ applyServices() { # applyServices <state.json> [force]
     stateNeedsCore "${st}" xray && needX=1
 
     if ((needNgx)); then
-        findNginxBin || ensureNginx || return 1
-        ensureNginxAccount || {
-            echoContent red " ---> 无法创建 nginx 专用账号 ${NGX_USER}（需要系统提供 useradd）"
-            return 1
-        }
-        # 在写入 `user ${NGX_USER};` 并重启 nginx 之前，先把目录权限切换到"专用组可读、其他用户不可读"的模型
-        applyHomePerms 1 || echoContent yellow " ---> 警告: 设置订阅目录权限失败，请检查 ${ATR_HOME} 的属主与权限"
-        selinuxAllowNginxPorts "${st}"
-        writeNginxMainConf
-        writeUnit nginx
-        serviceEnable "${NGX_UNIT}"
-        systemctl restart "${NGX_UNIT}" >/dev/null 2>&1
+        activateNginx "${st}" || return 1
     else
         serviceActive "${NGX_UNIT}" && serviceStop "${NGX_UNIT}"
         serviceDisable "${NGX_UNIT}"
         applyHomePerms 0
     fi
     if ((needSB)); then
+        UNIT_REWRITTEN=0
         writeUnit sing-box
         serviceEnable "${SB_UNIT}"
-        if [[ -n "${force}" || "${SB_CHANGED:-1}" == "1" ]] || ! serviceActive "${SB_UNIT}"; then
+        if [[ -n "${force}" || "${SB_CHANGED:-1}" == "1" || "${UNIT_REWRITTEN}" == "1" ]] || ! serviceActive "${SB_UNIT}"; then
             systemctl restart "${SB_UNIT}" >/dev/null 2>&1
         fi
     else
@@ -2962,9 +3117,10 @@ applyServices() { # applyServices <state.json> [force]
         serviceDisable "${SB_UNIT}"
     fi
     if ((needX)); then
+        UNIT_REWRITTEN=0
         writeUnit xray
         serviceEnable "${XRAY_UNIT}"
-        if [[ -n "${force}" || "${X_CHANGED:-1}" == "1" ]] || ! serviceActive "${XRAY_UNIT}"; then
+        if [[ -n "${force}" || "${X_CHANGED:-1}" == "1" || "${UNIT_REWRITTEN}" == "1" ]] || ! serviceActive "${XRAY_UNIT}"; then
             systemctl restart "${XRAY_UNIT}" >/dev/null 2>&1
         fi
     else
@@ -3005,6 +3161,25 @@ verifyRuntime() { # verifyRuntime <state.json>
 
 # ----------------------------- 事务主体 --------------------------------------
 # applyStaged [说明]  —— 应用 NEW_STATE；成功返回 0 并更新 state.json；任何一步失败都保持/恢复原状
+# 本机所有网卡的地址（/32 与 /128），JSON 数组。「公网出口」模式把它们也列入禁止访问，
+# 否则客户端可以直接连本机的公网 IP 来访问本机上只监听在内部的服务
+egressLocalIPs() {
+    local raw a
+    if command -v ip >/dev/null 2>&1; then
+        raw=$(ip -o addr show 2>/dev/null | awk '{print $4}' | sed 's#/.*##')
+    else
+        raw=$(hostname -I 2>/dev/null | tr ' ' '\n')
+    fi
+    while IFS= read -r a; do
+        a=${a%%%*}
+        if isIPv4 "${a}"; then
+            echo "${a}/32"
+        elif [[ "${a}" == *:* && "${a}" =~ ^[0-9a-fA-F:]+$ ]]; then
+            echo "${a,,}/128"
+        fi
+    done <<<"${raw}" | sort -u | jq -R . | jq -sc .
+}
+
 applyStaged() {
     local why=${1:-变更} ts stage bdir st oldst errs core
     [[ -n "${NEW_STATE}" ]] || {
@@ -3017,6 +3192,14 @@ applyStaged() {
     stage="${ATR_TMP:-/tmp}/stage.${ts}.$$"
     mkdir -p "${stage}/sing-box" "${stage}/xray" "${stage}/nginx"
     st="${stage}/state.json"
+    # 公网出口模式: 每次应用都刷新一次本机网卡地址（渲染是纯函数，所以地址要先进入 state）
+    if [[ "$(stagedGet '.egress.mode // ""')" == "public" ]]; then
+        stagedEdit --argjson ips "$(egressLocalIPs)" '.egress.local_ips=$ips' || {
+            rm -rf "${stage}"
+            lockRelease
+            return 1
+        }
+    fi
     printf '%s\n' "${NEW_STATE}" | jq . >"${st}"
 
     # 1) 状态校验（端口冲突/缺失字段/证书文件）
@@ -3090,8 +3273,7 @@ applyStaged() {
 
     # 9) 启停服务 + 验证
     echoContent green " ---> 应用配置并重启服务…"
-    applyServices "${st}"
-    if ! verifyRuntime "${st}"; then
+    if ! applyServices "${st}" || ! verifyRuntime "${st}"; then
         echoContent red "\n ---> 新配置运行异常，正在自动回滚到变更前的状态…"
         restoreFromBackup "${bdir}"
         [[ -n "${addList}" ]] && fwApplyList close <<<"${addList}" >/dev/null
@@ -3131,9 +3313,13 @@ reloadAll() {
     lockAcquire || return 1
     SB_CHANGED=1
     X_CHANGED=1
-    applyServices "${ATR_STATE}" force
     local rc=0
+    applyServices "${ATR_STATE}" force || rc=1
     verifyRuntime "${ATR_STATE}" || rc=1
+    # 订阅文件必须与 state 保持一致（令牌或权限模型迁移之后要重新发布，旧文件随之撤销）
+    if ((rc == 0)) && [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
+        generateSubscription || rc=1
+    fi
     lockRelease
     return "${rc}"
 }
@@ -3397,9 +3583,9 @@ def grp($tag; $members): {type: "selector", tag: $tag, outbounds: $members};
     log: {disabled: false, level: "info", timestamp: true},
     http_clients: [{tag: "rule_set_http", detour: "本地直连"}],
     experimental: {
-      clash_api: {external_controller: "127.0.0.1:9090", external_ui: "metacubexd",
-                  external_ui_download_url: ($mirror + "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"),
-                  external_ui_download_detour: "direct", default_mode: "rule"},
+      # 控制接口只监听回环，并且必须带 secret；不再自动下载面板（经镜像下载的面板代码无法验证完整性，
+      # 而它与控制接口同源，被篡改后能直接操作代理）。需要面板请自行下载并核对后再配置 external_ui
+      clash_api: ({external_controller: "127.0.0.1:9090", default_mode: "rule"} + (if $secret != "" then {secret: $secret} else {} end)),
       cache_file: {enabled: true}
     },
     dns: {
@@ -3479,7 +3665,7 @@ def sel($name; $members): {name: $name, type: "select", proxies: $members};
 | (if $provider != "" then {use: [$providerName]} else {proxies: $names} end) as $src
 | {
     "log-level": "info", mode: "rule", ipv6: true, "mixed-port": 7890, "allow-lan": false,
-    "find-process-mode": "strict", "external-controller": "127.0.0.1:9090",
+    "find-process-mode": "strict", "external-controller": "127.0.0.1:9090", secret: $secret,
     "geox-url": {geoip: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat",
                  geosite: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat",
                  mmdb: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb"},
@@ -3557,10 +3743,11 @@ jsonObjToYaml() { jq -r "${JQ_YAML} y(\"\")"; }
 # ----------------------------- 生成各类配置 ----------------------------------
 # cfgSbMin <outbounds JSON 数组>    stdout: 最小可运行配置
 cfgSbMin() { jq -n --argjson nodes "$1" "${JQ_SB_MIN}"; }
-cfgSbFull() { jq -n --argjson nodes "$1" --arg mirror "${RULESET_MIRROR}" "${JQ_SB_FULL}"; }
-# cfgClashFull <proxies JSON 数组> [provider URL] [provider 名称]  stdout: YAML
+cfgSbFull() { jq -n --argjson nodes "$1" --arg mirror "${RULESET_MIRROR}" --arg secret "${2:-}" "${JQ_SB_FULL}"; }
+# cfgClashFull <proxies JSON 数组> [provider URL] [控制接口 secret] [provider 名称]  stdout: YAML
+# cfgSbFull <outbounds JSON 数组> [控制接口 secret]
 cfgClashFull() {
-    jq -n --argjson proxies "$1" --arg mirror "${RULESET_MIRROR}" --arg provider "${2:-}" --arg providerName "${3:-atr_provider}" \
+    jq -n --argjson proxies "$1" --arg mirror "${RULESET_MIRROR}" --arg provider "${2:-}" --arg secret "${3:-}" --arg providerName "${4:-atr_provider}" \
         "${JQ_CLASH_FULL}" | jsonObjToYaml
 }
 
@@ -3581,6 +3768,7 @@ _checkClientFile() { # _checkClientFile <文件> <描述>
 generateClientFiles() { # generateClientFiles [用户名]
     stateExists || return 1
     local only=${1:-} u d n views dir sbouts mhprox
+    persistUserSecrets
     mkdir -p "${CLIENT_DIR}"
     chmod 700 "${CLIENT_DIR}" 2>/dev/null
     [[ -z "${ATR_PUBLIC_IP:-}" ]] && {
@@ -3608,13 +3796,13 @@ generateClientFiles() { # generateClientFiles [用户名]
         mhprox=$(jq -c '[.[]|select(.mihomo!=null)|.mihomo]' <<<"${views}")
         if [[ "$(jq 'length' <<<"${sbouts}")" != "0" ]]; then
             cfgSbMin "${sbouts}" | jq . >"${dir}/sing-box.json"
-            cfgSbFull "${sbouts}" | jq . >"${dir}/sing-box-full.json"
+            cfgSbFull "${sbouts}" "$(userApiSecret "${u}")" | jq . >"${dir}/sing-box-full.json"
             _checkClientFile "${dir}/sing-box.json" "${u} 的 sing-box 客户端配置"
             _checkClientFile "${dir}/sing-box-full.json" "${u} 的 sing-box 完整客户端配置"
         fi
         if [[ "$(jq 'length' <<<"${mhprox}")" != "0" ]]; then
             jsonToMihomoYaml <<<"${mhprox}" >"${dir}/mihomo-proxies.yaml"
-            cfgClashFull "${mhprox}" >"${dir}/mihomo-full.yaml"
+            cfgClashFull "${mhprox}" "" "$(userApiSecret "${u}")" >"${dir}/mihomo-full.yaml"
         fi
         if [[ "$(jq '[.[]|select(.naive!=null)]|length' <<<"${views}")" != "0" ]]; then
             jq '[.[]|select(.naive!=null)|.naive][0]' <<<"${views}" >"${dir}/naive-client.json"
@@ -3622,7 +3810,7 @@ generateClientFiles() { # generateClientFiles [用户名]
         chmod 600 "${dir}"/* 2>/dev/null
     done < <(userNames)
     if stateExists && [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
-        generateSubscription >/dev/null 2>&1
+        generateSubscription || echoContent red " ---> 订阅文件未能发布，订阅服务暂时不可用（凭据不会以不安全的权限落盘）。请根据上面的提示处理后重试"
     fi
     return 0
 }
@@ -3719,24 +3907,32 @@ subscriptionBase() { # 订阅 URL 前缀 scheme://host:port
 
 
 
-# 为没有订阅令牌的用户补齐随机令牌，并清掉旧版的全局 salt，直接写入 state.json
-# （旧版本升级，或手工构造的状态）。令牌不进入任何内核/nginx 配置，所以无需走完整事务、也无需重启服务。
-persistSubTokens() {
+# 为没有订阅令牌 / 控制接口 secret 的用户补齐随机值，并清掉旧版的全局 salt，直接写入 state.json
+# （旧版本升级，或手工构造的状态）。它们不进入任何内核/nginx 配置，所以无需走完整事务、也无需重启服务。
+# 状态变了就置 USER_SECRETS_CHANGED=1：调用方必须随后重新发布订阅文件，不能只更新 state。
+persistUserSecrets() {
+    USER_SECRETS_CHANGED=0
     stateExists || return 0
-    local names n st cnt=0 hadSalt=0
-    names=$(jq -r '.users[]? | select((.sub_token // "") == "") | .name' "${ATR_STATE}" 2>/dev/null)
+    local need n st cnt=0 hadSalt=0
+    need=$(jq -r '.users[]? | select((.sub_token // "") == "" or (.api_secret // "") == "") | .name' "${ATR_STATE}" 2>/dev/null)
     jq -e '(.nginx.subscribe // {}) | has("salt")' "${ATR_STATE}" >/dev/null 2>&1 && hadSalt=1
-    [[ -z "${names}" && "${hadSalt}" == "0" ]] && return 0
+    [[ -z "${need}" && "${hadSalt}" == "0" ]] && return 0
     st=$(jq '.nginx.subscribe |= ((. // {}) | del(.salt) | . + {peer_key: (.peer_key // ""), remotes: (.remotes // [])})' "${ATR_STATE}") || return 0
     while IFS= read -r n; do
         [[ -z "${n}" ]] && continue
-        st=$(jq --arg n "${n}" --arg t "$(newSubToken)" '.users |= map(if .name==$n then .sub_token=$t else . end)' <<<"${st}") && cnt=$((cnt + 1))
-    done <<<"${names}"
+        if [[ -z "$(jq -r --arg n "${n}" '.users[]|select(.name==$n)|.sub_token // ""' <<<"${st}")" ]]; then
+            st=$(jq --arg n "${n}" --arg t "$(newSubToken)" '.users |= map(if .name==$n then .sub_token=$t else . end)' <<<"${st}") && cnt=$((cnt + 1))
+        fi
+        if [[ -z "$(jq -r --arg n "${n}" '.users[]|select(.name==$n)|.api_secret // ""' <<<"${st}")" ]]; then
+            st=$(jq --arg n "${n}" --arg t "$(newApiSecret)" '.users |= map(if .name==$n then .api_secret=$t else . end)' <<<"${st}")
+        fi
+    done <<<"${need}"
     printf '%s\n' "${st}" | atomicWrite "${ATR_STATE}" 600
+    USER_SECRETS_CHANGED=1
     if ((cnt > 0)) && [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
         echoContent yellow " ---> 已为 ${cnt} 个用户生成独立的随机订阅令牌：旧订阅链接已失效，请在客户端重新导入新的订阅链接"
     fi
-    atrLog "subscription tokens migrated: ${cnt} user(s), legacy salt removed=${hadSalt}"
+    atrLog "user secrets migrated: sub_token=${cnt}, legacy salt removed=${hadSalt}"
     return 0
 }
 
@@ -3774,7 +3970,7 @@ _validRemoteSingbox() {
 }
 # 条目字段是否合法（会进入 URL 与 sed 脚本，必须严格校验）
 _remoteFieldsOK() { # _remoteFieldsOK <host> <port> <alias> <scheme>
-    { isDomainName "$1" || isIPv4 "$1"; } && isPort "$2" && isSafeName "$3" && [[ "$4" == "https" || "$4" == "http" ]]
+    { isDomainName "$1" || isIPv4 "$1"; } && isPort "$2" && isSafeName "$3" && [[ "$4" == "https" ]]
 }
 _appendRemoteSubscriptions() { # _appendRemoteSubscriptions <用户名> <default文件> <clash文件> <singbox_profiles文件>
     local user=$1 fdef=$2 fclash=$3 fsb=$4 e host port alias scheme key ca tmp url reason
@@ -3786,6 +3982,10 @@ _appendRemoteSubscriptions() { # _appendRemoteSubscriptions <用户名> <default
         scheme=$(jq -r '.scheme // "https"' <<<"${e}")
         key=$(jq -r '.key // ""' <<<"${e}")
         ca=$(jq -r '.cacert // ""' <<<"${e}")
+        if [[ "${scheme}" != "https" ]]; then # 对等密钥会被明文传输，不再支持 HTTP
+            echoContent yellow " ---> 远程订阅 ${alias}: 不再支持 HTTP（对等密钥会被明文传输），已跳过；请让对方启用 HTTPS 后重新添加"
+            continue
+        fi
         _remoteFieldsOK "${host}" "${port}" "${alias}" "${scheme}" || continue
         [[ "${key}" =~ ^[A-Za-z0-9]{16,64}$ ]] || continue # 没有对等密钥的条目（旧版导入）不参与合并
         if [[ -n "${ca}" && ! -r "${ca}" ]]; then
@@ -3820,20 +4020,52 @@ _appendRemoteSubscriptions() { # _appendRemoteSubscriptions <用户名> <default
     done < <(S -c '(.nginx.subscribe.remotes // [])[]')
 }
 
+# 关闭订阅发布: 清空已发布的内容（失败时宁可不提供订阅，也不留下旧链接或可读的残片）
+_closeSubscription() {
+    [[ -d "${SUB_DIR}" ]] && find "${SUB_DIR}" -mindepth 1 -delete 2>/dev/null
+    return 0
+}
+# 用 staging 目录整体替换 SUB_DIR（旧令牌对应的文件随旧目录一起消失）
+_swapSubDir() { # _swapSubDir <staging 目录>
+    local stage=$1
+    rm -rf "${SUB_DIR}.old"
+    if [[ -e "${SUB_DIR}" ]]; then mv "${SUB_DIR}" "${SUB_DIR}.old" || return 1; fi
+    if ! mv "${stage}" "${SUB_DIR}"; then
+        [[ -e "${SUB_DIR}.old" ]] && mv "${SUB_DIR}.old" "${SUB_DIR}"
+        return 1
+    fi
+    rm -rf "${SUB_DIR}.old"
+}
+
+# 发布订阅文件。顺序不能变：
+#   1) 令牌/密钥落到 state  2) nginx 必须已是"专用账号 + 受限权限"模型（否则先迁移，迁移失败就不发布）
+#   3) 在 staging 目录里生成全部文件并设好属主/权限  4) 整体换入。任何一步失败都关闭订阅，不降级成"所有人可读"。
 generateSubscription() {
     [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 0
-    persistSubTokens
-    local u token base views sbouts mhprox kind w peer old_umask
+    persistUserSecrets
+    if ! nginxModelCurrent; then
+        echoContent yellow " ---> 检测到旧版 nginx 权限模型，发布订阅前先迁移到专用账号模型（会重启 nginx）…"
+        if ! migrateNginxModel; then
+            echoContent red " ---> 迁移失败，本次不发布订阅文件"
+            _closeSubscription
+            return 1
+        fi
+    fi
+    [[ -z "${ATR_PUBLIC_IP:-}" ]] && {
+        ATR_PUBLIC_IP=$(getPublicIP 4)
+        [[ -z "${ATR_PUBLIC_IP}" ]] && ATR_PUBLIC_IP=$(getPublicIP 6)
+    }
+    local u token base views sbouts mhprox kind w peer old_umask stage
     base=$(subscriptionBase)
     peer=$(S '.nginx.subscribe.peer_key // ""')
-    # 订阅文件含节点凭据: 创建时就只有 root 可读，最后再统一交给 nginx 专用组（见 applyHomePerms）
+    stage="${SUB_DIR}.new"
+    rm -rf "${stage}" "${SUB_DIR}.old"
+    # 订阅文件含节点凭据: 创建时就只有 root 可读，换入前再统一交给 nginx 专用组
     old_umask=$(umask)
     umask 077
     for kind in default clashMeta clashMetaProfiles sing-box sing-box_profiles; do
-        mkdir -p "${SUB_DIR}/${kind}"
-        find "${SUB_DIR}/${kind}" -type f -delete 2>/dev/null
+        mkdir -p "${stage}/${kind}"
     done
-    rm -rf "${SUB_DIR}/peer"
     w="${ATR_TMP:-/tmp}/sub.$$"
     mkdir -p "${w}"
     while IFS= read -r u; do
@@ -3847,30 +4079,29 @@ generateSubscription() {
         jsonToMihomoYaml <"${w}/mh.json" >"${w}/clash" 2>/dev/null
         # 本机作为"被合并方"：只放本机自己的节点（不含已合并进来的远程节点，避免两台机器互相合并时重复膨胀）
         if [[ -n "${peer}" ]]; then
-            mkdir -p "${SUB_DIR}/peer/${peer}/${u}"
-            base64 -w 0 "${w}/links" 2>/dev/null >"${SUB_DIR}/peer/${peer}/${u}/default" || base64 "${w}/links" | tr -d '\n' >"${SUB_DIR}/peer/${peer}/${u}/default"
-            cp "${w}/clash" "${SUB_DIR}/peer/${peer}/${u}/clashMeta"
-            cp "${w}/sb.json" "${SUB_DIR}/peer/${peer}/${u}/sing-box_profiles"
+            mkdir -p "${stage}/peer/${peer}/${u}"
+            base64 -w 0 "${w}/links" 2>/dev/null >"${stage}/peer/${peer}/${u}/default" || base64 "${w}/links" | tr -d '\n' >"${stage}/peer/${peer}/${u}/default"
+            cp "${w}/clash" "${stage}/peer/${peer}/${u}/clashMeta"
+            cp "${w}/sb.json" "${stage}/peer/${peer}/${u}/sing-box_profiles"
         fi
         _appendRemoteSubscriptions "${u}" "${w}/links" "${w}/clash" "${w}/sb.json"
-        base64 -w 0 "${w}/links" 2>/dev/null >"${SUB_DIR}/default/${token}" || base64 "${w}/links" | tr -d '\n' >"${SUB_DIR}/default/${token}"
-        cp "${w}/clash" "${SUB_DIR}/clashMeta/${token}"
-        cp "${w}/sb.json" "${SUB_DIR}/sing-box_profiles/${token}"
+        base64 -w 0 "${w}/links" 2>/dev/null >"${stage}/default/${token}" || base64 "${w}/links" | tr -d '\n' >"${stage}/default/${token}"
+        cp "${w}/clash" "${stage}/clashMeta/${token}"
+        cp "${w}/sb.json" "${stage}/sing-box_profiles/${token}"
         # 完整 mihomo 配置: 用 provider 指向本机订阅
         sbouts=$(cat "${w}/sb.json")
-        cfgClashFull "$(cat "${w}/mh.json")" "${base}/s/clashMeta/${token}" >"${SUB_DIR}/clashMetaProfiles/${token}" 2>/dev/null
+        cfgClashFull "$(cat "${w}/mh.json")" "${base}/s/clashMeta/${token}" "$(userApiSecret "${u}")" >"${stage}/clashMetaProfiles/${token}" 2>/dev/null
         if [[ "$(jq length <<<"${sbouts}")" != "0" ]]; then
-            cfgSbFull "${sbouts}" | jq . >"${SUB_DIR}/sing-box/${token}"
+            cfgSbFull "${sbouts}" "$(userApiSecret "${u}")" | jq . >"${stage}/sing-box/${token}"
         fi
     done < <(userNames)
     rm -rf "${w}"
     umask "${old_umask}"
-    if nginxModelCurrent; then
-        applyHomePerms 1 || echoContent yellow " ---> 警告: 订阅目录权限设置失败（nginx 专用账号/组不存在？），请执行 ${ATR_CMD} restart"
-    else
-        # 升级前的旧安装：nginx 仍以发行版默认账号运行，暂时保持可读，避免订阅突然不可用
-        chmod -R a+rX "${SUB_DIR}" 2>/dev/null
-        echoContent yellow " ---> 提示: 检测到旧版 nginx 权限模型（订阅文件对本机所有用户可读）。请执行 ${ATR_CMD} restart 升级为专用账号模型"
+    if ! _applySubTreePerms "${stage}" || ! _swapSubDir "${stage}"; then
+        echoContent red " ---> 订阅文件发布失败（权限设置或目录替换出错）"
+        rm -rf "${stage}" "${SUB_DIR}.old"
+        _closeSubscription
+        return 1
     fi
     return 0
 }
@@ -3880,8 +4111,20 @@ showSubscriptionLinks() { # showSubscriptionLinks [用户名]
         echoContent yellow " ---> 未启用订阅服务（需要 nginx）"
         return 1
     }
-    local only=${1:-} u token base
-    persistSubTokens
+    local only=${1:-} u token base regen=0
+    # 令牌刚变过、或某个用户的订阅文件还不存在 -> 先重新发布，再显示链接（否则会打印出尚未生效的新链接，旧链接还在被提供）
+    persistUserSecrets
+    ((USER_SECRETS_CHANGED)) && regen=1
+    while IFS= read -r u; do
+        [[ -z "${u}" ]] && continue
+        [[ -e "${SUB_DIR}/default/$(subscriptionToken "${u}")" ]] || regen=1
+    done < <(userNames)
+    if ((regen)); then
+        generateSubscription || {
+            echoContent red " ---> 订阅文件未能发布，无法提供可用的订阅链接"
+            return 1
+        }
+    fi
     base=$(subscriptionBase)
     [[ "${base}" == http://* ]] && echoContent yellow " ---> 提示: 当前为 HTTP 明文订阅，可能被运营商拦截，建议配置域名证书后使用 HTTPS"
     while IFS= read -r u; do
@@ -4443,7 +4686,16 @@ installProtocols() {
     shift
     local -a ids=("$@")
     local id needTLS=0 needReality=0 needNginx=0 needPath=0 n=0 total i
-    local reuse="n"
+    local reuse="n" egress=""
+
+    # 最开始先问出口访问模式（已经选过就沿用，不再重复问）
+    egress=$(S '.egress.mode // ""' 2>/dev/null)
+    if [[ -z "${egress}" ]]; then
+        pickEgressMode "" || return 1
+        egress=${EGRESS_PICK}
+    else
+        echoContent green " ---> 出口访问模式沿用: $(egressModeLabel "${egress}")（可在 11.分流工具 → 6 修改）"
+    fi
 
     # Xray 的 WS/VMess-WS/Trojan 只能挂在 Vision 前置的回落上
     if [[ "${core}" == "xray" ]]; then
@@ -4489,6 +4741,8 @@ installProtocols() {
             NEW_STATE=$(stateDefault | jq .)
         fi
     fi
+
+    stagedEdit --arg m "${egress}" '.egress.mode=$m' || return 1
 
     # 协议若已在另一个核心上，需要确认迁移
     for id in "${ids[@]}"; do
@@ -4627,7 +4881,7 @@ installOneClickFlow() {
 
 # 非交互入口: atr install-anytls-reality [--port N] [--sni host[:port]] [--user name]
 cliInstallAnyTLSReality() {
-    local port="" sni="" user="" a
+    local port="" sni="" user="" egress="" a
     while [[ $# -gt 0 ]]; do
         a=$1
         case "${a}" in
@@ -4641,6 +4895,10 @@ cliInstallAnyTLSReality() {
             ;;
         --user)
             user=$2
+            shift
+            ;;
+        --egress)
+            egress=$2
             shift
             ;;
         *)
@@ -4658,6 +4916,10 @@ cliInstallAnyTLSReality() {
         echoContent red " ---> 用户名不合法"
         return 1
     }
+    [[ -n "${egress}" && "${egress}" != "public" && "${egress}" != "full" ]] && {
+        echoContent red " ---> --egress 只能是 public（公网出口，默认）或 full（允许内网访问）"
+        return 1
+    }
     if [[ -n "${sni}" ]] && ! parseSniInput "${sni}"; then
         echoContent red " ---> SNI 不合法"
         return 1
@@ -4666,6 +4928,9 @@ cliInstallAnyTLSReality() {
     ensureCore sing-box 2 5 || return 1
     stateInit
     stagedBegin
+    # 未指定时：已经选过就沿用，否则默认公网出口（更安全的一侧）
+    [[ -z "${egress}" ]] && egress=$(stagedGet '.egress.mode // ""')
+    stagedEdit --arg m "${egress:-public}" '.egress.mode=$m' || return 1
     [[ -z "${port}" ]] && port=$(suggestPort tcp anytls_reality)
     if [[ -z "${sni}" ]]; then
         SNI_HOST=www.microsoft.com
@@ -5275,7 +5540,7 @@ _remoteList() {
 # 旧版把远程机器写在 subscribe_remote/remoteSubscribeUrl 里，并要求两台机器共用同一个 salt；该机制已淘汰
 _importLegacyRemotes() {
     [[ -s "${SUB_REMOTE_FILE}" ]] || return 0
-    local line host port alias scheme n=0
+    local line host port alias scheme n=0 skipped=0
     echoContent yellow "\n 发现旧版远程订阅文件（${SUB_REMOTE_FILE}）：旧机制要求各机器共用 salt，已被淘汰且不再生效。"
     confirm "把其中的条目导入为「待补充对等密钥」的新条目？（导入后旧文件改名为 .migrated）" y || return 0
     stagedBegin
@@ -5285,7 +5550,10 @@ _importLegacyRemotes() {
         port=$(cut -d: -f2 <<<"${line}")
         alias=$(cut -d: -f3 <<<"${line}")
         scheme=https
-        [[ "$(cut -d: -f4 <<<"${line}")" == "http" ]] && scheme=http
+        if [[ "$(cut -d: -f4 <<<"${line}")" == "http" ]]; then # 对等订阅只允许 HTTPS
+            skipped=$((skipped + 1))
+            continue
+        fi
         _remoteFieldsOK "${host}" "${port}" "${alias}" "${scheme}" || continue
         stagedGet --arg a "${alias}" '(.nginx.subscribe.remotes // [])[]|select(.alias==$a)|.alias' | grep -q . && continue
         stagedEdit --arg h "${host}" --argjson p "$((10#${port}))" --arg a "${alias}" --arg s "${scheme}" \
@@ -5295,6 +5563,7 @@ _importLegacyRemotes() {
     if ((n > 0)) && applyStaged "导入旧版远程订阅条目"; then
         mv -f "${SUB_REMOTE_FILE}" "${SUB_REMOTE_FILE}.migrated"
         echoContent green " ---> 已导入 ${n} 条，请用「4.修改某台机器的对等密钥」补充对方的对等密钥后才会生效"
+        ((skipped > 0)) && echoContent yellow " ---> 另有 ${skipped} 条 HTTP 条目没有导入：对等订阅现在只支持 HTTPS（对等密钥不能明文传输）"
     else
         stagedDiscard
     fi
@@ -5372,7 +5641,6 @@ otherSubscriptionMenu() {
             echoContent red " ---> 别名已存在: ${alias}"
             return 1
         fi
-        confirm "对方是 HTTP（明文）订阅吗？明文传输会让对等密钥被窃听，不推荐" n && scheme=http
         ask key "请输入对方机器的对等密钥:" || return 1
         if [[ ! "${key}" =~ ^[A-Za-z0-9]{16,64}$ ]]; then
             echoContent red " ---> 对等密钥格式不合法（16-64 位字母数字）"
@@ -6141,6 +6409,74 @@ sniRoutingMenu() {
 }
 
 # ----------------------------- 11. 分流工具 -----------------------------------
+# 出口访问模式（决定客户端能不能经节点访问本机和内网）。选择结果放在 EGRESS_PICK，不改状态；输入结束返回 1
+EGRESS_PICK=""
+pickEgressMode() { # pickEgressMode [当前值] [回车默认: 1|2]
+    local cur=${1:-} def=${2:-} c
+    [[ -z "${def}" ]] && { [[ "${cur}" == "full" ]] && def=2 || def=1; }
+    EGRESS_PICK=""
+    echoContent skyBlue "\n---------------- 出口访问模式 ----------------"
+    echoContent yellow "决定通过节点连进来的客户端，能不能访问这台服务器本机和内网里的服务："
+    echoContent yellow "1.公网出口【推荐】  客户端只能访问公网。禁止：本机回环(127.0.0.0/8、::1)、内网/私网、链路本地(含云厂商元数据"
+    echoContent yellow "                   169.254.169.254)、本机自己所有网卡的地址(含公网 IP)；域名解析到这些地址同样会被拦截"
+    echoContent yellow "2.允许内网访问       不做任何限制。仅当你信任所有节点用户、并且确实需要经节点访问本机/内网服务时选择"
+    echoContent yellow "之后可以在 11.分流工具 → 6.出口访问模式 里随时切换。"
+    ask c "请选择[回车默认 ${def}]:" || return 1
+    case "${c:-${def}}" in
+    1) EGRESS_PICK=public ;;
+    2) EGRESS_PICK=full ;;
+    *)
+        echoContent red " ---> 选择错误"
+        return 1
+        ;;
+    esac
+}
+
+egressModeLabel() { # egressModeLabel <mode>
+    case "${1:-}" in
+    public) echo "公网出口（禁止访问本机与内网）" ;;
+    full) echo "允许内网访问（不限制）" ;;
+    *) echo "未选择（当前等同于允许内网访问）" ;;
+    esac
+}
+
+# 11.分流工具 → 6.出口访问模式
+egressMenu() {
+    requireInstalled || return 1
+    local cur
+    cur=$(S '.egress.mode // ""')
+    echoContent skyBlue "\n功能 1/1 : 出口访问模式"
+    echoContent yellow "当前: $(egressModeLabel "${cur}")"
+    pickEgressMode "${cur}" || return 1
+    if [[ "${EGRESS_PICK}" == "${cur}" ]]; then
+        echoContent green " ---> 没有变化"
+        return 0
+    fi
+    stagedBegin
+    stagedEdit --arg m "${EGRESS_PICK}" '.egress.mode=$m' || return 1
+    if applyStaged "出口访问模式: $(egressModeLabel "${EGRESS_PICK}")"; then
+        echoContent green " ---> 已切换为: $(egressModeLabel "${EGRESS_PICK}")（新连接立即生效）"
+    else
+        stagedDiscard
+        return 1
+    fi
+}
+
+# 老安装（升级前没有这个选项）打开菜单时问一次；回车 = 保持现状，所以不选也不会改变任何行为
+egressModeNotice() {
+    stateExists && [[ -n "$(installedProtocols)" ]] || return 0
+    [[ -z "$(S '.egress.mode // ""')" ]] || return 0
+    echoContent yellow "\n 出口访问模式: 这台服务器还没有选择过。目前不限制客户端访问本机和内网（等同于「允许内网访问」）。"
+    pickEgressMode "" 2 || return 0
+    stagedBegin
+    stagedEdit --arg m "${EGRESS_PICK}" '.egress.mode=$m' || return 0
+    if applyStaged "出口访问模式: $(egressModeLabel "${EGRESS_PICK}")"; then
+        echoContent green " ---> 已设置为: $(egressModeLabel "${EGRESS_PICK}")"
+    else
+        stagedDiscard
+    fi
+}
+
 routingToolsMenu() {
     local c
     echoContent skyBlue "\n功能 1/1 : 分流工具"
@@ -6152,6 +6488,7 @@ routingToolsMenu() {
     echoContent yellow "3.IPv6分流"
     echoContent yellow "4.Socks5分流【替换任意门分流】"
     echoContent yellow "5.DNS分流"
+    echoContent yellow "6.出口访问模式【决定客户端能不能访问本机和内网】"
     echoContent yellow "7.SNI反向代理分流"
     ask c "请选择:" || return 1
     case "${c}" in
@@ -6160,6 +6497,7 @@ routingToolsMenu() {
     3) ipv6Menu ;;
     4) socks5Menu ;;
     5) dnsRoutingMenu ;;
+    6) egressMenu ;;
     7) sniRoutingMenu ;;
     *) echoContent red " ---> 选择错误" ;;
     esac
@@ -6292,6 +6630,7 @@ showInstallStatus() {
         protoNames+="$(protoName "${x}") "
     done < <(installedProtocols)
     [[ -n "${protoNames}" ]] && echoContent yellow "已安装协议: ${protoNames}"
+    echoContent yellow "出口访问模式: $(egressModeLabel "$(S '.egress.mode // ""')")"
     if stateNeedsNginx "${ATR_STATE}"; then
         if serviceActive "${NGX_UNIT}"; then echoContent yellow "nginx: 运行中"; else echoContent yellow "nginx: 未运行"; fi
     fi
@@ -6502,6 +6841,7 @@ ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+R
         --port N        监听端口(默认 443，被占用则随机)
         --sni host[:p]  Reality 目标域名(默认 www.microsoft.com)
         --user name     首个用户名(默认随机)
+        --egress MODE   出口访问模式: public 公网出口(默认，禁止客户端访问本机与内网) | full 允许内网访问
   status                           查看服务与端口状态
   show [用户] [1]                  查看账号(第二个参数 1 同时显示二维码)
   sub [用户]                       查看订阅链接
@@ -6509,6 +6849,7 @@ ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+R
   sni <host[:port]> [--force]      修改 Reality 目标域名(SNI)
   passwd <用户> [新密码] [--keep-sub]  重置密码(不给则随机)；订阅已启用时默认同时更换订阅链接，--keep-sub 保留旧链接
   adduser <用户> [uuid] [密码]     添加用户
+        (密码参数写成 - 表示从标准输入读取，避免密码出现在 ps / shell 历史里；passwd 同理)
   deluser <用户>                   删除用户(至少保留一个)
   restart                          重启全部服务
   log [sing-box|xray|nginx|acme]   查看日志(Ctrl+C 返回)
@@ -6546,9 +6887,21 @@ cliSetSNI() { # cliSetSNI <host[:port]> [--force]
     fi
 }
 
+# 命令行参数会出现在 ps 与 shell 历史里。密码参数写成 "-" 表示改从标准输入读取一行
+_secretArg() { # _secretArg <值>
+    local s
+    if [[ "${1:-}" == "-" ]]; then
+        IFS= read -r s || s=""
+        printf '%s' "${s}"
+    else
+        printf '%s' "${1:-}"
+    fi
+}
+
 cliAddUser() { # cliAddUser <name> [uuid] [password]
     local name=${1:-} uuid=${2:-} pass=${3:-}
     requireInstalled || return 1
+    pass=$(_secretArg "${pass}")
     isSafeName "${name}" || {
         echoContent red " ---> 用户名不合法"
         return 1
@@ -6595,6 +6948,7 @@ cliPasswd() { # cliPasswd <用户> [新密码] [--keep-sub]
     for a in "$@"; do
         if [[ "${a}" == "--keep-sub" ]]; then rotate=0; else args+=("${a}"); fi
     done
+    args[1]=$(_secretArg "${args[1]:-}")
     userResetFlow "${args[0]:-}" "${args[1]:-}" password "${rotate}"
 }
 
@@ -6604,6 +6958,7 @@ securityUpgradeNotice() {
     nginxModelCurrent && return 0
     echoContent yellow "\n 安全升级: 检测到旧版 nginx 权限模型（订阅文件对本机所有用户可读，nginx 以发行版默认账号运行）。"
     echoContent yellow "           升级会创建专用账号 ${NGX_USER}、收紧订阅目录权限，并重启 nginx（sing-box / Xray 不受影响）。"
+    echoContent yellow "           现在不升级也可以；但之后任何一次发布订阅（含 ${ATR_CMD} sub / ${ATR_CMD} restart）都会先自动完成升级，不会再以公开可读的权限写出订阅文件。"
     confirm "是否现在升级？" y || return 0
     stagedBegin
     if applyStaged "安全升级: nginx 专用账号与订阅权限"; then
@@ -6735,6 +7090,7 @@ main() {
     menu)
         warnV2rayAgentConflict
         securityUpgradeNotice
+        egressModeNotice
         menuLoop
         ;;
     install-anytls-reality) cliInstallAnyTLSReality "$@" ;;
