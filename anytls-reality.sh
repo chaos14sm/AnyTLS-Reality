@@ -18,7 +18,7 @@
 # =============================================================================
 export LANG=en_US.UTF-8
 
-ATR_VERSION="v1.0.0"
+ATR_VERSION="v1.1.0"
 ATR_PROJECT_NAME="anytls-reality"
 
 # ----------------------------- 路径与常量 -----------------------------------
@@ -206,6 +206,8 @@ randStr() { # randStr [长度] [字符集]
 randHex() { randStr "${1:-8}" 'a-f0-9'; }
 randLower() { randStr "${1:-4}" 'a-z'; }
 newPassword() { randStr 20 'A-Za-z0-9'; }
+# 订阅令牌: 每个用户一个独立的随机值（128 位），与节点密码/UUID 没有任何数学关系
+newSubToken() { randHex 32; }
 newUUID() {
     if [[ -x "${SB_BIN}" ]]; then
         "${SB_BIN}" generate uuid
@@ -513,14 +515,30 @@ jqVersionOK() {
     ((major > 1 || (major == 1 && minor >= 6)))
 }
 
-# 无法通过包管理器获得合格 jq 时，下载官方静态二进制
+# 无法通过包管理器获得合格 jq 时，下载官方静态二进制。
+# 固定版本并校验 SHA256（哈希取自 jqlang/jq 该版本发布的 sha256sum.txt，写死在脚本里，不依赖下载渠道，
+# 经 GITHUB_PROXY 下载也无法被替换）；校验不通过的文件绝不会被执行。
+JQ_BOOT_VERSION="1.7.1"
+JQ_BOOT_SHA256_AMD64="5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5"
+JQ_BOOT_SHA256_ARM64="4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5"
 bootstrapJq() {
-    mkdir -p "${ATR_HOME}/bin"
-    export PATH="${ATR_HOME}/bin:${PATH}"
-    echoContent green " ---> 下载 jq 静态二进制"
-    if download "https://github.com/jqlang/jq/releases/latest/download/${CPU_JQ}" "${ATR_HOME}/bin/jq"; then
-        chmod 755 "${ATR_HOME}/bin/jq"
+    local want tmp
+    case "${CPU_JQ}" in
+    jq-linux-amd64) want=${JQ_BOOT_SHA256_AMD64} ;;
+    jq-linux-arm64) want=${JQ_BOOT_SHA256_ARM64} ;;
+    *) return 1 ;;
+    esac
+    tmp=$(mktemp "${ATR_TMP:-/tmp}/jq.XXXXXX") || return 1
+    echoContent green " ---> 下载 jq ${JQ_BOOT_VERSION} 静态二进制（固定版本，SHA256 校验）"
+    if download "https://github.com/jqlang/jq/releases/download/jq-${JQ_BOOT_VERSION}/${CPU_JQ}" "${tmp}" &&
+        [[ "$(sha256sum "${tmp}" 2>/dev/null | awk '{print $1}')" == "${want}" ]]; then
+        mkdir -p "${ATR_HOME}/bin"
+        export PATH="${ATR_HOME}/bin:${PATH}"
+        install -m 755 "${tmp}" "${ATR_HOME}/bin/jq"
+    else
+        echoContent red " ---> jq 下载失败或 SHA256 校验不通过，已丢弃该文件"
     fi
+    rm -f "${tmp}"
     jqVersionOK
 }
 
@@ -707,7 +725,7 @@ stateDefault() {
   "cdn": "",
   "alpn": "h2",
   "extra_ports": [],
-  "nginx": {"subscribe": {"enabled": false, "port": 0, "ssl": true, "salt": ""}, "redirect302": ""},
+  "nginx": {"subscribe": {"enabled": false, "port": 0, "ssl": true, "peer_key": "", "remotes": []}, "redirect302": ""},
   "routing": {
     "block_bt": false,
     "global": "",
@@ -728,13 +746,83 @@ EOF
 
 stateExists() { [[ -s "${ATR_STATE}" ]] && jq -e . "${ATR_STATE}" >/dev/null 2>&1; }
 
+# ----------------------------- nginx 专用账号与目录权限 ------------------------
+# 订阅目录里有全部用户的节点凭据。nginx worker 使用专用系统账号（无登录、无家目录），
+# 只有 root 与该账号所属的组能读取订阅目录；其他本机用户既不能列目录，也不能读文件。
+NGX_USER="atr-nginx"
+ngxWorkerUser() { echo "${ATR_NGINX_USER:-${NGX_USER}}"; } # ATR_NGINX_USER 仅用于测试环境
+ngxWorkerGroup() { id -gn "$(ngxWorkerUser)" 2>/dev/null; }
+_sbinCmd() { # 非 root 的 PATH 里常常没有 /usr/sbin
+    command -v "$1" 2>/dev/null && return 0
+    local d
+    for d in /usr/sbin /sbin; do
+        [[ -x "${d}/$1" ]] && {
+            echo "${d}/$1"
+            return 0
+        }
+    done
+    return 1
+}
+ensureNginxAccount() {
+    local u uadd nologin
+    u=$(ngxWorkerUser)
+    id -u "${u}" >/dev/null 2>&1 && return 0
+    [[ "${u}" == "${NGX_USER}" ]] || return 1 # 显式指定的账号不存在时，不替用户创建
+    uadd=$(_sbinCmd useradd) || return 1
+    nologin=$(_sbinCmd nologin) || nologin=/usr/sbin/nologin
+    "${uadd}" --system --user-group --no-create-home --home-dir /nonexistent --shell "${nologin}" "${u}" >/dev/null 2>&1
+    id -u "${u}" >/dev/null 2>&1
+}
+removeNginxAccount() {
+    local c
+    id -u "${NGX_USER}" >/dev/null 2>&1 && {
+        c=$(_sbinCmd userdel) && "${c}" "${NGX_USER}" >/dev/null 2>&1
+    }
+    if getent group "${NGX_USER}" >/dev/null 2>&1; then
+        c=$(_sbinCmd groupdel) && "${c}" "${NGX_USER}" >/dev/null 2>&1
+    fi
+    return 0
+}
+# 目录权限模型:
+#   不需要 nginx: ATR_HOME 与 subscribe/ 只有 root 能进入（700）
+#   需要 nginx:   ATR_HOME 为 root:<nginx 组> 710（该组只能"穿越"进去读取 www/ 与 subscribe/，不能列目录）；
+#                 subscribe/ 为 root:<nginx 组> 750，里面的文件 640。
+#   clients/、backup/、tls/、state.json、各核心配置保持各自的 700/600，与此无关。
+applyHomePerms() { # applyHomePerms <是否需要 nginx: 0|1>
+    local need=${1:-0} g
+    mkdir -p "${SUB_DIR}"
+    if ((need)); then
+        g=$(ngxWorkerGroup)
+        [[ -n "${g}" ]] || return 1
+        chown root:"${g}" "${ATR_HOME}" || return 1
+        chmod 710 "${ATR_HOME}"
+        chown -R root:"${g}" "${SUB_DIR}" || return 1
+        find "${SUB_DIR}" -type d -exec chmod 750 {} + 2>/dev/null
+        find "${SUB_DIR}" -type f -exec chmod 640 {} + 2>/dev/null
+    else
+        chown root:root "${ATR_HOME}" 2>/dev/null
+        chown -R root:root "${SUB_DIR}" 2>/dev/null
+        chmod 700 "${ATR_HOME}"
+        chmod -R go-rwx "${SUB_DIR}" 2>/dev/null
+    fi
+    return 0
+}
+# nginx 主配置是否已经是"专用账号"模型（升级前的旧安装不是）
+nginxModelCurrent() { grep -q "^user $(ngxWorkerUser);" "${NGX_CONF}" 2>/dev/null; }
+
 stateInit() {
     mkdir -p "${ATR_HOME}" "${TLS_DIR}" "${CLIENT_DIR}" "${BACKUP_DIR}" "${SB_DIR}/conf" "${XRAY_DIR}/conf" "${WEB_ROOT}" "${SUB_DIR}"
     chmod 700 "${TLS_DIR}" "${CLIENT_DIR}" "${BACKUP_DIR}" 2>/dev/null
-    chmod 755 "${WEB_ROOT}" "${SUB_DIR}" 2>/dev/null
-    # 711: 其他用户只能"穿越"到 www/ 与 subscribe/（nginx worker 降权后需要读取），不能列目录；
-    # 私密内容各自保持 600/700（state.json、clients/、backup/、tls/、配置文件）
-    chmod 711 "${ATR_HOME}" 2>/dev/null
+    chmod 755 "${WEB_ROOT}" 2>/dev/null
+    # ATR_HOME / subscribe/ 的权限按"当前已生效的状态是否需要 nginx"设置（不需要时只有 root 能进入）。
+    # 升级前的旧安装还没有 nginx 专用账号：保持原状，由 applyServices 在重启 nginx 之前统一迁移。
+    local need=0
+    if stateExists && declare -F stateNeedsNginx >/dev/null && stateNeedsNginx "${ATR_STATE}"; then need=1; fi
+    if ((need)); then
+        if [[ -n "$(ngxWorkerGroup)" ]] && nginxModelCurrent; then applyHomePerms 1; fi
+    else
+        applyHomePerms 0
+    fi
     if ! stateExists; then
         stateDefault | jq . | atomicWrite "${ATR_STATE}" 600
     fi
@@ -778,6 +866,9 @@ protoPort() { S --arg id "$1" '.protocols[$id].port // empty'; }
 userCount() { S '.users|length'; }
 userNames() { S '.users[].name'; }
 userExists() { jq -e --arg n "$1" '.users[]|select(.name==$n)' "${ATR_STATE}" >/dev/null 2>&1; }
+# 订阅 URL 令牌: 每个用户一个独立的随机令牌（存于 state.json）。重置节点密码/UUID 不会改变它；
+# 需要收回已泄露的订阅链接时，请单独"更换订阅链接"
+subscriptionToken() { S --arg n "$1" '.users[]|select(.name==$n)|.sub_token // empty'; }
 
 # ----------------------------- 状态校验 --------------------------------------
 # 返回错误列表(每行一个)，空表示通过。校验的是"候选状态"（stdin）
@@ -799,7 +890,10 @@ def netof($id): if (udp_ids | index($id)) != null then "udp" else "tcp" end;
     # 至少一个用户
     (if ($P | length) > 0 and ($U | length) == 0 then "没有用户" else empty end),
     # 用户名唯一
-    ($U | group_by(.name)[] | select(length > 1) | "用户名重复: \(.[0].name)")
+    ($U | group_by(.name)[] | select(length > 1) | "用户名重复: \(.[0].name)"),
+    # Socks5 入站必须有来源 IP 白名单: 空数组会被 sing-box 当作"不限制来源"，等于对所有来源放行
+    (if (.routing.socks5_in.port // null) != null and ((.routing.socks5_in.allow_ips // []) | length) == 0
+     then "Socks5 入站的来源 IP 白名单为空（空白名单等于允许所有来源）；请在 11.分流工具→Socks5入站→3 里重新设置" else empty end)
   ]
 | .[]
 EOF
@@ -852,7 +946,7 @@ stagedUserAdd() {
         echoContent red " ---> UUID 已被其他用户使用"
         return 1
     fi
-    stagedEdit --arg n "${name}" --arg u "${uuid}" --arg p "${pass}" '.users += [{name:$n,uuid:$u,password:$p}]'
+    stagedEdit --arg n "${name}" --arg u "${uuid}" --arg p "${pass}" --arg t "$(newSubToken)" '.users += [{name:$n,uuid:$u,password:$p,sub_token:$t}]'
 }
 
 # 从候选状态删除用户，至少保留一个
@@ -969,16 +1063,41 @@ listStableVersions() { # listStableVersions <core> [数量]
 # ----------------------------- 下载校验 --------------------------------------
 sha256Of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
-# 取得资产的期望 sha256（取不到返回空）
 fetchExpectedSha256() { # fetchExpectedSha256 <core> <tag> <资产名>
-    local core=$1 tag=$2 asset=$3
-    if [[ "${core}" == "sing-box" ]]; then
-        curl -fsSL -m 15 "https://api.github.com/repos/${REPO_SB}/releases/tags/${tag}" 2>/dev/null |
-            jq -r --arg n "${asset}" '.assets[]|select(.name==$n)|.digest // empty' 2>/dev/null | sed 's/^sha256://'
-    else
-        curl -fsSL -m 15 "$(ghURL "https://github.com/${REPO_XRAY}/releases/download/${tag}/${asset}.dgst")" 2>/dev/null |
-            awk '/^SHA2-256=/{print $2; exit}'
+    # 取得资产的期望 sha256（取不到返回 1）。
+    # 优先用 GitHub API 的 assets[].digest: api.github.com 不经过 GITHUB_PROXY，所以即使下载代理不可信，
+    # 校验值仍来自独立渠道。ATR_EXPECTED_SHA256 可手动指定（自行从可信渠道核对后得到）。
+    local core=$1 tag=$2 asset=$3 d i repo
+    if [[ -n "${ATR_EXPECTED_SHA256:-}" ]]; then
+        d=${ATR_EXPECTED_SHA256,,}
+        if [[ "${d}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "${d}"
+            return 0
+        fi
+        echoContent red " ---> ATR_EXPECTED_SHA256 不是合法的 64 位十六进制 SHA256" >&2
+        return 1
     fi
+    repo=$(coreRepo "${core}")
+    for i in 1 2 3; do
+        d=$(curl -fsSL -m 15 "https://api.github.com/repos/${repo}/releases/tags/${tag}" 2>/dev/null |
+            jq -r --arg n "${asset}" '.assets[]|select(.name==$n)|.digest // empty' 2>/dev/null | sed 's/^sha256://')
+        if [[ "${d}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "${d}"
+            return 0
+        fi
+        ((i < 3)) && sleep 2
+    done
+    # API 没有给出摘要（旧版本资产，或被限流）: Xray 另有官方 .dgst 文件。但只有在没配置下载代理时才采用，
+    # 否则 .dgst 与压缩包走同一个代理，恶意代理可以同时替换两者，校验就失去意义
+    if [[ "${core}" == "xray" && -z "${GITHUB_PROXY}" ]]; then
+        d=$(curl -fsSL -m 15 "https://github.com/${REPO_XRAY}/releases/download/${tag}/${asset}.dgst" 2>/dev/null |
+            awk '/^SHA2-256=/{print $2; exit}')
+        if [[ "${d}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "${d}"
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # ----------------------------- 安装二进制 ------------------------------------
@@ -997,6 +1116,20 @@ installCoreBinary() {
         url="https://github.com/${REPO_XRAY}/releases/download/${tag}/${asset}"
     fi
 
+    # 先取校验值: 取不到就不必下载几十 MB 再中止，也保证任何下载物在被解压/执行之前就已完成校验
+    expected=$(fetchExpectedSha256 "${core}" "${tag}" "${asset}")
+    if [[ -z "${expected}" ]]; then
+        if [[ "${ATR_ALLOW_UNVERIFIED:-0}" == "1" ]]; then
+            echoContent red " ---> 警告: 未能取得官方校验值，按 ATR_ALLOW_UNVERIFIED=1 的要求跳过校验，下载内容的完整性与来源无法保证！"
+        else
+            echoContent red " ---> 未能取得官方 SHA256 校验值，已中止安装（不会运行未经校验的程序）"
+            echoContent yellow "      常见原因: GitHub API 限流或网络受限，请稍后重试。"
+            echoContent yellow "      也可以先从可信渠道核对该文件的 SHA256，再用 ATR_EXPECTED_SHA256=<64位十六进制> 重新运行。"
+            rm -rf "${work}"
+            return 1
+        fi
+    fi
+
     echoContent green " ---> 下载 $(coreLabel "${core}") ${tag}"
     if ! download "${url}" "${work}/${asset}"; then
         echoContent red " ---> 下载失败: ${url}"
@@ -1004,7 +1137,6 @@ installCoreBinary() {
         return 1
     fi
 
-    expected=$(fetchExpectedSha256 "${core}" "${tag}" "${asset}")
     if [[ -n "${expected}" ]]; then
         actual=$(sha256Of "${work}/${asset}")
         if [[ "${actual}" != "${expected}" ]]; then
@@ -1015,8 +1147,6 @@ installCoreBinary() {
             return 1
         fi
         echoContent green " ---> SHA256 校验通过"
-    else
-        echoContent yellow " ---> 未能获取官方校验值，跳过 SHA256 校验"
     fi
 
     if [[ "${core}" == "sing-box" ]]; then
@@ -1942,7 +2072,9 @@ read -r -d '' JQ_SINGBOX <<'EOF'
                 # Socks5 入站: 仅允许指定来源 IP 访问指定目标，其余一律拒绝（它是明文代理，绝不能对外开放）
                 + (if $haveS5in then
                      ((if ($R.socks5_in.ip_strategy // "") != "" then [{inbound: "socks5_inbound", action: "resolve", strategy: $R.socks5_in.ip_strategy}] else [] end)
-                      + (if ($R.socks5_in.all // false) then [{inbound: ["socks5_inbound"], source_ip_cidr: ($R.socks5_in.allow_ips // []), outbound: "direct"}]
+                      # 来源白名单为空时不生成任何放行规则（只剩最后的 reject）: source_ip_cidr 为空数组会被 sing-box 当作"不限制来源"
+                      + (if (($R.socks5_in.allow_ips // []) | length) == 0 then []
+                         elif ($R.socks5_in.all // false) then [{inbound: ["socks5_inbound"], source_ip_cidr: ($R.socks5_in.allow_ips // []), outbound: "direct"}]
                          else ([ (if (dom($R.socks5_in.domains // []) | length) > 0 then {inbound: ["socks5_inbound"], source_ip_cidr: ($R.socks5_in.allow_ips // []), domain_suffix: dom($R.socks5_in.domains // []), outbound: "direct"} else empty end),
                                  (if (gsite($R.socks5_in.domains // []) | length) > 0 then {inbound: ["socks5_inbound"], source_ip_cidr: ($R.socks5_in.allow_ips // []), rule_set: [gsite($R.socks5_in.domains // [])[] | "geosite-" + .], outbound: "direct"} else empty end) ]) end)
                       + [{inbound: ["socks5_inbound"], action: "reject"}])
@@ -2142,9 +2274,11 @@ stateNeedsNginx() {
 writeNginxMainConf() {
     mkdir -p "${NGX_DIR}/tmp/body" "${NGX_DIR}/tmp/proxy" "${NGX_DIR}/tmp/fastcgi" \
         "${NGX_DIR}/tmp/uwsgi" "${NGX_DIR}/tmp/scgi" "${NGX_CONFD}" "${WEB_ROOT}"
-    local userLine=""
-    # 默认由 nginx 自己降权；测试环境可通过 ATR_NGINX_USER 指定
-    [[ -n "${ATR_NGINX_USER:-}" ]] && userLine="user ${ATR_NGINX_USER};"
+    # worker 使用专用账号 atr-nginx（见 ensureNginxAccount）；测试环境可通过 ATR_NGINX_USER 指定
+    local userLine
+    userLine="user $(ngxWorkerUser);"
+    # worker 要往临时目录写（请求体/代理缓冲）；nginx 自己通常会 chown，这里显式做一次，不依赖这个行为
+    chown -R "$(ngxWorkerUser):$(ngxWorkerGroup)" "${NGX_DIR}/tmp" 2>/dev/null || true
     atomicWrite "${NGX_CONF}" 644 <<EOF
 ${userLine}
 worker_processes auto;
@@ -2320,6 +2454,11 @@ EOF
         default_type 'text/plain; charset=utf-8';
         alias ${SUB_DIR}/\$1/\$2;
     }
+    # 供其他机器合并本机订阅的对等端点: /s/peer/<对等密钥>/<用户名>/<类型>（路径各段均限定字符集，杜绝路径穿越）
+    location ~ "^/s/peer/([A-Za-z0-9]{16,64})/([A-Za-z0-9_][A-Za-z0-9._@-]{0,47})/(default|clashMeta|sing-box_profiles)\$" {
+        default_type 'text/plain; charset=utf-8';
+        alias ${SUB_DIR}/peer/\$1/\$2/\$3;
+    }
     location / {
     }
 }
@@ -2387,15 +2526,26 @@ After=network.target nss-lookup.target
 [Service]
 User=root
 WorkingDirectory=${SB_DIR}
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+# 只保留服务端真正需要的能力（去掉了仅用于按进程名分流的两个能力）
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=${ATR_HOME}
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 ExecStartPre=${SB_BIN} check -c ${SB_CONF}
 ExecStart=${SB_BIN} run -c ${SB_CONF}
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=10
-LimitNPROC=infinity
-LimitNOFILE=infinity
+LimitNOFILE=1048576
+TasksMax=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -2412,13 +2562,25 @@ After=network.target nss-lookup.target
 User=root
 WorkingDirectory=${XRAY_DIR}
 Environment="XRAY_LOCATION_ASSET=${XRAY_DIR}"
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=${ATR_HOME}
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 ExecStartPre=${XRAY_BIN} run -test -c ${XRAY_CONF}
 ExecStart=${XRAY_BIN} run -c ${XRAY_CONF}
 Restart=on-failure
 RestartPreventExitStatus=23
 RestartSec=10
-LimitNPROC=infinity
-LimitNOFILE=infinity
+LimitNOFILE=1048576
+TasksMax=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -2705,7 +2867,13 @@ prepareAssets() {
                         | map(select(startswith("geosite:") or startswith("geoip:"))) | unique[]' "${st}")
     fi
     if stateNeedsCore "${st}" xray; then ensureXrayGeo >/dev/null 2>&1; fi
-    if stateNeedsNginx "${st}"; then ensureNginx || return 1; fi
+    if stateNeedsNginx "${st}"; then
+        ensureNginx || return 1
+        if ! ensureNginxAccount; then
+            echoContent red " ---> 无法创建 nginx 专用账号 ${NGX_USER}（需要系统提供 useradd），未做任何改动"
+            return 1
+        fi
+    fi
     return 0
 }
 
@@ -2767,6 +2935,12 @@ applyServices() { # applyServices <state.json> [force]
 
     if ((needNgx)); then
         findNginxBin || ensureNginx || return 1
+        ensureNginxAccount || {
+            echoContent red " ---> 无法创建 nginx 专用账号 ${NGX_USER}（需要系统提供 useradd）"
+            return 1
+        }
+        # 在写入 `user ${NGX_USER};` 并重启 nginx 之前，先把目录权限切换到"专用组可读、其他用户不可读"的模型
+        applyHomePerms 1 || echoContent yellow " ---> 警告: 设置订阅目录权限失败，请检查 ${ATR_HOME} 的属主与权限"
         selinuxAllowNginxPorts "${st}"
         writeNginxMainConf
         writeUnit nginx
@@ -2775,6 +2949,7 @@ applyServices() { # applyServices <state.json> [force]
     else
         serviceActive "${NGX_UNIT}" && serviceStop "${NGX_UNIT}"
         serviceDisable "${NGX_UNIT}"
+        applyHomePerms 0
     fi
     if ((needSB)); then
         writeUnit sing-box
@@ -3542,72 +3717,161 @@ subscriptionBase() { # 订阅 URL 前缀 scheme://host:port
     echo "${scheme}://${host}:${port}"
 }
 
-subscriptionToken() { # 用户名 + salt 的 md5（订阅 URL 令牌）
-    printf '%s' "${1}$(S '.nginx.subscribe.salt')" | md5sum | awk '{print $1}'
+
+
+# 为没有订阅令牌的用户补齐随机令牌，并清掉旧版的全局 salt，直接写入 state.json
+# （旧版本升级，或手工构造的状态）。令牌不进入任何内核/nginx 配置，所以无需走完整事务、也无需重启服务。
+persistSubTokens() {
+    stateExists || return 0
+    local names n st cnt=0 hadSalt=0
+    names=$(jq -r '.users[]? | select((.sub_token // "") == "") | .name' "${ATR_STATE}" 2>/dev/null)
+    jq -e '(.nginx.subscribe // {}) | has("salt")' "${ATR_STATE}" >/dev/null 2>&1 && hadSalt=1
+    [[ -z "${names}" && "${hadSalt}" == "0" ]] && return 0
+    st=$(jq '.nginx.subscribe |= ((. // {}) | del(.salt) | . + {peer_key: (.peer_key // ""), remotes: (.remotes // [])})' "${ATR_STATE}") || return 0
+    while IFS= read -r n; do
+        [[ -z "${n}" ]] && continue
+        st=$(jq --arg n "${n}" --arg t "$(newSubToken)" '.users |= map(if .name==$n then .sub_token=$t else . end)' <<<"${st}") && cnt=$((cnt + 1))
+    done <<<"${names}"
+    printf '%s\n' "${st}" | atomicWrite "${ATR_STATE}" 600
+    if ((cnt > 0)) && [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
+        echoContent yellow " ---> 已为 ${cnt} 个用户生成独立的随机订阅令牌：旧订阅链接已失效，请在客户端重新导入新的订阅链接"
+    fi
+    atrLog "subscription tokens migrated: ${cnt} user(s), legacy salt removed=${hadSalt}"
+    return 0
 }
 
-# 把远程机器的订阅合并进本机用户订阅（远程用户名与 salt 需与本机一致，令牌才相同）
-_appendRemoteSubscriptions() { # _appendRemoteSubscriptions <令牌> <default文件> <clash文件> <singbox_profiles文件>
-    local token=$1 fdef=$2 fclash=$3 fsb=$4 line host port alias scheme tmp
-    [[ -s "${SUB_REMOTE_FILE}" ]] || return 0
+# ----------------------------- 合并其他机器的订阅 -----------------------------
+# 对方机器在 菜单 7→3→5 里开启「对等密钥」后，本机用这把密钥从
+#   <scheme>://<host>:<port>/s/peer/<对等密钥>/<用户名>/<类型>
+# 取回"同名用户"在对方机器上的节点。对等密钥只用于服务器之间合并，与各用户自己的订阅令牌互相独立；
+# 证书一律严格校验（私有 CA / 自签证书请在条目里提供 cacert 文件），取回内容必须通过格式校验才会被合并。
+_fetchRemote() { # _fetchRemote <url> <输出文件> <https|http> [CA 证书文件]  —— 成功返回 0（响应体可以为空）
+    local url=$1 out=$2 scheme=$3 ca=${4:-} sz
+    local -a opt=(-fsS -m 15 --max-redirs 0 --proto "=${scheme}")
+    [[ -n "${ca}" ]] && opt+=(--cacert "${ca}")
+    # 用 head -c 兜底限制大小（--max-filesize 对未知长度的分块传输不生效）
+    curl "${opt[@]}" "${url}" 2>/dev/null | head -c 2097153 >"${out}"
+    [[ "${PIPESTATUS[0]}" == "0" ]] || return 1
+    sz=$(stat -c %s "${out}" 2>/dev/null || echo 0)
+    ((sz <= 2097152))
+}
+_validRemoteDefault() { # 正文是 base64；解码后每个非空行都必须是 scheme://… 形式的链接
+    local dec line n=0
+    dec=$(base64 -d <"$1" 2>/dev/null) || return 1
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
-        host=$(cut -d: -f1 <<<"${line}")
-        port=$(cut -d: -f2 <<<"${line}")
-        alias=$(cut -d: -f3 <<<"${line}")
-        scheme=https
-        [[ "$(cut -d: -f4 <<<"${line}")" == "http" ]] && scheme=http
-        # host/port/alias 会进入 URL 与 sed 脚本，必须严格校验
-        isPort "${port}" && isSafeName "${alias}" || continue
-        isDomainName "${host}" || isIPv4 "${host}" || continue
-        tmp=$(mktemp "${ATR_TMP:-/tmp}/rs.XXXXXX")
-        # 通用订阅
-        if curl -fsSk -m 15 "${scheme}://${host}:${port}/s/default/${token}" -o "${tmp}" 2>/dev/null && [[ -s "${tmp}" ]]; then
+        [[ "${line}" =~ ^[a-z][a-z0-9+.-]*://[^[:space:][:cntrl:]]+$ ]] || return 1
+        n=$((n + 1))
+    done <<<"${dec}"
+    ((n > 0))
+}
+_validRemoteClash() { # 只接受本脚本生成的 proxies 片段: 首行可以是 "proxies:"，其余每一行都缩进两格；不允许控制字符
+    LC_ALL=C grep -q '[[:cntrl:]]' "$1" && return 1
+    awk 'NR==1 && $0=="proxies:" {next} /^  / {next} {bad=1} END{exit bad}' "$1"
+}
+_validRemoteSingbox() {
+    jq -e 'type == "array" and all(.[]; type == "object" and (.tag | type) == "string" and (.type | type) == "string")' "$1" >/dev/null 2>&1
+}
+# 条目字段是否合法（会进入 URL 与 sed 脚本，必须严格校验）
+_remoteFieldsOK() { # _remoteFieldsOK <host> <port> <alias> <scheme>
+    { isDomainName "$1" || isIPv4 "$1"; } && isPort "$2" && isSafeName "$3" && [[ "$4" == "https" || "$4" == "http" ]]
+}
+_appendRemoteSubscriptions() { # _appendRemoteSubscriptions <用户名> <default文件> <clash文件> <singbox_profiles文件>
+    local user=$1 fdef=$2 fclash=$3 fsb=$4 e host port alias scheme key ca tmp url reason
+    while IFS= read -r e; do
+        [[ -z "${e}" ]] && continue
+        host=$(jq -r '.host // ""' <<<"${e}")
+        port=$(jq -r '.port // ""' <<<"${e}")
+        alias=$(jq -r '.alias // ""' <<<"${e}")
+        scheme=$(jq -r '.scheme // "https"' <<<"${e}")
+        key=$(jq -r '.key // ""' <<<"${e}")
+        ca=$(jq -r '.cacert // ""' <<<"${e}")
+        _remoteFieldsOK "${host}" "${port}" "${alias}" "${scheme}" || continue
+        [[ "${key}" =~ ^[A-Za-z0-9]{16,64}$ ]] || continue # 没有对等密钥的条目（旧版导入）不参与合并
+        if [[ -n "${ca}" && ! -r "${ca}" ]]; then
+            echoContent yellow " ---> 远程订阅 ${alias}: CA 证书文件不可读(${ca})，已跳过"
+            continue
+        fi
+        url="${scheme}://${host}:${port}/s/peer/${key}/${user}"
+        tmp=$(mktemp "${ATR_TMP:-/tmp}/rs.XXXXXX") || continue
+        # 通用订阅: 取不到（连接/证书/密钥/用户名不对）或内容校验不过 -> 整条跳过并告知；
+        # 对方没有可分享的节点时返回空文件 -> 没有可合并的内容，不算失败
+        reason=""
+        if ! _fetchRemote "${url}/default" "${tmp}" "${scheme}" "${ca}"; then
+            reason="连接、证书、对等密钥或同名用户不匹配"
+        elif [[ -s "${tmp}" ]] && ! _validRemoteDefault "${tmp}"; then
+            reason="返回内容格式不合法"
+        fi
+        if [[ -n "${reason}" ]]; then
+            echoContent yellow " ---> 远程订阅 ${alias}(${host}:${port}): 取回或校验失败（${reason}），已跳过"
+            atrLog "remote subscription ${alias}: ${reason} (user ${user})"
+        elif [[ -s "${tmp}" ]]; then
             base64 -d <"${tmp}" 2>/dev/null | sed "s/#\([^#]*\)\$/#\1_${alias}/" >>"${fdef}"
-        fi
-        # clash: 去掉 proxies: 行并给 name 加后缀
-        if curl -fsSk -m 15 "${scheme}://${host}:${port}/s/clashMeta/${token}" -o "${tmp}" 2>/dev/null && [[ -s "${tmp}" ]]; then
-            grep -v '^proxies:' "${tmp}" | sed "s/^\\(  - name: \"[^\"]*\\)\"/\\1_${alias}\"/" >>"${fclash}"
-        fi
-        # sing-box 出站数组
-        if curl -fsSk -m 15 "${scheme}://${host}:${port}/s/sing-box_profiles/${token}" -o "${tmp}" 2>/dev/null && jq -e 'type=="array"' "${tmp}" >/dev/null 2>&1; then
-            jq --arg a "_${alias}" 'map(.tag += $a)' "${tmp}" >"${tmp}.2" && jq -s '.[0] + .[1]' "${fsb}" "${tmp}.2" >"${tmp}.3" && mv "${tmp}.3" "${fsb}"
+            # clash: 去掉 proxies: 行并给 name 加后缀
+            if _fetchRemote "${url}/clashMeta" "${tmp}" "${scheme}" "${ca}" && [[ -s "${tmp}" ]] && _validRemoteClash "${tmp}"; then
+                grep -v '^proxies:' "${tmp}" | sed "s/^\\(  - name: \"[^\"]*\\)\"/\\1_${alias}\"/" >>"${fclash}"
+            fi
+            # sing-box 出站数组
+            if _fetchRemote "${url}/sing-box_profiles" "${tmp}" "${scheme}" "${ca}" && [[ -s "${tmp}" ]] && _validRemoteSingbox "${tmp}"; then
+                jq --arg a "_${alias}" 'map(.tag += $a)' "${tmp}" >"${tmp}.2" && jq -s '.[0] + .[1]' "${fsb}" "${tmp}.2" >"${tmp}.3" && mv "${tmp}.3" "${fsb}"
+            fi
         fi
         rm -f "${tmp}" "${tmp}.2" "${tmp}.3"
-    done <"${SUB_REMOTE_FILE}"
+    done < <(S -c '(.nginx.subscribe.remotes // [])[]')
 }
 
 generateSubscription() {
     [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 0
-    local u token base views sbouts mhprox kind w
+    persistSubTokens
+    local u token base views sbouts mhprox kind w peer old_umask
     base=$(subscriptionBase)
+    peer=$(S '.nginx.subscribe.peer_key // ""')
+    # 订阅文件含节点凭据: 创建时就只有 root 可读，最后再统一交给 nginx 专用组（见 applyHomePerms）
+    old_umask=$(umask)
+    umask 077
     for kind in default clashMeta clashMetaProfiles sing-box sing-box_profiles; do
         mkdir -p "${SUB_DIR}/${kind}"
         find "${SUB_DIR}/${kind}" -type f -delete 2>/dev/null
     done
+    rm -rf "${SUB_DIR}/peer"
     w="${ATR_TMP:-/tmp}/sub.$$"
     mkdir -p "${w}"
     while IFS= read -r u; do
         [[ -z "${u}" ]] && continue
         token=$(subscriptionToken "${u}")
+        [[ -n "${token}" ]] || continue
         views=$(nodeViews "${u}")
         jq -r '.[]|select(.uri!=null)|.uri' <<<"${views}" >"${w}/links"
         jq -c '[.[]|select(.singbox!=null)|.singbox]' <<<"${views}" >"${w}/sb.json"
         jq -c '[.[]|select(.mihomo!=null)|.mihomo]' <<<"${views}" >"${w}/mh.json"
         jsonToMihomoYaml <"${w}/mh.json" >"${w}/clash" 2>/dev/null
-        _appendRemoteSubscriptions "${token}" "${w}/links" "${w}/clash" "${w}/sb.json"
+        # 本机作为"被合并方"：只放本机自己的节点（不含已合并进来的远程节点，避免两台机器互相合并时重复膨胀）
+        if [[ -n "${peer}" ]]; then
+            mkdir -p "${SUB_DIR}/peer/${peer}/${u}"
+            base64 -w 0 "${w}/links" 2>/dev/null >"${SUB_DIR}/peer/${peer}/${u}/default" || base64 "${w}/links" | tr -d '\n' >"${SUB_DIR}/peer/${peer}/${u}/default"
+            cp "${w}/clash" "${SUB_DIR}/peer/${peer}/${u}/clashMeta"
+            cp "${w}/sb.json" "${SUB_DIR}/peer/${peer}/${u}/sing-box_profiles"
+        fi
+        _appendRemoteSubscriptions "${u}" "${w}/links" "${w}/clash" "${w}/sb.json"
         base64 -w 0 "${w}/links" 2>/dev/null >"${SUB_DIR}/default/${token}" || base64 "${w}/links" | tr -d '\n' >"${SUB_DIR}/default/${token}"
         cp "${w}/clash" "${SUB_DIR}/clashMeta/${token}"
         cp "${w}/sb.json" "${SUB_DIR}/sing-box_profiles/${token}"
         # 完整 mihomo 配置: 用 provider 指向本机订阅
         sbouts=$(cat "${w}/sb.json")
-        cfgClashFull "$(cat "${w}/mh.json")" "${base}/s/clashMeta/${token}" "$(subscriptionToken "provider")" >"${SUB_DIR}/clashMetaProfiles/${token}" 2>/dev/null
+        cfgClashFull "$(cat "${w}/mh.json")" "${base}/s/clashMeta/${token}" >"${SUB_DIR}/clashMetaProfiles/${token}" 2>/dev/null
         if [[ "$(jq length <<<"${sbouts}")" != "0" ]]; then
             cfgSbFull "${sbouts}" | jq . >"${SUB_DIR}/sing-box/${token}"
         fi
     done < <(userNames)
     rm -rf "${w}"
-    chmod -R a+rX "${SUB_DIR}" 2>/dev/null
+    umask "${old_umask}"
+    if nginxModelCurrent; then
+        applyHomePerms 1 || echoContent yellow " ---> 警告: 订阅目录权限设置失败（nginx 专用账号/组不存在？），请执行 ${ATR_CMD} restart"
+    else
+        # 升级前的旧安装：nginx 仍以发行版默认账号运行，暂时保持可读，避免订阅突然不可用
+        chmod -R a+rX "${SUB_DIR}" 2>/dev/null
+        echoContent yellow " ---> 提示: 检测到旧版 nginx 权限模型（订阅文件对本机所有用户可读）。请执行 ${ATR_CMD} restart 升级为专用账号模型"
+    fi
     return 0
 }
 
@@ -3617,6 +3881,7 @@ showSubscriptionLinks() { # showSubscriptionLinks [用户名]
         return 1
     }
     local only=${1:-} u token base
+    persistSubTokens
     base=$(subscriptionBase)
     [[ "${base}" == http://* ]] && echoContent yellow " ---> 提示: 当前为 HTTP 明文订阅，可能被运营商拦截，建议配置域名证书后使用 HTTPS"
     while IFS= read -r u; do
@@ -3853,9 +4118,9 @@ userDeleteFlow() {
 }
 
 # 重置密码 / UUID
-# userResetFlow [用户名] [密码|空=随机] [模式 password|uuid|both]  —— 带参数时为非交互(CLI)
+# userResetFlow [用户名] [密码|空=随机] [模式 password|uuid|both] [更换订阅链接 1|0，缺省: 订阅已启用则更换]  —— 带参数时为非交互(CLI)
 userResetFlow() {
-    local user=${1:-} newpass=${2:-} mode=${3:-} choice newuuid
+    local user=${1:-} newpass=${2:-} mode=${3:-} rotate=${4:-} choice newuuid
     stateExists || {
         echoContent red " ---> 尚未安装"
         return 1
@@ -3882,6 +4147,10 @@ userResetFlow() {
                 echoContent red " ---> 密码不能为空、不能含换行/制表符，且不超过 128 位"
             done
         fi
+        if [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
+            echoContent yellow "\n 订阅链接与节点密码是两回事：只重置密码/UUID，已泄露的订阅链接仍然能取到重置后的新凭据。"
+            if confirm "是否同时更换该用户的订阅链接？（旧链接立即失效，需要在客户端重新导入）" y; then rotate=1; else rotate=0; fi
+        fi
     fi
     userExists "${user}" || {
         echoContent red " ---> 用户不存在: ${user}"
@@ -3902,10 +4171,68 @@ userResetFlow() {
         newuuid=$(newUUID)
         stagedEdit --arg n "${user}" --arg u "${newuuid}" '.users |= map(if .name==$n then .uuid=$u else . end)' || return 1
     fi
+    # 不更换订阅链接的话，已泄露的旧链接仍能取到新凭据；订阅已启用时 CLI 默认也更换（--keep-sub 保留）
+    if [[ -z "${rotate}" ]]; then
+        if [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then rotate=1; else rotate=0; fi
+    fi
+    if [[ "${rotate}" == "1" ]]; then
+        stagedEdit --arg n "${user}" --arg t "$(newSubToken)" '.users |= map(if .name==$n then .sub_token=$t else . end)' || return 1
+    fi
     if applyStaged "重置凭据(${user})"; then
         postChangeShow "${user}" "用户 ${user} 的凭据已重置，旧凭据已失效"
+        if [[ "${rotate}" == "1" && "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
+            echoContent yellow " ---> 该用户的订阅链接也已更换，旧订阅链接已失效，请在客户端重新导入下面的新链接:"
+            showSubscriptionLinks "${user}"
+        fi
     else
         stagedDiscard
+        return 1
+    fi
+}
+
+# 更换订阅链接: 单个用户或全部用户（旧链接立即失效）
+rotateSubTokens() { # rotateSubTokens [用户名|空=全部]
+    local only=${1:-} n
+    stagedBegin
+    while IFS= read -r n; do
+        [[ -z "${n}" ]] && continue
+        [[ -n "${only}" && "${n}" != "${only}" ]] && continue
+        stagedEdit --arg n "${n}" --arg t "$(newSubToken)" '.users |= map(if .name==$n then .sub_token=$t else . end)' || {
+            stagedDiscard
+            return 1
+        }
+    done < <(userNames)
+    applyStaged "更换订阅链接${only:+(${only})}" || {
+        stagedDiscard
+        return 1
+    }
+}
+
+# 用户选择器（可选"全部"）: 设置 PICKED_USER，空字符串表示全部用户
+pickUserOrAll() { # pickUserOrAll [提示]
+    local i=0 name sel
+    local -a names=()
+    PICKED_USER=""
+    while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        names+=("${name}")
+        i=$((i + 1))
+        echoContent yellow "${i}.${name}"
+    done < <(userNames)
+    ((i > 0)) || {
+        echoContent red " ---> 没有用户"
+        return 1
+    }
+    echoContent yellow "a.全部用户"
+    ask sel "${1:-请选择用户编号、输入用户名，或输入 a 选择全部用户}:" || return 1
+    if [[ "${sel}" == "a" || "${sel}" == "A" ]]; then
+        PICKED_USER=""
+    elif isInt "${sel}" && ((10#${sel} >= 1 && 10#${sel} <= i)); then
+        PICKED_USER=${names[$((10#${sel} - 1))]}
+    elif userExists "${sel}"; then
+        PICKED_USER=${sel}
+    else
+        echoContent red " ---> 选择错误"
         return 1
     fi
 }
@@ -3921,7 +4248,7 @@ manageUsers() {
     echoContent yellow "# 添加用户时可自定义用户名/UUID/密码；账号会同时添加到所有已安装的协议\n"
     echoContent yellow "1.查看账号"
     echoContent yellow "2.查看订阅"
-    echoContent yellow "3.管理其他订阅"
+    echoContent yellow "3.合并其他机器的订阅"
     echoContent yellow "4.添加用户"
     echoContent yellow "5.删除用户"
     echoContent yellow "6.重置密码/UUID"
@@ -4877,7 +5204,7 @@ manageCertificate() {
 
 # ----------------------------- 订阅 ------------------------------------------
 enableSubscription() {
-    local port ssl=false d salt
+    local port ssl=false d
     ensureNginx || return 1
     d=$(S '.domain // ""')
     if [[ -n "${d}" ]] && tlsReusable "${d}"; then
@@ -4889,8 +5216,8 @@ enableSubscription() {
     fi
     stagedBegin
     askPort port subscribe "订阅" tcp "$(randomFreePort "$(stagedUsedPorts | awk '{print $2}' | tr '\n' ' ')")" || return 1
-    salt=$(randLower 12)
-    stagedEdit --argjson p "${port}" --argjson s "${ssl}" --arg salt "${salt}" '.nginx.subscribe={enabled:true,port:$p,ssl:$s,salt:$salt}' || return 1
+    # 保留已有的对等密钥与远程条目（关闭后再启用不会丢）；旧版的全局 salt 不再使用
+    stagedEdit --argjson p "${port}" --argjson s "${ssl}" '.nginx.subscribe = (((.nginx.subscribe // {}) | del(.salt)) + {enabled:true,port:$p,ssl:$s}) | .nginx.subscribe |= (. + {peer_key: (.peer_key // ""), remotes: (.remotes // [])})' || return 1
     [[ -s "${WEB_ROOT}/index.html" ]] || installFakeSite
     if applyStaged "启用订阅服务"; then
         generateClientFiles
@@ -4905,10 +5232,10 @@ subscriptionMenu() {
         confirm "是否现在启用？" y && enableSubscription
         return
     fi
-    local c
+    local c who
     echoContent skyBlue "\n---------- 订阅管理 ----------"
     echoContent yellow "1.查看订阅链接"
-    echoContent yellow "2.重置订阅令牌(salt)   [旧订阅链接立即失效]"
+    echoContent yellow "2.更换订阅链接   [指定用户或全部用户，旧链接立即失效]"
     echoContent yellow "3.关闭订阅服务"
     ask c "请选择:" || return 1
     case "${c}" in
@@ -4917,12 +5244,13 @@ subscriptionMenu() {
         showSubscriptionLinks
         ;;
     2)
-        stagedBegin
-        stagedEdit --arg s "$(randLower 12)" '.nginx.subscribe.salt=$s' || return 1
-        if applyStaged "重置订阅令牌"; then
+        pickUserOrAll "请选择要更换订阅链接的用户编号/用户名，输入 a 表示全部用户" || return 1
+        who=${PICKED_USER}
+        if rotateSubTokens "${who}"; then
             generateClientFiles
-            showSubscriptionLinks
-        else stagedDiscard; fi
+            echoContent yellow " ---> 旧订阅链接已失效，请在客户端重新导入下面的新链接:"
+            showSubscriptionLinks "${who}"
+        fi
         ;;
     3)
         stagedBegin
@@ -4932,48 +5260,187 @@ subscriptionMenu() {
     esac
 }
 
-# 3.管理其他订阅（把其他机器的订阅合并进本机订阅，两台机器的用户名与 salt 需相同）
+# 3.合并其他机器的订阅（见 _appendRemoteSubscriptions 的说明）
+# 列出远程条目（不显示对等密钥本身）
+_remoteList() {
+    local n
+    n=$(S '(.nginx.subscribe.remotes // []) | length')
+    if [[ -z "${n}" || "${n}" == "0" ]]; then
+        echoContent yellow " ---> 没有其他机器的订阅"
+        return 1
+    fi
+    S '(.nginx.subscribe.remotes // []) | to_entries[] | "\(.key + 1). \(.value.alias)  \(.value.host):\(.value.port)  \(.value.scheme // "https")  对等密钥:\(if (.value.key // "") == "" then "【缺失，未生效】" else "已设置" end)\(if (.value.cacert // "") != "" then "  CA:" + .value.cacert else "" end)"'
+}
+
+# 旧版把远程机器写在 subscribe_remote/remoteSubscribeUrl 里，并要求两台机器共用同一个 salt；该机制已淘汰
+_importLegacyRemotes() {
+    [[ -s "${SUB_REMOTE_FILE}" ]] || return 0
+    local line host port alias scheme n=0
+    echoContent yellow "\n 发现旧版远程订阅文件（${SUB_REMOTE_FILE}）：旧机制要求各机器共用 salt，已被淘汰且不再生效。"
+    confirm "把其中的条目导入为「待补充对等密钥」的新条目？（导入后旧文件改名为 .migrated）" y || return 0
+    stagedBegin
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        host=$(cut -d: -f1 <<<"${line}")
+        port=$(cut -d: -f2 <<<"${line}")
+        alias=$(cut -d: -f3 <<<"${line}")
+        scheme=https
+        [[ "$(cut -d: -f4 <<<"${line}")" == "http" ]] && scheme=http
+        _remoteFieldsOK "${host}" "${port}" "${alias}" "${scheme}" || continue
+        stagedGet --arg a "${alias}" '(.nginx.subscribe.remotes // [])[]|select(.alias==$a)|.alias' | grep -q . && continue
+        stagedEdit --arg h "${host}" --argjson p "$((10#${port}))" --arg a "${alias}" --arg s "${scheme}" \
+            '.nginx.subscribe.remotes = ((.nginx.subscribe.remotes // []) + [{host:$h,port:$p,alias:$a,scheme:$s,key:"",cacert:""}])' || continue
+        n=$((n + 1))
+    done <"${SUB_REMOTE_FILE}"
+    if ((n > 0)) && applyStaged "导入旧版远程订阅条目"; then
+        mv -f "${SUB_REMOTE_FILE}" "${SUB_REMOTE_FILE}.migrated"
+        echoContent green " ---> 已导入 ${n} 条，请用「4.修改某台机器的对等密钥」补充对方的对等密钥后才会生效"
+    else
+        stagedDiscard
+    fi
+}
+
+# 本机的对等密钥: 其他机器凭它合并本机订阅
+_peerKeyMenu() {
+    local c key
+    key=$(S '.nginx.subscribe.peer_key // ""')
+    echoContent skyBlue "\n---------- 本机对等密钥（供其他机器合并本机订阅）----------"
+    echoContent yellow "# 对等密钥只用于服务器之间合并订阅；泄露它等于泄露本机所有用户的节点，请只告诉你自己的其他机器"
+    echoContent yellow "当前状态: $([[ -n "${key}" ]] && echo 已启用 || echo 未启用)\n"
+    echoContent yellow "1.查看（未启用则生成）"
+    echoContent yellow "2.重置   [旧密钥立即失效]"
+    echoContent yellow "3.关闭   [其他机器不能再合并本机订阅]"
+    ask c "请选择:" || return 1
+    case "${c}" in
+    1 | 2)
+        if [[ -z "${key}" || "${c}" == "2" ]]; then
+            key=$(randHex 32)
+            stagedBegin
+            stagedEdit --arg k "${key}" '.nginx.subscribe.peer_key=$k' || return 1
+            if ! applyStaged "$([[ "${c}" == "2" ]] && echo 重置 || echo 启用)对等密钥"; then
+                stagedDiscard
+                return 1
+            fi
+            generateClientFiles
+        fi
+        echoContent green "本机对等密钥: \c"
+        printRaw green "${key}"
+        echoContent yellow "在对方机器的 菜单 7→3→1 里添加本机时填写：域名或IP:端口:别名，以及这把密钥。"
+        ;;
+    3)
+        stagedBegin
+        stagedEdit '.nginx.subscribe.peer_key=""' || return 1
+        if applyStaged "关闭对等密钥"; then
+            generateClientFiles
+            echoContent green " ---> 已关闭，其他机器不能再合并本机订阅"
+        else stagedDiscard; fi
+        ;;
+    *) echoContent red " ---> 选择错误" ;;
+    esac
+}
+
 otherSubscriptionMenu() {
-    local c line n host port alias http
-    mkdir -p "$(dirname "${SUB_REMOTE_FILE}")"
-    echoContent skyBlue "\n===================== 添加其他机器订阅 ====================="
-    echoContent yellow "1.添加"
+    requireInstalled || return 1
+    if [[ "$(S '.nginx.subscribe.enabled')" != "true" ]]; then
+        echoContent yellow "\n 订阅服务尚未启用，请先在 7→2 里启用订阅服务"
+        return 1
+    fi
+    local c line host port alias scheme key ca n cnt
+    echoContent skyBlue "\n===================== 合并其他机器的订阅 ====================="
+    echoContent yellow "# 对方机器要先在 菜单 7→3→5 里开启「对等密钥」；本机凭这把密钥取回同名用户在对方机器上的节点"
+    echoContent yellow "# 两台机器的用户名需一致；证书会被严格校验（私有 CA/自签证书请提供证书文件）\n"
+    _importLegacyRemotes
+    echoContent yellow "1.添加其他机器"
     echoContent yellow "2.移除"
     echoContent yellow "3.查看"
+    echoContent yellow "4.修改某台机器的对等密钥"
+    echoContent yellow "5.本机的对等密钥（供其他机器合并本机订阅）"
     ask c "请选择:" || return 1
     case "${c}" in
     1)
-        echoContent skyBlue "录入示例：www.example.com:443:vps1  (域名:端口:机器别名)"
+        echoContent skyBlue "录入示例：www.example.com:443:vps1  (域名或IPv4:端口:机器别名)"
         ask line "请输入域名:端口:机器别名:" || return 1
         host=$(cut -d: -f1 <<<"${line}")
         port=$(cut -d: -f2 <<<"${line}")
         alias=$(cut -d: -f3 <<<"${line}")
-        if ! { isDomainName "${host}" || isIPv4 "${host}"; } || ! isPort "${port}" || ! isSafeName "${alias}"; then
+        scheme=https
+        if ! _remoteFieldsOK "${host}" "${port}" "${alias}" "${scheme}"; then
             echoContent red " ---> 格式不合法（域名或IPv4:端口:别名，别名只能含字母数字 . _ @ -）"
             return 1
         fi
-        http=""
-        confirm "是否是 HTTP 订阅？" n && http=":http"
-        echo "${host}:${port}:${alias}${http}" >>"${SUB_REMOTE_FILE}"
-        generateClientFiles
-        echoContent green " ---> 已添加并重新生成订阅"
+        if S --arg a "${alias}" '(.nginx.subscribe.remotes // [])[]|select(.alias==$a)|.alias' | grep -q .; then
+            echoContent red " ---> 别名已存在: ${alias}"
+            return 1
+        fi
+        confirm "对方是 HTTP（明文）订阅吗？明文传输会让对等密钥被窃听，不推荐" n && scheme=http
+        ask key "请输入对方机器的对等密钥:" || return 1
+        if [[ ! "${key}" =~ ^[A-Za-z0-9]{16,64}$ ]]; then
+            echoContent red " ---> 对等密钥格式不合法（16-64 位字母数字）"
+            return 1
+        fi
+        ca=""
+        if [[ "${scheme}" == "https" ]]; then
+            ask ca "私有 CA / 自签证书文件的绝对路径（公共 CA 签发的证书直接回车）:" || return 1
+            if [[ -n "${ca}" ]] && { [[ "${ca}" != /* ]] || ! openssl x509 -noout -in "${ca}" >/dev/null 2>&1; }; then
+                echoContent red " ---> 需要证书文件的绝对路径，且必须是有效的 PEM 证书"
+                return 1
+            fi
+        fi
+        stagedBegin
+        stagedEdit --arg h "${host}" --argjson p "$((10#${port}))" --arg a "${alias}" --arg s "${scheme}" --arg k "${key}" --arg c "${ca}" \
+            '.nginx.subscribe.remotes = ((.nginx.subscribe.remotes // []) + [{host:$h,port:$p,alias:$a,scheme:$s,key:$k,cacert:$c}])' || return 1
+        if applyStaged "添加远程订阅(${alias})"; then
+            generateClientFiles
+            echoContent green " ---> 已添加并重新生成订阅"
+        else
+            stagedDiscard
+            return 1
+        fi
         ;;
     2)
-        [[ -s "${SUB_REMOTE_FILE}" ]] || {
-            echoContent yellow " ---> 没有其他订阅"
-            return 0
-        }
-        grep -v '^$' "${SUB_REMOTE_FILE}" | awk '{print NR":"$0}'
+        _remoteList || return 0
         ask n "请选择要删除的编号[仅支持单个删除]:" || return 1
-        isInt "${n}" || {
+        cnt=$(S '(.nginx.subscribe.remotes // [])|length')
+        if ! isInt "${n}" || ((10#${n} < 1 || 10#${n} > cnt)); then
             echoContent red " ---> 选择错误"
             return 1
-        }
-        sed -i "${n}d" "${SUB_REMOTE_FILE}"
-        generateClientFiles
-        echoContent green " ---> 已删除并重新生成订阅"
+        fi
+        stagedBegin
+        stagedEdit --argjson i "$((10#${n} - 1))" 'del(.nginx.subscribe.remotes[$i])' || return 1
+        if applyStaged "移除远程订阅"; then
+            generateClientFiles
+            echoContent green " ---> 已删除并重新生成订阅"
+        else
+            stagedDiscard
+            return 1
+        fi
         ;;
-    3) [[ -s "${SUB_REMOTE_FILE}" ]] && grep -v '^$' "${SUB_REMOTE_FILE}" | awk '{print NR":"$0}' || echoContent yellow " ---> 没有其他订阅" ;;
+    3) _remoteList ;;
+    4)
+        _remoteList || return 0
+        ask n "请选择要修改对等密钥的编号:" || return 1
+        cnt=$(S '(.nginx.subscribe.remotes // [])|length')
+        if ! isInt "${n}" || ((10#${n} < 1 || 10#${n} > cnt)); then
+            echoContent red " ---> 选择错误"
+            return 1
+        fi
+        ask key "请输入新的对等密钥:" || return 1
+        if [[ ! "${key}" =~ ^[A-Za-z0-9]{16,64}$ ]]; then
+            echoContent red " ---> 对等密钥格式不合法（16-64 位字母数字）"
+            return 1
+        fi
+        stagedBegin
+        stagedEdit --argjson i "$((10#${n} - 1))" --arg k "${key}" '.nginx.subscribe.remotes[$i].key=$k' || return 1
+        if applyStaged "修改远程订阅的对等密钥"; then
+            generateClientFiles
+            echoContent green " ---> 已更新并重新生成订阅"
+        else
+            stagedDiscard
+            return 1
+        fi
+        ;;
+    5) _peerKeyMenu ;;
+    *) echoContent red " ---> 选择错误" ;;
     esac
 }
 
@@ -5206,6 +5673,23 @@ parseIPList() {
         fi
     done
     ((count > 0))
+}
+
+# 解析 Socks5「来源 IP 白名单」，成功时在 stdout 输出 JSON 数组（至少一项）；没有任何有效的 IP/CIDR 时失败。
+# 绝不返回空数组: 空数组交给 sing-box 的 source_ip_cidr 会被当作"不限制来源"，等于对所有来源放行。
+# （parseIPList 没有有效项时返回 1，但放进 `a | b | c` 管道后会被最后一个命令的成功退出码掩盖，所以单独处理）
+parseSourceIPs() { # parseSourceIPs <输入>
+    local out ips
+    out=$(parseIPList "${1:-}") || true
+    ips=$(printf '%s\n' "${out}" | sed -n 's/^ip://p')
+    if [[ -z "${ips}" ]]; then
+        echoContent red " ---> 来源 IP 不能为空：没有任何有效的 IP/CIDR（来源白名单只支持 IP/CIDR，不支持 geoip）" >&2
+        return 1
+    fi
+    if printf '%s\n' "${out}" | grep -q '^geoip:'; then
+        echoContent yellow " ---> 来源白名单不支持 geoip 条目，已忽略" >&2
+    fi
+    printf '%s\n' "${ips}" | jq -R . | jq -sc .
 }
 
 # stagedAddTokens <路径(如 .routing.warp.v4.domains)> <token...>
@@ -5493,9 +5977,7 @@ socks5InMenu() {
         [[ "${strat}" == "2" ]] && strat=ipv6_only || strat=ipv4_only
         ask ips "请输入允许访问的来源 IP，多个用英文逗号隔开(例如 1.1.1.1,2.2.2.2):" || return 1
         local arr
-        arr=$(parseIPList "${ips}" | grep '^ip:' | sed 's/^ip://' | jq -R . | jq -sc .) || return 1
-        [[ "${arr}" != "[]" ]] || {
-            echoContent red " ---> 来源 IP 不能为空"
+        arr=$(parseSourceIPs "${ips}") || {
             stagedDiscard
             return 1
         }
@@ -5525,7 +6007,7 @@ socks5InMenu() {
         }
         ask ips "请输入允许访问的来源 IP(多个逗号隔开，替换原有):" || return 1
         local arr2
-        arr2=$(parseIPList "${ips}" | grep '^ip:' | sed 's/^ip://' | jq -R . | jq -sc .) || return 1
+        arr2=$(parseSourceIPs "${ips}") || return 1 # 输入无效时保留原配置，绝不变成"不限制来源"
         ask list "请输入允许访问的域名(替换原有，留空表示允许所有网站):" || return 1
         stagedBegin
         if [[ -z "${list}" ]]; then
@@ -5939,7 +6421,9 @@ updateScript() {
     fi
     newver=$(sed -n 's/^ATR_VERSION="\(.*\)"/\1/p' "${f}" | head -n 1)
     echoContent yellow " ---> 当前版本 ${ATR_VERSION}，远程版本 ${newver:-未知}"
-    confirm "确认更新？" y || return 0
+    echoContent yellow " ---> 新脚本 SHA256: $(sha256sum "${f}" | awk '{print $1}')"
+    echoContent yellow "      语法与名称检查只能发现损坏的文件，不能证明来源可信；请确认下载地址是你自己的仓库。"
+    confirm "确认更新？" n || return 0
     printf '%s' "${url}" >"${ATR_HOME}/script_url"
     [[ -f "${ATR_SCRIPT_PATH}" ]] && cp -f "${ATR_SCRIPT_PATH}" "${ATR_SCRIPT_PATH}.prev"
     install -m 700 "${f}" "${ATR_SCRIPT_PATH}.new" && mv -f "${ATR_SCRIPT_PATH}.new" "${ATR_SCRIPT_PATH}"
@@ -5996,6 +6480,7 @@ uninstallAll() {
         rm -rf "${ACME_HOME}"
         echoContent green " ---> 已删除 acme.sh"
     fi
+    removeNginxAccount
     rm -f "${ATR_BIN_DIR}/${ATR_CMD}"
     rm -rf "${ATR_HOME}"
     echoContent green " ---> 卸载完成"
@@ -6022,7 +6507,7 @@ ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+R
   sub [用户]                       查看订阅链接
   selfcheck                        自检(回环握手测试)
   sni <host[:port]> [--force]      修改 Reality 目标域名(SNI)
-  passwd <用户> [新密码]           重置密码(不给则随机)
+  passwd <用户> [新密码] [--keep-sub]  重置密码(不给则随机)；订阅已启用时默认同时更换订阅链接，--keep-sub 保留旧链接
   adduser <用户> [uuid] [密码]     添加用户
   deluser <用户>                   删除用户(至少保留一个)
   restart                          重启全部服务
@@ -6102,6 +6587,29 @@ cliDelUser() {
     else
         stagedDiscard
         return 1
+    fi
+}
+
+cliPasswd() { # cliPasswd <用户> [新密码] [--keep-sub]
+    local args=() a rotate=""
+    for a in "$@"; do
+        if [[ "${a}" == "--keep-sub" ]]; then rotate=0; else args+=("${a}"); fi
+    done
+    userResetFlow "${args[0]:-}" "${args[1]:-}" password "${rotate}"
+}
+
+# 旧版安装（nginx 仍以发行版默认账号运行、订阅文件对本机所有用户可读）升级到专用账号模型
+securityUpgradeNotice() {
+    stateExists && stateNeedsNginx "${ATR_STATE}" || return 0
+    nginxModelCurrent && return 0
+    echoContent yellow "\n 安全升级: 检测到旧版 nginx 权限模型（订阅文件对本机所有用户可读，nginx 以发行版默认账号运行）。"
+    echoContent yellow "           升级会创建专用账号 ${NGX_USER}、收紧订阅目录权限，并重启 nginx（sing-box / Xray 不受影响）。"
+    confirm "是否现在升级？" y || return 0
+    stagedBegin
+    if applyStaged "安全升级: nginx 专用账号与订阅权限"; then
+        generateClientFiles
+    else
+        stagedDiscard
     fi
 }
 
@@ -6210,8 +6718,11 @@ main() {
     checkRoot
     checkSystem
     checkCPU
-    mkdir -p "${ATR_HOME}"
-    chmod 711 "${ATR_HOME}" 2>/dev/null
+    # 新建的目录只有 root 能进入；需要 nginx 时再由 applyHomePerms 对 nginx 专用组开放"仅穿越"（710）
+    if [[ ! -d "${ATR_HOME}" ]]; then
+        mkdir -p "${ATR_HOME}"
+        chmod 700 "${ATR_HOME}"
+    fi
     ensureJq || exit 1
     recoverIfNeeded
     aliasInstall
@@ -6223,6 +6734,7 @@ main() {
     case "${cmd}" in
     menu)
         warnV2rayAgentConflict
+        securityUpgradeNotice
         menuLoop
         ;;
     install-anytls-reality) cliInstallAnyTLSReality "$@" ;;
@@ -6235,7 +6747,7 @@ main() {
     sub) showSubscriptionLinks "${1:-}" ;;
     selfcheck) selfCheckAll ;;
     sni) cliSetSNI "${1:-}" "${2:-}" ;;
-    passwd) userResetFlow "${1:-}" "${2:-}" password ;;
+    passwd) cliPasswd "$@" ;;
     adduser) cliAddUser "${1:-}" "${2:-}" "${3:-}" ;;
     deluser) cliDelUser "${1:-}" ;;
     log) viewLog "${1:-sing-box}" ;;
