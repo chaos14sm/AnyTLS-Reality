@@ -18,7 +18,7 @@
 # =============================================================================
 export LANG=en_US.UTF-8
 
-ATR_VERSION="v1.2.1"
+ATR_VERSION="v1.2.2"
 ATR_PROJECT_NAME="anytls-reality"
 
 # ----------------------------- 路径与常量 -----------------------------------
@@ -1021,7 +1021,9 @@ def netof($id): if (udp_ids | index($id)) != null then "udp" else "tcp" end;
     (if (.routing.socks5_in.port // null) != null and ((.routing.socks5_in.allow_ips // []) | length) == 0
      then "Socks5 入站的来源 IP 白名单为空（空白名单等于允许所有来源）；请在 11.分流工具→Socks5入站→3 里重新设置" else empty end),
     # 出口访问模式只能是 空(未选择) / public / full
-    ((.egress.mode // "") as $m | if (["", "public", "full"] | index($m)) != null then empty else "出口访问模式不合法: \($m)" end)
+    ((.egress.mode // "") as $m | if (["", "public", "full"] | index($m)) != null then empty else "出口访问模式不合法: \($m)" end),
+    # 对等密钥会被写进 nginx 配置作为路径片段：只能是空(未启用)或 16-64 位字母数字
+    ((.nginx.subscribe.peer_key // "") as $k | if $k == "" or ($k | test("^[A-Za-z0-9]{16,64}$")) then empty else "对等密钥格式不合法（需要 16-64 位字母数字）" end)
   ]
 | .[]
 EOF
@@ -2281,11 +2283,17 @@ read -r -d '' JQ_XRAY <<'EOF'
 | ($S.protocols // {}) as $PR
 | @@EGRESS_DEF@@
   # 公网出口: 先放行"添加新端口"的 dokodemo-door（它只是把流量转给本机 Vision 前置端口，不是客户端的目的地），再拦截内网/本机目的地。
-  # 不用 geoip:private（它需要 geoip.dat 文件）；显式地址段与数据文件无关。Xray 不接受 ::ffff:0:0/96 这种写法，但它会先把 IPv4 映射地址归一成 IPv4 再匹配（见 t_security 的实测）。对域名目标，检查依据的是路由时的解析结果（IPOnDemand）；Xray 的 freedom 出站会再解析一次，没有专门验证过能否防住 DNS rebinding（尤其可能防不住）
-  def egress_x: if ($S.egress.mode // "") == "public" then
+  # 不用 geoip:private（它需要 geoip.dat 文件）；显式地址段与数据文件无关。Xray 不接受 ::ffff:0:0/96 这种写法，但它会先把 IPv4 映射地址归一成 IPv4 再匹配（见 t_security 的实测）。
+  # 域名目标（已用 DNS rebinding 实测，见 t_rebind）: 路由检查用的是 Xray 的一次解析，freedom 出站"拨号前"会再解析一次；如果两次解析的结果不同（攻击者控制的域名第一次给公网地址、第二次给 127.0.0.1），
+  # 光靠路由规则会被绕过。所以公网出口模式下还要做两件事: 1) 用 DNS 服务器自身的 unexpectedIPs 把落在这些地址段的解析结果丢掉（路由检查和 freedom 的再解析都经过它，拨号只可能用到通过过滤的地址）；
+  # 2) 直连出站改用 ForceIP: 解析失败就直接失败，绝不退回去按域名拨号（退回去就是交给系统解析器再解析一次，等于绕过了过滤）。
+  def xpublic: ($S.egress.mode // "") == "public";
+  def egress_xip: (egress_cidrs - ["::ffff:0:0/96"]) + ($S.egress.local_ips // []);
+  def xdns($a): if xpublic then {address: $a, unexpectedIPs: egress_xip} else $a end;
+  def egress_x: if xpublic then
       ([ ($S.extra_ports // [])[] | "dokodemo-door-newPort-" + tostring ]) as $dk
       | (if ($dk | length) > 0 and ($PR.vless_vision_tls.core // "") == "xray" then [{type: "field", inboundTag: $dk, outboundTag: "direct"}] else [] end)
-        + [{type: "field", ip: ((egress_cidrs - ["::ffff:0:0/96"]) + ($S.egress.local_ips // [])), outboundTag: "block"}]
+        + [{type: "field", ip: egress_xip, outboundTag: "block"}]
     else [] end;
   def tlsCert: {rejectUnknownSni: true, minVersion: "1.2",
                 certificates: [{certificateFile: ($tlsdir + "/" + $D + ".crt"), keyFile: ($tlsdir + "/" + $D + ".key"), ocspStapling: 3600}]};
@@ -2362,10 +2370,10 @@ read -r -d '' JQ_XRAY <<'EOF'
       log: {loglevel: (if $debug == "1" then "debug" else "warning" end)},
       policy: {levels: {"0": {handshake: 4, connIdle: 300}}},
       dns: (if (($R.dns_unlock.server // "") != "" and ((($R.dns_unlock.domains // []) | length) > 0)) then
-              {servers: [{address: $R.dns_unlock.server, port: 53, domains: xdomains($R.dns_unlock.domains)}, "localhost"]}
+              {servers: [{address: $R.dns_unlock.server, port: 53, domains: xdomains($R.dns_unlock.domains)}, xdns("localhost")]}
             elif (($R.sni_proxy.ip // "") != "" and ((($R.sni_proxy.domains // []) | length) > 0)) then
-              {hosts: (reduce xdomains($R.sni_proxy.domains)[] as $d ({}; .[$d] = $R.sni_proxy.ip)), servers: ["8.8.8.8", "1.1.1.1"]}
-            else {servers: ["localhost"]} end),
+              {hosts: (reduce xdomains($R.sni_proxy.domains)[] as $d ({}; .[$d] = $R.sni_proxy.ip)), servers: [xdns("8.8.8.8"), xdns("1.1.1.1")]}
+            else {servers: [xdns("localhost")]} end),
       inbounds: $inbounds,
       outbounds: ((if $G == "warp_v4" and $haveWarp then [{protocol: "wireguard", tag: "warp_v4", settings: {secretKey: $W.private_key, address: ["172.16.0.2/32"],
                       peers: [{publicKey: $W.public_key, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: "162.159.192.1:2408"}], reserved: $W.reserved, mtu: 1280}}]
@@ -2375,7 +2383,7 @@ read -r -d '' JQ_XRAY <<'EOF'
                    elif $G == "socks5" and $useS5 then [{protocol: "socks", tag: "socks5_outbound", settings: {servers: [{address: $R.socks5_out.server, port: $R.socks5_out.port,
                       users: [{user: ($R.socks5_out.user // ""), pass: ($R.socks5_out.pass // "")}]}]}}]
                    else [] end)
-                  + [{protocol: "freedom", tag: "direct", settings: {domainStrategy: "UseIP"}}, {protocol: "blackhole", tag: "block"}]
+                  + [{protocol: "freedom", tag: "direct", settings: {domainStrategy: (if xpublic then "ForceIP" else "UseIP" end)}}, {protocol: "blackhole", tag: "block"}]
                   + (if ($haveWarp and $useW4 and $G != "warp_v4") then [{protocol: "wireguard", tag: "warp_v4", settings: {secretKey: $W.private_key, address: ["172.16.0.2/32"],
                       peers: [{publicKey: $W.public_key, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: "162.159.192.1:2408"}], reserved: $W.reserved, mtu: 1280}}] else [] end)
                   + (if ($haveWarp and $useW6 and $G != "warp_v6") then [{protocol: "wireguard", tag: "warp_v6", settings: {secretKey: $W.private_key, address: [($W.address_v6 + "/128")],
@@ -2501,7 +2509,7 @@ _ngxSafeValue() { [[ "${1:-}" =~ ^[A-Za-z0-9._:/@%?=\&#+~,-]+$ ]]; }
 
 # renderNginxConfs <state.json> <输出目录>  —— 只写需要的文件，不需要的不生成
 renderNginxConfs() {
-    local st=$1 out=$2 domain path redirect port h2a h2b ssl6 sub_port sub_ssl
+    local st=$1 out=$2 domain path redirect port h2a h2b ssl6 sub_port sub_ssl peer_key peer_loc=""
     mkdir -p "${out}"
     domain=$(jq -r '.domain // ""' "${st}")
     path=$(jq -r '.path // ""' "${st}")
@@ -2593,7 +2601,20 @@ EOF
     if stateNeedsSubscribe "${st}"; then
         sub_port=$(jq -r '.nginx.subscribe.port' "${st}")
         sub_ssl=$(jq -r '.nginx.subscribe.ssl' "${st}")
+        peer_key=$(jq -r '.nginx.subscribe.peer_key // ""' "${st}")
+        peer_loc=""
+        if [[ "${peer_key}" =~ ^[A-Za-z0-9]{16,64}$ ]]; then
+            peer_loc=$(
+                cat <<PEER
+    location ~ "^/s/peer/${peer_key}/([A-Za-z0-9_][A-Za-z0-9._@-]{0,47})/(default|clashMeta|sing-box_profiles)\$" {
+        default_type 'text/plain; charset=utf-8';
+        alias ${SUB_DIR}/peer/\$1/\$2;
+    }
+PEER
+            )
+        fi
         {
+            echo "# atr-sub-layout 2"
             if [[ "${sub_ssl}" == "true" ]]; then
                 cat <<EOF
 server {
@@ -2620,11 +2641,10 @@ EOF
         default_type 'text/plain; charset=utf-8';
         alias ${SUB_DIR}/\$1/\$2;
     }
-    # 供其他机器合并本机订阅的对等端点: /s/peer/<对等密钥>/<用户名>/<类型>（路径各段均限定字符集，杜绝路径穿越）
-    location ~ "^/s/peer/([A-Za-z0-9]{16,64})/([A-Za-z0-9_][A-Za-z0-9._@-]{0,47})/(default|clashMeta|sing-box_profiles)\$" {
-        default_type 'text/plain; charset=utf-8';
-        alias ${SUB_DIR}/peer/\$1/\$2/\$3;
-    }
+    # 供其他机器合并本机订阅的对等端点: /s/peer/<对等密钥>/<用户名>/<类型>。密钥由这份配置自己核对（所以这份配置是 600 权限），
+    # 文件按 peer/<用户名>/<类型> 存放、路径里没有密钥：重置/关闭密钥在配置提交、nginx 重启的那一刻就生效，不依赖随后的文件发布；
+    # 创建目录时也不需要把密钥交给任何外部命令
+${peer_loc}
     location / {
     }
 }
@@ -2952,39 +2972,97 @@ _txnFiles() {
 # backupLive <备份目录>  —— 记录每个文件原先是否存在
 backupLive() {
     local bdir=$1 f key
-    mkdir -p "${bdir}/files"
-    : >"${bdir}/manifest"
+    mkdir -p "${bdir}/files" || return 1
+    : >"${bdir}/manifest" || return 1
     while read -r f; do
         [[ -z "${f}" ]] && continue
         key=$(printf '%s' "${f}" | sed 's#/#%#g')
         if [[ -f "${f}" ]]; then
-            cp -p "${f}" "${bdir}/files/${key}"
-            printf 'E\t%s\n' "${f}" >>"${bdir}/manifest"
+            # 复制后逐字节核对：磁盘写满时 cp 可能报错，也可能留下被截断的备份，两种都不能算"已备份"
+            cp -p "${f}" "${bdir}/files/${key}" && cmp -s "${f}" "${bdir}/files/${key}" || return 1
+            printf 'E\t%s\n' "${f}" >>"${bdir}/manifest" || return 1
         else
-            printf 'N\t%s\n' "${f}" >>"${bdir}/manifest"
+            printf 'N\t%s\n' "${f}" >>"${bdir}/manifest" || return 1
         fi
     done < <(_txnFiles)
     # nginx 站点配置在新事务里可能新增，同样需要记录"原先不存在"
     for f in atr_alone.conf atr_httpupgrade.conf atr_subscribe.conf; do
-        grep -qF "${NGX_CONFD}/${f}" "${bdir}/manifest" || printf 'N\t%s\n' "${NGX_CONFD}/${f}" >>"${bdir}/manifest"
+        grep -qF "${NGX_CONFD}/${f}" "${bdir}/manifest" || printf 'N\t%s\n' "${NGX_CONFD}/${f}" >>"${bdir}/manifest" || return 1
     done
     chmod 700 "${bdir}"
 }
 
-restoreFromBackup() { # restoreFromBackup <备份目录>
-    local bdir=$1 kind f key
+restoreFromBackup() { # restoreFromBackup <备份目录>  —— 任何一个文件没能恢复就返回 1（并列出来），绝不假装成功
+    local bdir=$1 kind f key rc=0 tmp
     [[ -f "${bdir}/manifest" ]] || return 1
     while IFS=$'\t' read -r kind f; do
         key=$(printf '%s' "${f}" | sed 's#/#%#g')
         if [[ "${kind}" == "E" ]]; then
-            mkdir -p "$(dirname "${f}")"
-            cp -p "${bdir}/files/${key}" "${f}"
+            # 同目录临时文件 + rename，再核对内容
+            tmp="${f}.atr-restore.$$"
+            if mkdir -p "$(dirname "${f}")" && cp -p "${bdir}/files/${key}" "${tmp}" && mv -f "${tmp}" "${f}" && cmp -s "${bdir}/files/${key}" "${f}"; then
+                :
+            else
+                rm -f "${tmp}"
+                echoContent red " ---> 恢复失败: ${f}"
+                rc=1
+            fi
         else
             rm -f "${f}"
+            if [[ -e "${f}" ]]; then
+                echoContent red " ---> 无法删除（应当不存在）: ${f}"
+                rc=1
+            fi
         fi
     done <"${bdir}/manifest"
     systemctl daemon-reload >/dev/null 2>&1
-    return 0
+    return "${rc}"
+}
+
+# ----------------------------- 落盘 ------------------------------------------
+# 把 <源文件> 换成 <目标>：同目录临时文件 + rename（崩溃或写满不会留下半截文件），然后核对内容
+_commitFile() { # _commitFile <源> <目标> <模式>
+    atomicWrite "$2" "$3" <"$1" && cmp -s "$1" "$2"
+}
+# 删除并确认确实没了
+_removeLive() { # _removeLive <目标>
+    rm -f -- "$1"
+    [[ ! -e "$1" ]]
+}
+# 把候选配置落到 live 位置（先配置，后 state）。每一步都检查，任何一步失败返回 1，由调用方回滚
+_commitLive() { # _commitLive <stage 目录> <候选 state 文件>
+    local stage=$1 st=$2 nf base mode
+    mkdir -p "${SB_DIR}/conf" "${XRAY_DIR}/conf" "${NGX_CONFD}" || return 1
+    if stateNeedsCore "${st}" sing-box; then _commitFile "${stage}/sing-box/config.json" "${SB_CONF}" 600 || return 1; else _removeLive "${SB_CONF}" || return 1; fi
+    if stateNeedsCore "${st}" xray; then _commitFile "${stage}/xray/config.json" "${XRAY_CONF}" 600 || return 1; else _removeLive "${XRAY_CONF}" || return 1; fi
+    for nf in "${NGX_CONFD}"/atr_*.conf; do
+        [[ -e "${nf}" ]] && { _removeLive "${nf}" || return 1; }
+    done
+    for nf in "${stage}"/nginx/*.conf; do
+        [[ -e "${nf}" ]] || continue
+        base=$(basename "${nf}")
+        mode=644
+        [[ "${base}" == "atr_subscribe.conf" ]] && mode=600 # 里面有对等密钥
+        _commitFile "${nf}" "${NGX_CONFD}/${base}" "${mode}" || return 1
+    done
+    _commitFile "${st}" "${ATR_STATE}" 600
+}
+# 服务和端口正常并不能证明落盘的就是候选内容；成功之前再核对一遍，不一致就当作失败
+_verifyCommitted() { # _verifyCommitted <stage 目录> <候选 state 文件>
+    local stage=$1 st=$2 nf bad=0 base
+    cmp -s "${st}" "${ATR_STATE}" || { echoContent red " ---> 核对失败: state.json 与候选内容不一致"; bad=1; }
+    if stateNeedsCore "${st}" sing-box; then cmp -s "${stage}/sing-box/config.json" "${SB_CONF}" || { echoContent red " ---> 核对失败: ${SB_CONF}"; bad=1; }; else [[ ! -e "${SB_CONF}" ]] || { echoContent red " ---> 核对失败: ${SB_CONF} 应当不存在"; bad=1; }; fi
+    if stateNeedsCore "${st}" xray; then cmp -s "${stage}/xray/config.json" "${XRAY_CONF}" || { echoContent red " ---> 核对失败: ${XRAY_CONF}"; bad=1; }; else [[ ! -e "${XRAY_CONF}" ]] || { echoContent red " ---> 核对失败: ${XRAY_CONF} 应当不存在"; bad=1; }; fi
+    for nf in "${stage}"/nginx/*.conf; do
+        [[ -e "${nf}" ]] || continue
+        cmp -s "${nf}" "${NGX_CONFD}/$(basename "${nf}")" || { echoContent red " ---> 核对失败: ${NGX_CONFD}/$(basename "${nf}")"; bad=1; }
+    done
+    for nf in "${NGX_CONFD}"/atr_*.conf; do
+        [[ -e "${nf}" ]] || continue
+        base=$(basename "${nf}")
+        [[ -e "${stage}/nginx/${base}" ]] || { echoContent red " ---> 核对失败: ${nf} 不在候选内容里"; bad=1; }
+    done
+    return "${bad}"
 }
 
 pruneBackups() { # 只保留最近 10 份（目录名是时间戳，glob 展开即按时间升序）
@@ -3202,6 +3280,112 @@ verifyRuntime() { # verifyRuntime <state.json>
     return "${ok}"
 }
 
+# ----------------------------- 撤销收口（订阅发布目录）-------------------------
+# 关闭订阅发布: 清空已发布的内容（失败时宁可不提供订阅，也不留下旧链接或可读的残片）
+_closeSubscription() {
+    [[ -d "${SUB_DIR}" ]] || return 0
+    find "${SUB_DIR}" -mindepth 1 -delete 2>/dev/null
+    # 必须确认真的删干净了（只读文件系统等情况下删除会失败，nginx 却会继续提供旧内容）
+    [[ -z "$(find "${SUB_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]] && return 0
+    echoContent red " ---> 无法删除已发布的订阅文件，改为停止 nginx，确保不再提供旧订阅"
+    serviceStop "${NGX_UNIT}"
+    if serviceActive "${NGX_UNIT}"; then
+        echoContent red " ---> nginx 也没能停止！请立即手动处理: systemctl stop ${NGX_UNIT}，并检查 ${SUB_DIR} 所在的文件系统"
+        return 2
+    fi
+    echoContent yellow " ---> nginx 已停止（订阅与伪装站暂不可用）。排除文件系统问题后执行 ${ATR_CMD} restart 恢复"
+    return 1
+}
+# 订阅的 nginx 配置是不是当前格式（对等端点按 peer/<用户名>/<类型> 取文件，并由配置核对密钥）
+nginxSubLayoutCurrent() {
+    grep -q '^# atr-sub-layout 2$' "${NGX_CONFD}/atr_subscribe.conf" 2>/dev/null
+}
+# 撤销收口。按当前 state 清除已发布目录里不再有效的内容：失效令牌对应的文件、已删除用户的文件、对等分享关闭后的 peer/、
+# 以及旧版目录布局的遗留；订阅整体关闭时清空整个目录。只做删除（不渲染、不联网），所以几乎不会失败；
+# 删不掉（或删完复查仍有）就改为停止 nginx。必须持锁调用：applyStaged 提交之后、每次发布之前、启动对账都会用到。
+#   _pruneRevokedSubscription        清除。0=已确认干净  1=删不掉，已改为停止 nginx（旧订阅不会再被提供）  2=连 nginx 也没能停止
+#   _pruneRevokedSubscription check  只检查不动。0=干净  10=存在应被撤销的内容
+_pruneRevokedSubscription() {
+    local mode=${1:-prune}
+    [[ -d "${SUB_DIR}" ]] || return 0
+    if [[ "$(S '.nginx.subscribe.enabled')" != "true" ]]; then
+        [[ -z "$(find "${SUB_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]] && return 0
+        [[ "${mode}" == check ]] && return 10
+        _closeSubscription
+        return
+    fi
+    local -A valid=() users=()
+    local u t kind f name d stale=0 peer
+    while IFS=$'\t' read -r u t; do
+        [[ -z "${u}" ]] && continue
+        users["${u}"]=1
+        [[ -n "${t}" ]] && valid["${t}"]=1
+    done < <(S '.users[]? | "\(.name)\t\(.sub_token // "")"')
+    peer=$(S '.nginx.subscribe.peer_key // ""')
+    for kind in default clashMeta clashMetaProfiles sing-box sing-box_profiles; do
+        for f in "${SUB_DIR}/${kind}"/*; do
+            [[ -e "${f}" || -L "${f}" ]] || continue
+            name=${f##*/}
+            [[ "${name}" =~ ^[A-Za-z0-9]+$ && -n "${valid[${name}]:-}" ]] && continue
+            stale=1
+            [[ "${mode}" == check ]] || rm -rf -- "${f}"
+        done
+    done
+    if [[ -d "${SUB_DIR}/peer" || -L "${SUB_DIR}/peer" ]]; then
+        if [[ -z "${peer}" ]]; then
+            stale=1
+            [[ "${mode}" == check ]] || rm -rf -- "${SUB_DIR}/peer"
+        else
+            for d in "${SUB_DIR}/peer"/*; do
+                [[ -e "${d}" || -L "${d}" ]] || continue
+                name=${d##*/}
+                # 只认 peer/<现存用户>/ 下的普通文件；旧版 peer/<密钥>/<用户>/ 的目录布局整个视为过期
+                if [[ -d "${d}" && ! -L "${d}" && -n "${users[${name}]:-}" && -z "$(find "${d}" -mindepth 1 \( -type d -o -type l \) -print -quit 2>/dev/null)" ]]; then
+                    continue
+                fi
+                stale=1
+                [[ "${mode}" == check ]] || rm -rf -- "${d}"
+            done
+        fi
+    fi
+    # 其余不认识的顶层条目（旧版本遗留）
+    for f in "${SUB_DIR}"/* "${SUB_DIR}"/.[!.]*; do
+        [[ -e "${f}" || -L "${f}" ]] || continue
+        case "${f##*/}" in
+        default | clashMeta | clashMetaProfiles | sing-box | sing-box_profiles | peer) ;;
+        *)
+            stale=1
+            [[ "${mode}" == check ]] || rm -rf -- "${f}"
+            ;;
+        esac
+    done
+    if [[ "${mode}" == check ]]; then
+        ((stale)) && return 10
+        return 0
+    fi
+    ((stale)) || return 0
+    # 删完再扫一遍，确认真的干净了；否则改为停止 nginx
+    _pruneRevokedSubscription check && return 0
+    echoContent red " ---> 无法清除已被撤销的订阅文件（文件系统只读或没有权限？）"
+    _closeSubscription
+}
+# 启动时对账：提交之后、清理之前进程被中断，或有人手工动过发布目录，都会留下应被撤销的内容。只读检查不加锁，真有才加锁清除
+reconcileSubscription() {
+    stateExists || return 0
+    [[ -d "${SUB_DIR}" ]] || return 0
+    _pruneRevokedSubscription check
+    (($? == 10)) || return 0
+    lockAcquire || {
+        echoContent red " ---> 发现订阅目录里有应被撤销的内容，但拿不到锁，没有清理。请稍后执行 ${ATR_CMD} restart"
+        return 1
+    }
+    echoContent yellow "\n ---> 检测到订阅目录里有已被撤销的内容（上次操作可能被中断），正在清除…"
+    _pruneRevokedSubscription
+    local rc=$?
+    lockRelease
+    return "${rc}"
+}
+
 # ----------------------------- 事务主体 --------------------------------------
 # applyStaged [说明]  —— 应用 NEW_STATE；成功返回 0 并更新 state.json；任何一步失败都保持/恢复原状
 # 本机所有网卡的地址（/32 与 /128），JSON 数组。「公网出口」模式把它们也列入禁止访问，
@@ -3290,10 +3474,21 @@ applyStaged() {
         return 1
     fi
 
-    # 5) 备份 + 事务标记（崩溃后可恢复）
+    # 5) 备份 + 事务标记（崩溃后可恢复）。备份和标记没有确认写成功之前不能动 live 文件，否则之后失败就没有可恢复的依据
     bdir="${BACKUP_DIR}/${ts}"
-    backupLive "${bdir}"
-    printf '%s' "${bdir}" >"${TXN_MARK}"
+    if ! backupLive "${bdir}"; then
+        echoContent red " ---> 无法完整备份当前配置（磁盘空间或权限问题？）。为保证随时可以回滚，本次没有做任何改动"
+        rm -rf "${bdir}" "${stage}"
+        lockRelease
+        return 1
+    fi
+    if ! { printf '%s' "${bdir}" >"${TXN_MARK}" && [[ "$(cat "${TXN_MARK}" 2>/dev/null)" == "${bdir}" ]]; }; then
+        echoContent red " ---> 无法写入事务标记 ${TXN_MARK}。本次没有做任何改动"
+        rm -f "${TXN_MARK}" 2>/dev/null
+        rm -rf "${bdir}" "${stage}"
+        lockRelease
+        return 1
+    fi
     oldst="${bdir}/files/$(printf '%s' "${ATR_STATE}" | sed 's#/#%#g')"
     [[ -f "${oldst}" ]] || oldst=""
 
@@ -3305,55 +3500,75 @@ applyStaged() {
         cmp -s "${stage}/xray/config.json" "${XRAY_CONF}" 2>/dev/null && X_CHANGED=0
     fi
 
-    # 7) 原子落盘（先配置，后 state）
-    mkdir -p "${SB_DIR}/conf" "${XRAY_DIR}/conf" "${NGX_CONFD}"
-    if stateNeedsCore "${st}" sing-box; then install -m 600 "${stage}/sing-box/config.json" "${SB_CONF}"; else rm -f "${SB_CONF}"; fi
-    if stateNeedsCore "${st}" xray; then install -m 600 "${stage}/xray/config.json" "${XRAY_CONF}"; else rm -f "${XRAY_CONF}"; fi
-    rm -f "${NGX_CONFD}"/atr_*.conf
-    local nf
-    for nf in "${stage}"/nginx/*.conf; do
-        [[ -e "${nf}" ]] && install -m 644 "${nf}" "${NGX_CONFD}/$(basename "${nf}")"
-    done
-    install -m 600 "${st}" "${ATR_STATE}"
-
-    # 8) 防火墙放行（新增的先开，回收的等成功后再关）
-    local addList
-    addList=$(fwDiff "${oldst}" "${st}" add)
-    [[ -n "${addList}" ]] && fwApplyList open <<<"${addList}"
-
-    # 9) 启停服务 + 验证
-    echoContent green " ---> 应用配置并重启服务…"
-    if ! applyServices "${st}" || ! verifyRuntime "${st}"; then
-        echoContent red "\n ---> 新配置运行异常，正在自动回滚到变更前的状态…"
-        restoreFromBackup "${bdir}"
+    # 7) 原子落盘（先配置，后 state），逐项检查并核对内容；8) 防火墙放行（新增的先开，回收的等成功后再关）；
+    # 9) 启停服务 + 验证运行状态 + 核对落盘内容就是候选内容。任何一环失败都进入回滚
+    local failWhy="" addList="" restored=1
+    if ! _commitLive "${stage}" "${st}"; then
+        failWhy="配置文件没能写入（磁盘已满、只读文件系统或权限问题？）"
+    else
+        addList=$(fwDiff "${oldst}" "${st}" add)
+        [[ -n "${addList}" ]] && fwApplyList open <<<"${addList}"
+        echoContent green " ---> 应用配置并重启服务…"
+        if ! applyServices "${st}" || ! verifyRuntime "${st}"; then
+            failWhy="新配置运行异常"
+        elif ! _verifyCommitted "${stage}" "${st}"; then
+            failWhy="落盘的配置与候选内容不一致"
+        fi
+    fi
+    if [[ -n "${failWhy}" ]]; then
+        echoContent red "\n ---> ${failWhy}，正在自动回滚到变更前的状态…"
+        restoreFromBackup "${bdir}" || restored=0
         [[ -n "${addList}" ]] && fwApplyList close <<<"${addList}" >/dev/null
         SB_CHANGED=1
         X_CHANGED=1
-        if [[ -n "${oldst}" ]]; then
-            applyServices "${ATR_STATE}" force
-            verifyRuntime "${ATR_STATE}" >/dev/null 2>&1 && echoContent green " ---> 已回滚，旧配置运行正常" || echoContent red " ---> 回滚后旧配置也未能正常运行，请检查日志"
+        if ((restored)); then
+            if [[ -n "${oldst}" ]]; then
+                applyServices "${ATR_STATE}" force
+                verifyRuntime "${ATR_STATE}" >/dev/null 2>&1 && echoContent green " ---> 已回滚，旧配置运行正常" || echoContent red " ---> 回滚后旧配置也未能正常运行，请检查日志"
+            else
+                applyServices "${ATR_STATE}" force
+                echoContent yellow " ---> 首次安装失败，已清理本次改动"
+            fi
+            rm -f "${TXN_MARK}"
         else
-            applyServices "${ATR_STATE}" force
-            echoContent yellow " ---> 首次安装失败，已清理本次改动"
+            # 恢复本身失败：保留事务标记和备份，这是之后继续恢复的唯一依据（下次运行本脚本会自动再试一次）
+            echoContent red " ---> 回滚没有完整完成！事务标记和备份已保留（${bdir}），下次运行 ${ATR_CMD} 会自动再次尝试恢复；也可以手动检查 ${ATR_HOME}"
         fi
-        rm -f "${TXN_MARK}"
-        atrLog "ROLLBACK (${why}) backup=${bdir}"
+        atrLog "ROLLBACK (${why}) reason=${failWhy} restored=${restored} backup=${bdir}"
         rm -rf "${stage}"
         lockRelease
         return 1
     fi
 
     # 10) 成功: 回收不再需要的端口、清理标记、保留备份
-    local delList
+    local delList prc=0
     delList=$(fwDiff "${oldst}" "${st}" remove)
     [[ -n "${delList}" ]] && fwApplyList close <<<"${delList}"
     rm -f "${TXN_MARK}"
+    if [[ -e "${TXN_MARK}" ]]; then
+        # 标记留着，下次运行会把它当作"上次操作未完成"并回滚到旧配置——必须明说，不能报成功
+        echoContent red " ---> 配置已写入并运行正常，但无法删除事务标记 ${TXN_MARK}：下次运行脚本时它会被当作未完成的操作，并把配置回滚到旧版本。请手动删除该文件（回滚用的备份在 ${bdir}）"
+        atrLog "APPLIED but txn marker could not be removed (${why}) backup=${bdir}"
+        rm -rf "${stage}"
+        lockRelease
+        NEW_STATE=""
+        STAGED_BASE=""
+        return 1
+    fi
     pruneBackups
     atrLog "APPLIED (${why}) backup=${bdir}"
     rm -rf "${stage}"
+    # 11) 撤销收口：新 state 已提交，已发布目录里属于旧令牌/已删除用户/已关闭的订阅的内容必须在这里（仍持有锁）清除，
+    # 不依赖后面的发布能不能成功。清不掉就改为停止 nginx；连这也做不到则明确报告"撤销未完成"
+    _pruneRevokedSubscription || prc=$?
     lockRelease
     NEW_STATE=""
     STAGED_BASE=""
+    if ((prc >= 2)); then
+        echoContent red " ---> 配置已写入，但「撤销未完成」：已发布的订阅目录里仍留有应被撤销的文件，nginx 也没能停止（见上面的提示）。请先处理再继续使用订阅"
+        atrLog "APPLIED but subscription revocation incomplete (${why}) rc=${prc}"
+        return 3
+    fi
     echoContent green " ---> 配置已生效（${why}）"
     return 0
 }
@@ -3836,10 +4051,16 @@ _checkClientFile() { # _checkClientFile <文件> <描述>
 # 目录: ${CLIENT_DIR}/<用户>/{links.txt, sing-box.json, sing-box-full.json, mihomo-proxies.yaml, mihomo-full.yaml, naive-client.json}
 _generateClientFilesLocked() { # _generateClientFilesLocked [用户名]
     stateExists || return 1
-    local only=${1:-} u d n views dir sbouts mhprox rc=0
-    persistUserSecrets || rc=1
-    mkdir -p "${CLIENT_DIR}"
-    chmod 700 "${CLIENT_DIR}" 2>/dev/null
+    local only=${1:-} u d n views dir sbouts mhprox rc=0 out
+    local -a problems=()
+    persistUserSecrets || {
+        rc=1
+        problems+=("用户令牌/密钥没能写入 state")
+    }
+    if ! { mkdir -p "${CLIENT_DIR}" && chmod 700 "${CLIENT_DIR}"; }; then
+        echoContent red " ---> 无法创建/设置客户端配置目录 ${CLIENT_DIR}"
+        return 1
+    fi
     [[ -z "${ATR_PUBLIC_IP:-}" ]] && {
         ATR_PUBLIC_IP=$(getPublicIP 4)
         [[ -z "${ATR_PUBLIC_IP}" ]] && ATR_PUBLIC_IP=$(getPublicIP 6)
@@ -3856,35 +4077,53 @@ _generateClientFilesLocked() { # _generateClientFilesLocked [用户名]
         [[ -z "${u}" ]] && continue
         [[ -n "${only}" && "${u}" != "${only}" ]] && continue
         dir="${CLIENT_DIR}/${u}"
-        mkdir -p "${dir}"
-        chmod 700 "${dir}"
+        if ! { mkdir -p "${dir}" && chmod 700 "${dir}"; }; then
+            problems+=("${u}: 无法创建目录")
+            continue
+        fi
         rm -f "${dir}"/links.txt "${dir}"/sing-box*.json "${dir}"/mihomo*.yaml "${dir}"/naive-client.json
-        views=$(nodeViews "${u}") || continue
-        jq -r '.[]|select(.uri!=null)|.uri' <<<"${views}" >"${dir}/links.txt"
+        views=$(nodeViews "${u}") || {
+            problems+=("${u}: 无法生成节点信息")
+            continue
+        }
+        jq -r '.[]|select(.uri!=null)|.uri' <<<"${views}" >"${dir}/links.txt" || problems+=("${u}: links.txt 写入失败")
         sbouts=$(jq -c '[.[]|select(.singbox!=null)|.singbox]' <<<"${views}")
         mhprox=$(jq -c '[.[]|select(.mihomo!=null)|.mihomo]' <<<"${views}")
         if [[ "$(jq 'length' <<<"${sbouts}")" != "0" ]]; then
-            cfgSbMin "${sbouts}" | jq . >"${dir}/sing-box.json"
-            cfgSbFull "${sbouts}" "$(userApiSecret "${u}")" | jq . >"${dir}/sing-box-full.json"
-            _checkClientFile "${dir}/sing-box.json" "${u} 的 sing-box 客户端配置"
-            _checkClientFile "${dir}/sing-box-full.json" "${u} 的 sing-box 完整客户端配置"
+            out=$(cfgSbMin "${sbouts}") && jq . <<<"${out}" >"${dir}/sing-box.json" || problems+=("${u}: sing-box.json 生成失败")
+            out=$(cfgSbFull "${sbouts}" "$(userApiSecret "${u}")") && jq . <<<"${out}" >"${dir}/sing-box-full.json" || problems+=("${u}: sing-box-full.json 生成失败")
+            _checkClientFile "${dir}/sing-box.json" "${u} 的 sing-box 客户端配置" || problems+=("${u}: sing-box.json 未通过校验")
+            _checkClientFile "${dir}/sing-box-full.json" "${u} 的 sing-box 完整客户端配置" || problems+=("${u}: sing-box-full.json 未通过校验")
         fi
         if [[ "$(jq 'length' <<<"${mhprox}")" != "0" ]]; then
-            jsonToMihomoYaml <<<"${mhprox}" >"${dir}/mihomo-proxies.yaml"
-            cfgClashFull "${mhprox}" "" "$(userApiSecret "${u}")" >"${dir}/mihomo-full.yaml"
+            jsonToMihomoYaml <<<"${mhprox}" >"${dir}/mihomo-proxies.yaml" || problems+=("${u}: mihomo-proxies.yaml 生成失败")
+            cfgClashFull "${mhprox}" "" "$(userApiSecret "${u}")" >"${dir}/mihomo-full.yaml" || problems+=("${u}: mihomo-full.yaml 生成失败")
         fi
         if [[ "$(jq '[.[]|select(.naive!=null)]|length' <<<"${views}")" != "0" ]]; then
-            jq '[.[]|select(.naive!=null)|.naive][0]' <<<"${views}" >"${dir}/naive-client.json"
+            jq '[.[]|select(.naive!=null)|.naive][0]' <<<"${views}" >"${dir}/naive-client.json" || problems+=("${u}: naive-client.json 生成失败")
         fi
-        chmod 600 "${dir}"/* 2>/dev/null
+        chmod 600 "${dir}"/* || problems+=("${u}: 无法设置文件权限")
     done < <(userNames)
     if stateExists && [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
         generateSubscription || {
             echoContent red " ---> 订阅文件未能发布，订阅服务暂时不可用（凭据不会以不安全的权限落盘）。请根据上面的提示处理后重试"
-            rc=1
+            problems+=("订阅文件没有发布")
         }
     fi
+    if ((${#problems[@]} > 0)); then
+        echoContent red " ---> 客户端配置没有全部生成成功（${#problems[@]} 项问题）:"
+        printf '       - %s\n' "${problems[@]}" >&2
+        rc=1
+    fi
     return "${rc}"
+}
+# 配置已经生效之后重新生成客户端文件和订阅。返回 0=全部成功；失败时已打印原因，调用方必须把失败继续往上传，
+# 不能再宣称"已重新生成"。已被撤销的旧令牌/旧订阅链接在提交时已经从发布目录清除（见 applyStaged），与这里成败无关。
+# shellcheck disable=SC2120
+regenClients() { # regenClients [用户名]
+    generateClientFiles "$@" && return 0
+    echoContent red " ---> 服务端配置已生效，已被撤销的旧订阅链接/旧密钥已经失效；但客户端配置或订阅文件没有全部生成成功（原因见上）。修复后可用「重新生成全部客户端配置」重试"
+    return 1
 }
 # 整个生成过程持有事务锁（可重入），保证各用户的文件和订阅都来自同一份 state
 # shellcheck disable=SC2120
@@ -4129,21 +4368,6 @@ _appendRemoteSubscriptions() { # _appendRemoteSubscriptions <用户名> <default
     done < <(S -c '(.nginx.subscribe.remotes // [])[]')
 }
 
-# 关闭订阅发布: 清空已发布的内容（失败时宁可不提供订阅，也不留下旧链接或可读的残片）
-_closeSubscription() {
-    [[ -d "${SUB_DIR}" ]] || return 0
-    find "${SUB_DIR}" -mindepth 1 -delete 2>/dev/null
-    # 必须确认真的删干净了（只读文件系统等情况下删除会失败，nginx 却会继续提供旧内容）
-    [[ -z "$(find "${SUB_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]] && return 0
-    echoContent red " ---> 无法删除已发布的订阅文件，改为停止 nginx，确保不再提供旧订阅"
-    serviceStop "${NGX_UNIT}"
-    if serviceActive "${NGX_UNIT}"; then
-        echoContent red " ---> nginx 也没能停止！请立即手动处理: systemctl stop ${NGX_UNIT}，并检查 ${SUB_DIR} 所在的文件系统"
-        return 2
-    fi
-    echoContent yellow " ---> nginx 已停止（订阅与伪装站暂不可用）。排除文件系统问题后执行 ${ATR_CMD} restart 恢复"
-    return 1
-}
 # 每个用户的订阅文件是否齐全且结构合法（换入前的最后一道检查）
 _validateSubStage() { # _validateSubStage <staging 目录> <peer 密钥或空>
     local d=$1 peer=$2 u t
@@ -4155,7 +4379,7 @@ _validateSubStage() { # _validateSubStage <staging 目录> <peer 密钥或空>
         # 用标准输入读文件：文件名就是令牌，不能出现在 jq 的命令行上
         jq -e 'type == "array"' <"${d}/sing-box_profiles/${t}" >/dev/null 2>&1 || return 1
         if [[ -e "${d}/sing-box/${t}" ]]; then jq -e . <"${d}/sing-box/${t}" >/dev/null 2>&1 || return 1; fi
-        if [[ -n "${peer}" ]]; then [[ -e "${d}/peer/${peer}/${u}/default" ]] || return 1; fi
+        if [[ -n "${peer}" ]]; then [[ -e "${d}/peer/${u}/default" ]] || return 1; fi
     done < <(userNames)
 }
 # 复制文件。目标文件名是令牌/对等密钥，所以不用 cp（会把目标路径放在命令行上），改用 shell 重定向
@@ -4187,14 +4411,31 @@ _swapSubDir() { # _swapSubDir <staging 目录>
 # 任何一步失败都关闭订阅（并验证确实关闭了），不降级成"所有人可读"，也不留下已被撤销的旧链接。
 _generateSubscriptionLocked() {
     [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 0 # 拿到锁之后重新确认（等锁期间可能被关掉）
+    # 任何一次发布尝试都先保证"已被撤销的内容不在发布目录里"，不管后面的发布成不成功
+    _pruneRevokedSubscription
+    if (($? >= 2)); then
+        echoContent red " ---> 无法清除已撤销的订阅文件，本次不发布"
+        return 1
+    fi
     persistUserSecrets || {
-        echoContent red " ---> 无法更新用户令牌/密钥，本次不发布订阅文件（已发布的内容保持不变）"
+        echoContent red " ---> 无法更新用户令牌/密钥，本次不发布订阅文件（仍然有效的已发布内容保持不变，已被撤销的内容已清除）"
         return 1
     }
     if ! nginxModelCurrent; then
         echoContent yellow " ---> 检测到旧版 nginx 权限模型，发布订阅前先迁移到专用账号模型（会重启 nginx）…"
         if ! migrateNginxModel; then
             echoContent red " ---> 迁移失败，本次不发布订阅文件"
+            _closeSubscription
+            return 1
+        fi
+    fi
+    if ! nginxSubLayoutCurrent; then
+        # 订阅的 nginx 配置是旧格式（对等端点按旧的目录布局取文件），先按当前 state 重新渲染并应用一次，再按新布局发布
+        echoContent yellow " ---> 订阅服务的 nginx 配置是旧版格式，先重新应用一次配置…"
+        stagedBegin
+        if ! applyStaged "更新订阅服务的 nginx 配置"; then
+            stagedDiscard
+            echoContent red " ---> 更新失败，本次不发布订阅文件"
             _closeSubscription
             return 1
         fi
@@ -4236,10 +4477,10 @@ _generateSubscriptionLocked() {
         jsonToMihomoYaml <"${w}/mh.json" >"${w}/clash" 2>/dev/null || fail=1
         # 本机作为"被合并方"：只放本机自己的节点（不含已合并进来的远程节点，避免两台机器互相合并时重复膨胀）
         if [[ -n "${peer}" ]]; then
-            mkdir -p "${stage}/peer/${peer}/${u}" || fail=1
-            _b64file "${w}/links" "${stage}/peer/${peer}/${u}/default" || fail=1
-            _copyFile "${w}/clash" "${stage}/peer/${peer}/${u}/clashMeta" || fail=1
-            _copyFile "${w}/sb.json" "${stage}/peer/${peer}/${u}/sing-box_profiles" || fail=1
+            mkdir -p "${stage}/peer/${u}" || fail=1
+            _b64file "${w}/links" "${stage}/peer/${u}/default" || fail=1
+            _copyFile "${w}/clash" "${stage}/peer/${u}/clashMeta" || fail=1
+            _copyFile "${w}/sb.json" "${stage}/peer/${u}/sing-box_profiles" || fail=1
         fi
         ((fail)) && break
         _appendRemoteSubscriptions "${u}" "${w}/links" "${w}/clash" "${w}/sb.json" # 远程合并是尽力而为：取不到只跳过并提示
@@ -4265,6 +4506,14 @@ _generateSubscriptionLocked() {
         rm -rf "${SUB_DIR}.old"
         _closeSubscription
         return 1
+    fi
+    # 上一次失败时 nginx 可能被停掉了（见 _closeSubscription）；发布成功后要让它重新运行起来
+    if stateNeedsNginx "${ATR_STATE}" && ! serviceActive "${NGX_UNIT}"; then
+        systemctl start "${NGX_UNIT}" >/dev/null 2>&1
+        if ! waitServiceActive "${NGX_UNIT}" 10; then
+            echoContent red " ---> 订阅文件已发布，但 nginx 没能启动"
+            return 1
+        fi
     fi
     return 0
 }
@@ -4297,7 +4546,7 @@ _showSubscriptionLinksLocked() { # _showSubscriptionLinksLocked [用户名]
         }
     fi
     base=$(subscriptionBase)
-    [[ "${base}" == http://* ]] && echoContent yellow " ---> 提示: 当前为 HTTP 明文订阅，可能被运营商拦截，建议配置域名证书后使用 HTTPS"
+    [[ "${base}" == http://* ]] && echoContent yellow " ---> 提示: 当前为 HTTP 明文订阅，订阅令牌和全部节点凭据会明文经过网络（可被中间人读取，也可能被运营商拦截），建议配置域名证书后使用 HTTPS"
     while IFS= read -r u; do
         [[ -z "${u}" ]] && continue
         [[ -n "${only}" && "${u}" != "${only}" ]] && continue
@@ -4409,10 +4658,16 @@ selfCheckAll() {
 # =============================================================================
 
 # 变更成功后: 重新生成全部客户端配置，展示受影响用户的账号，并提示需要同步
-postChangeShow() { # postChangeShow [用户名|空=全部] [提示语]
-    generateClientFiles
+postChangeShow() { # postChangeShow [用户名|空=全部] [提示语]；返回 0=全部成功，1=客户端/订阅文件没有全部生成
+    local gr=0
+    regenClients || gr=1
     showAccounts "${1:-}" 0
-    echoContent yellow "\n ! ${2:-配置已变更}：客户端配置已自动重新生成，请把上面的链接/配置同步到对应客户端。"
+    if ((gr)); then
+        echoContent red "\n ! ${2:-配置已变更}，但客户端配置/订阅文件没有全部生成成功，上面显示的账号信息请以实际生效的服务端配置为准。"
+    else
+        echoContent yellow "\n ! ${2:-配置已变更}：客户端配置已自动重新生成，请把上面的链接/配置同步到对应客户端。"
+    fi
+    return "${gr}"
 }
 
 # 用户选择器: 列出编号，选择后设置 PICKED_USER
@@ -4508,10 +4763,11 @@ userAddFlow() {
         names+=("$(stagedGet '.users|last|.name')")
     done
     if applyStaged "添加用户"; then
-        generateClientFiles
-        local n
+        local n gr=0
+        regenClients || gr=1
         for n in "${names[@]}"; do showAccounts "${n}" 0; done
         echoContent yellow "\n ---> 已添加 ${#names[@]} 个用户，账号会同时添加到所有已安装的协议"
+        return "${gr}"
     else
         stagedDiscard
         return 1
@@ -4535,8 +4791,8 @@ userDeleteFlow() {
         return 1
     }
     if applyStaged "删除用户"; then
-        generateClientFiles
-        echoContent green " ---> 已删除用户 ${PICKED_USER}（并同步移除其客户端配置文件）"
+        echoContent green " ---> 已删除用户 ${PICKED_USER}（该用户的所有客户端凭据和订阅链接已失效）"
+        regenClients
     else
         stagedDiscard
         return 1
@@ -4605,11 +4861,17 @@ userResetFlow() {
         stagedEdit --arg n "${user}" --arg t "$(newSubToken)" '.users |= map(if .name==$n then .sub_token=$t else . end)' || return 1
     fi
     if applyStaged "重置凭据(${user})"; then
-        postChangeShow "${user}" "用户 ${user} 的凭据已重置，旧凭据已失效"
+        local pr=0
+        postChangeShow "${user}" "用户 ${user} 的凭据已重置，旧凭据已失效" || pr=1
         if [[ "${rotate}" == "1" && "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
-            echoContent yellow " ---> 该用户的订阅链接也已更换，旧订阅链接已失效，请在客户端重新导入下面的新链接:"
-            showSubscriptionLinks "${user}"
+            if ((pr)); then
+                echoContent red " ---> 该用户的旧订阅链接已失效，但新的订阅链接没能发布，暂时没有可用的订阅链接。请按上面的提示处理后再用「查看订阅链接」重试"
+            else
+                echoContent yellow " ---> 该用户的订阅链接也已更换，旧订阅链接已失效，请在客户端重新导入下面的新链接:"
+                showSubscriptionLinks "${user}" || pr=1
+            fi
         fi
+        return "${pr}"
     else
         stagedDiscard
         return 1
@@ -4694,8 +4956,7 @@ manageUsers() {
     5) userDeleteFlow ;;
     6) userResetFlow ;;
     7)
-        generateClientFiles
-        echoContent green " ---> 已重新生成全部客户端配置: ${CLIENT_DIR}/"
+        regenClients && echoContent green " ---> 已重新生成全部客户端配置: ${CLIENT_DIR}/"
         ;;
     *) echoContent red " ---> 选择错误" ;;
     esac
@@ -5020,10 +5281,11 @@ installProtocols() {
     # --- 自检 + 展示 ---
     n=$((n + 1))
     step "${n}" "${total}" "自检并生成客户端配置"
-    generateClientFiles
+    local gr=0
+    regenClients || gr=1
     selfCheckAll || echoContent yellow " ---> 自检有失败项，请查看上面的提示后再使用对应协议"
     showAccounts "" 0
-    return 0
+    return "${gr}"
 }
 
 # ----------------------------- 菜单入口 --------------------------------------
@@ -5135,9 +5397,11 @@ cliInstallAnyTLSReality() {
         return 1
     }
     step 5 5 "自检并生成客户端配置"
-    generateClientFiles
+    local gr=0
+    regenClients || gr=1
     selfCheckAll
     showAccounts "" 0
+    return "${gr}"
 }
 
 # =============================================================================
@@ -5411,8 +5675,8 @@ manageUDPProtocol() { # manageUDPProtocol <hysteria2|tuic>
         stagedBegin
         stagedEdit --arg id "${id}" 'del(.protocols[$id])' || return 1
         if applyStaged "卸载 ${name}"; then
-            generateClientFiles
             echoContent green " ---> ${name} 已卸载"
+            regenClients
         else stagedDiscard; fi
         ;;
     3) portHoppingMenu "${id}" ;;
@@ -5659,7 +5923,7 @@ enableSubscription() {
         ssl=true
         echoContent green " ---> 使用域名 ${d} 的证书提供 HTTPS 订阅"
     else
-        echoContent yellow " ---> 没有可用的域名证书，将使用 HTTP 明文订阅，可能被运营商拦截，请注意风险"
+        echoContent yellow " ---> 没有可用的域名证书，将使用 HTTP 明文订阅：订阅令牌和全部节点凭据会明文经过网络（可被中间人读取，也可能被运营商拦截），请注意风险"
         confirm "是否继续使用 HTTP 订阅？" n || return 1
     fi
     stagedBegin
@@ -5668,8 +5932,7 @@ enableSubscription() {
     stagedEdit --argjson p "${port}" --argjson s "${ssl}" '.nginx.subscribe = (((.nginx.subscribe // {}) | del(.salt)) + {enabled:true,port:$p,ssl:$s}) | .nginx.subscribe |= (. + {peer_key: (.peer_key // ""), remotes: (.remotes // [])})' || return 1
     [[ -s "${WEB_ROOT}/index.html" ]] || installFakeSite
     if applyStaged "启用订阅服务"; then
-        generateClientFiles
-        showSubscriptionLinks
+        regenClients && showSubscriptionLinks
     else stagedDiscard; return 1; fi
 }
 
@@ -5688,16 +5951,21 @@ subscriptionMenu() {
     ask c "请选择:" || return 1
     case "${c}" in
     1)
-        generateClientFiles
-        showSubscriptionLinks
+        regenClients && showSubscriptionLinks
         ;;
     2)
         pickUserOrAll "请选择要更换订阅链接的用户编号/用户名，输入 a 表示全部用户" || return 1
         who=${PICKED_USER}
         if rotateSubTokens "${who}"; then
-            generateClientFiles
-            echoContent yellow " ---> 旧订阅链接已失效，请在客户端重新导入下面的新链接:"
-            showSubscriptionLinks "${who}"
+            if regenClients; then
+                echoContent yellow " ---> 旧订阅链接已失效，请在客户端重新导入下面的新链接:"
+                showSubscriptionLinks "${who}"
+            else
+                echoContent red " ---> 旧订阅链接已失效（提交时已从发布目录清除），但新的订阅文件没能发布，暂时没有可用的订阅链接。请按上面的提示处理后再选「查看订阅链接」重试"
+                return 1
+            fi
+        else
+            return 1
         fi
         ;;
     3)
@@ -5754,7 +6022,7 @@ _importLegacyRemotes() {
 
 # 本机的对等密钥: 其他机器凭它合并本机订阅
 _peerKeyMenu() {
-    local c key
+    local c key gf=0
     key=$(S '.nginx.subscribe.peer_key // ""')
     echoContent skyBlue "\n---------- 本机对等密钥（供其他机器合并本机订阅）----------"
     echoContent yellow "# 对等密钥只用于服务器之间合并订阅；泄露它等于泄露本机所有用户的节点，请只告诉你自己的其他机器"
@@ -5773,18 +6041,22 @@ _peerKeyMenu() {
                 stagedDiscard
                 return 1
             fi
-            generateClientFiles
+            regenClients || gf=1
         fi
         echoContent green "本机对等密钥: \c"
         printRaw green "${key}"
         echoContent yellow "在对方机器的 菜单 7→3→1 里添加本机时填写：域名或IP:端口:别名，以及这把密钥。"
+        if ((gf)); then
+            echoContent red " ---> 新密钥已在 nginx 中生效（旧密钥已立即失效），但本机的订阅文件没有全部发布成功，对方暂时可能取不到内容"
+            return 1
+        fi
         ;;
     3)
         stagedBegin
         stagedEdit '.nginx.subscribe.peer_key=""' || return 1
         if applyStaged "关闭对等密钥"; then
-            generateClientFiles
             echoContent green " ---> 已关闭，其他机器不能再合并本机订阅"
+            regenClients
         else stagedDiscard; fi
         ;;
     *) echoContent red " ---> 选择错误" ;;
@@ -5841,7 +6113,7 @@ otherSubscriptionMenu() {
         stagedEdit --arg h "${host}" --argjson p "$((10#${port}))" --arg a "${alias}" --arg s "${scheme}" --arg k "${key}" --arg c "${ca}" \
             '.nginx.subscribe.remotes = ((.nginx.subscribe.remotes // []) + [{host:$h,port:$p,alias:$a,scheme:$s,key:$k,cacert:$c}])' || return 1
         if applyStaged "添加远程订阅(${alias})"; then
-            generateClientFiles
+            regenClients || return 1
             echoContent green " ---> 已添加并重新生成订阅"
         else
             stagedDiscard
@@ -5859,7 +6131,7 @@ otherSubscriptionMenu() {
         stagedBegin
         stagedEdit --argjson i "$((10#${n} - 1))" 'del(.nginx.subscribe.remotes[$i])' || return 1
         if applyStaged "移除远程订阅"; then
-            generateClientFiles
+            regenClients || return 1
             echoContent green " ---> 已删除并重新生成订阅"
         else
             stagedDiscard
@@ -5883,7 +6155,7 @@ otherSubscriptionMenu() {
         stagedBegin
         stagedEdit --argjson i "$((10#${n} - 1))" --arg k "${key}" '.nginx.subscribe.remotes[$i].key=$k' || return 1
         if applyStaged "修改远程订阅的对等密钥"; then
-            generateClientFiles
+            regenClients || return 1
             echoContent green " ---> 已更新并重新生成订阅"
         else
             stagedDiscard
@@ -6601,7 +6873,7 @@ pickEgressMode() { # pickEgressMode [当前值] [回车默认: 1|2]
     echoContent skyBlue "\n---------------- 出口访问模式 ----------------"
     echoContent yellow "决定通过节点连进来的客户端，能不能访问这台服务器本机和内网里的服务："
     echoContent yellow "1.公网出口【推荐】  客户端只能访问公网。禁止：本机回环(127.0.0.0/8、::1)、内网/私网、链路本地(含云厂商元数据"
-    echoContent yellow "                   169.254.169.254)、本机自己所有网卡的地址(含公网 IP)；域名解析到这些地址时同样会被拦截（Xray 对域名目标的 DNS rebinding 防护尚未验证）"
+    echoContent yellow "                   169.254.169.254)、本机自己所有网卡的地址(含公网 IP)；域名解析到这些地址时同样会被拦截（已用 DNS rebinding 实测，详见 README）"
     echoContent yellow "2.允许内网访问       不做任何限制。仅当你信任所有节点用户、并且确实需要经节点访问本机/内网服务时选择"
     echoContent yellow "之后可以在 11.分流工具 → 6.出口访问模式 里随时切换。"
     ask c "请选择[回车默认 ${def}]:" || return 1
@@ -7118,8 +7390,10 @@ cliDelUser() {
         return 1
     }
     if applyStaged "删除用户 ${1}"; then
-        generateClientFiles
+        local gr=0
+        regenClients || gr=1
         echoContent green " ---> 已删除用户 ${1}"
+        return "${gr}"
     else
         stagedDiscard
         return 1
@@ -7145,7 +7419,7 @@ securityUpgradeNotice() {
     confirm "是否现在升级？" y || return 0
     stagedBegin
     if applyStaged "安全升级: nginx 专用账号与订阅权限"; then
-        generateClientFiles
+        regenClients
     else
         stagedDiscard
     fi
@@ -7263,6 +7537,7 @@ main() {
     fi
     ensureJq || exit 1
     recoverIfNeeded
+    reconcileSubscription
     aliasInstall
     if [[ ! -x "${ATR_SCRIPT_PATH}" ]]; then
         echoContent yellow "\n 提示: 脚本没有保存到本机文件(可能是通过管道 curl | bash 运行的)，${ATR_CMD} 命令与证书自动续签后的重载钩子将不可用。"
