@@ -33,7 +33,12 @@ export LANG=en_US.UTF-8
 # - 换内核时的互通检查区分"握手失败"（自动恢复旧内核）和"无法自动验证"（保留新内核并列出，只确认了服务启动与端口监听）；
 #   安装验收同理。ATR_ALLOW_UNTESTED_CORE 取消。
 # - 有未完成的事务时 status / show / log 仍可使用；atr recover 重试恢复，atr recover --abandon 放弃恢复（备份保留）。
-ATR_VERSION="v1.2.4"
+# v1.2.5：
+# - 订阅要不要重新发布按磁盘上的实际状态判断（每个用户的 default/<令牌>、对等分享开着时的 peer/<用户>/default、nginx 订阅配置格式），
+#   不再依赖进程内的标记：发布失败、_swapSubDir 两次 mv 之间被中断、开机任务只撤下没发布，下一次运行 atr 都会自动补发。
+# - 清空/删除之后的复查本身失败（find 出错）按"没删干净"处理，走停止 nginx 的兜底，不再当成已经清空。
+# - 哪些协议不能用 sing-box 自检由协议表声明（selfcheck:false）；其余协议拿不到自检用的客户端配置时按检测失败处理，不再降级为"未验证"。
+ATR_VERSION="v1.2.5"
 ATR_PROJECT_NAME="anytls-reality"
 
 # ----------------------------- 路径与常量 -----------------------------------
@@ -369,6 +374,14 @@ _requireCleanTransaction() {
         return 1
     fi
     return 0
+}
+
+# find 只要第一个匹配项（打印出来，可能为空）。find 本身失败（读不了目录、I/O 错误）时返回 1：
+# 调用方必须把它当成"不确定"，不能当成"没有"——否则检测失败就成了检测通过
+_findFirst() { # _findFirst <find 参数...>
+    local out
+    out=$(find "$@" -print -quit 2>/dev/null) || return 1
+    printf '%s' "${out}"
 }
 
 # ----------------------------- 日志跟随 -------------------------------------
@@ -782,7 +795,7 @@ read -r -d '' PROTO_REGISTRY <<'EOF'
  {"id":"anytls_reality","name":"AnyTLS+Reality","short":"AnyTLS_Reality","cores":["sing-box"],"reality":true,"tls":false,"net":"tcp","note":"推荐","preset":true},
  {"id":"tuic","name":"Tuic","short":"Tuic","cores":["sing-box"],"reality":false,"tls":true,"net":"udp","preset":true},
  {"id":"hysteria2","name":"Hysteria2","short":"Hysteria2","cores":["sing-box"],"reality":false,"tls":true,"net":"udp","preset":true},
- {"id":"naive","name":"Naive","short":"Naive","cores":["sing-box"],"reality":false,"tls":true,"net":"tcp","preset":true},
+ {"id":"naive","name":"Naive","short":"Naive","cores":["sing-box"],"reality":false,"tls":true,"net":"tcp","preset":true,"selfcheck":false},
  {"id":"vless_vision_tls","name":"VLESS+TLS_Vision+TCP","short":"VLESS_TCP_TLS_Vision","cores":["sing-box","xray"],"reality":false,"tls":true,"net":"tcp","note":"推荐"},
  {"id":"vless_ws","name":"VLESS+TLS+WS","short":"VLESS_WS","cores":["sing-box","xray"],"reality":false,"tls":true,"net":"tcp","note":"仅CDN推荐","cdn":true},
  {"id":"vmess_ws","name":"VMess+TLS+WS","short":"VMess_WS","cores":["sing-box","xray"],"reality":false,"tls":true,"net":"tcp","note":"仅CDN推荐","cdn":true},
@@ -790,8 +803,8 @@ read -r -d '' PROTO_REGISTRY <<'EOF'
  {"id":"vless_reality_grpc","name":"VLESS+Reality+gRPC","short":"VLESS_Reality_gRPC","cores":["sing-box"],"reality":true,"tls":false,"net":"tcp"},
  {"id":"vmess_httpupgrade","name":"VMess+TLS+HTTPUpgrade","short":"VMess_HTTPUpgrade","cores":["sing-box"],"reality":false,"tls":true,"net":"tcp","note":"仅CDN推荐","cdn":true,"nginx":true},
  {"id":"anytls_tls","name":"AnyTLS+TLS(证书)","short":"AnyTLS","cores":["sing-box"],"reality":false,"tls":true,"net":"tcp"},
- {"id":"vless_reality_xhttp","name":"VLESS+Reality+XHTTP","short":"VLESS_Reality_XHTTP","cores":["xray"],"reality":true,"tls":false,"net":"tcp"},
- {"id":"vless_xhttp_tls","name":"VLESS+XHTTP+TLS","short":"VLESS_XHTTP_TLS","cores":["xray"],"reality":false,"tls":true,"net":"tcp","note":"CDN可用","cdn":true}
+ {"id":"vless_reality_xhttp","name":"VLESS+Reality+XHTTP","short":"VLESS_Reality_XHTTP","cores":["xray"],"reality":true,"tls":false,"net":"tcp","selfcheck":false},
+ {"id":"vless_xhttp_tls","name":"VLESS+XHTTP+TLS","short":"VLESS_XHTTP_TLS","cores":["xray"],"reality":false,"tls":true,"net":"tcp","note":"CDN可用","cdn":true,"selfcheck":false}
 ]
 EOF
 
@@ -1443,8 +1456,8 @@ _restorePreviousCore() {
     atomicWrite "${bin}" 755 <"${bin}.prev" && cmp -s "${bin}.prev" "${bin}"
 }
 # 换内核后的互通检查: 用本机 sing-box 作客户端，对该核心承载的协议逐个做回环握手（selfCheckProtocol）。
-# 返回 1 = 至少一个协议握手失败，调用方恢复旧内核。无法自动验证的协议（本机没有 sing-box，或 sing-box 客户端
-# 不支持该协议: Naive、VLESS+Reality+XHTTP、VLESS+XHTTP+TLS）不算失败，只列出来——它们只确认了服务启动与端口监听。
+# 返回 1 = 至少一个协议握手失败（含生成自检配置出错），调用方恢复旧内核。无法自动验证的协议（本机没有 sing-box，或协议表声明
+# sing-box 客户端不支持: Naive、VLESS+Reality+XHTTP、VLESS+XHTTP+TLS）不算失败，只列出来——它们只确认了服务启动与端口监听。
 # 注意: 升级 sing-box 时客户端就是新的 sing-box 本身，只能证明自洽，不能证明旧版客户端 / mihomo / Xray 客户端仍然兼容。
 _checkCoreInterop() {
     local core=$1 id user rc ids fail=0 unverified=()
@@ -1471,12 +1484,14 @@ _checkCoreInterop() {
 }
 # 该核心承载、但无法用本机 sing-box 自动验证的协议名（判断条件与 selfCheckProtocol 的跳过条件相同）
 coreUncheckableNames() { # coreUncheckableNames <core>
-    local id user names=()
+    local id user rc names=()
     stateExists || return 0
     user=$(userNames | head -n 1)
     while IFS= read -r id; do
         [[ -n "${id}" ]] || continue
-        selfCheckSupported "${id}" "${user}" || names+=("$(protoName "${id}")")
+        rc=0
+        selfCheckSupported "${id}" "${user}" || rc=$?
+        ((rc == 1 || rc == 2)) && names+=("$(protoName "${id}")") # rc 3（生成出错）不是"不支持"，换内核后会按失败处理
     done < <(installedProtocolsOfCore "$1")
     ((${#names[@]} == 0)) || printf '%s\n' "${names[*]}"
 }
@@ -3535,9 +3550,11 @@ verifyRuntime() { # verifyRuntime <state.json>
 # 关闭订阅发布: 清空已发布的内容（失败时宁可不提供订阅，也不留下旧链接或可读的残片）
 _closeSubscription() {
     [[ -d "${SUB_DIR}" ]] || return 0
+    local first
     find "${SUB_DIR}" -mindepth 1 -delete 2>/dev/null
-    # 必须确认真的删干净了（只读文件系统等情况下删除会失败，nginx 却会继续提供旧内容）
-    [[ -z "$(find "${SUB_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]] && return 0
+    # 必须确认真的删干净了（只读文件系统等情况下删除会失败，nginx 却会继续提供旧内容）；
+    # 复查本身失败（读不了目录）同样不能当成"已清空"，一律走下面停止 nginx 的兜底
+    if first=$(_findFirst "${SUB_DIR}" -mindepth 1) && [[ -z "${first}" ]]; then return 0; fi
     echoContent red " ---> 无法删除已发布的订阅文件，改为停止 nginx，确保不再提供旧订阅"
     serviceStop "${NGX_UNIT}"
     if serviceActive "${NGX_UNIT}"; then
@@ -3555,11 +3572,10 @@ nginxSubLayoutCurrent() {
 # 被撤销的令牌、旧版布局里以对等密钥命名的目录，名字都不会出现在任何外部命令的参数里（rm 只拿到固定的 .old 路径，
 # 在它自己的递归里删除）；仍然有效的文件也不会先被删掉、再等下一次发布。
 # 源文件必须用 < 读: _copyFile 的 cat -- "$1" 会把源路径（也就是有效令牌）放进 cat 的命令行。
-# 由 _pruneRevokedSubscription 在持锁时调用，读取它的 valid / users / peer。
-# 返回后 SUB_PEER_DROPPED=1 表示旧版 peer 布局的内容没有搬过来（含密钥的目录名无法安全处理），调用方应按新布局重新发布
+# 由 _pruneRevokedSubscription 在持锁时调用，读取它的 valid / users / peer（Bash 动态作用域：不要把它当独立函数调用）。
+# 旧版 peer 布局的内容不会搬过来；要不要重新发布由 _subscriptionIncomplete 按磁盘状态判断
 _rebuildSubDir() {
     local tmp kind t u k fail=0 old_umask
-    SUB_PEER_DROPPED=0
     rm -rf "${SUB_DIR}".prune.* 2>/dev/null # 上次崩溃留下的（持锁，所以不会是别人正在用的）
     old_umask=$(umask)
     umask 077
@@ -3575,9 +3591,10 @@ _rebuildSubDir() {
         done
     done
     if [[ -n "${peer}" && -d "${SUB_DIR}/peer" && ! -L "${SUB_DIR}/peer" ]]; then
-        if [[ -n "$(find "${SUB_DIR}/peer" -mindepth 2 -type d -print -quit 2>/dev/null)" ]]; then
-            SUB_PEER_DROPPED=1 # 旧版 peer/<密钥>/<用户>/ 布局（新布局在第二层只有文件）
-        else
+        # 第二层出现目录 = 旧版 peer/<密钥>/<用户>/ 布局；find 失败（无法确认）同样按旧布局处理。这两种情况都不搬 peer 内容
+        # （含密钥的目录名无法安全处理），之后 _subscriptionIncomplete 会发现 peer 文件缺失，按新布局重新发布
+        local sub
+        if sub=$(_findFirst "${SUB_DIR}/peer" -mindepth 2 -type d) && [[ -z "${sub}" ]]; then
             for u in "${!users[@]}"; do # 新布局 peer/<用户名>/<类型>: 用户名不是凭据
                 for k in default clashMeta sing-box_profiles; do
                     [[ -f "${SUB_DIR}/peer/${u}/${k}" && ! -L "${SUB_DIR}/peer/${u}/${k}" ]] || continue
@@ -3613,13 +3630,14 @@ _pruneRevokedSubscription() {
     local mode=${1:-prune}
     [[ -d "${SUB_DIR}" ]] || return 0
     if [[ "$(S '.nginx.subscribe.enabled')" != "true" ]]; then
-        [[ -z "$(find "${SUB_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]] && return 0
+        local first
+        if first=$(_findFirst "${SUB_DIR}" -mindepth 1) && [[ -z "${first}" ]]; then return 0; fi # 扫描失败不算"空"
         [[ "${mode}" == check ]] && return 10
         _closeSubscription
         return
     fi
     local -A valid=() users=()
-    local u t kind f name d stale=0 peer
+    local u t kind f name d sub stale=0 peer
     while IFS=$'\t' read -r u t; do
         [[ -z "${u}" ]] && continue
         users["${u}"]=1
@@ -3643,8 +3661,8 @@ _pruneRevokedSubscription() {
                 [[ -e "${d}" || -L "${d}" ]] || continue
                 name=${d##*/}
                 # 只认 peer/<现存用户>/ 下的普通文件。条件的顺序不能改: 先确认 name 是现存用户名，find 才会拿到这个路径
-                # （旧版 peer/<密钥>/<用户>/ 布局里 name 就是对等密钥，绝不能出现在 find 的参数里）
-                if [[ -n "${users[${name}]:-}" && -d "${d}" && ! -L "${d}" && -z "$(find "${d}" -mindepth 1 \( -type d -o -type l \) -print -quit 2>/dev/null)" ]]; then
+                # （旧版 peer/<密钥>/<用户>/ 布局里 name 就是对等密钥，绝不能出现在 find 的参数里）。find 失败按"过期"处理（触发重建）
+                if [[ -n "${users[${name}]:-}" && -d "${d}" && ! -L "${d}" ]] && sub=$(_findFirst "${d}" -mindepth 1 \( -type d -o -type l \)) && [[ -z "${sub}" ]]; then
                     continue
                 fi
                 stale=1
@@ -3672,35 +3690,56 @@ _pruneRevokedSubscription() {
     echoContent red " ---> 无法清除已被撤销的订阅文件（文件系统只读或没有权限？）"
     _closeSubscription
 }
-# 启动时对账：提交之后、清理之前进程被中断，或有人手工动过发布目录，都会留下应被撤销的内容。只读检查不加锁，真有才加锁清除。
-# 清除时撤下了旧版 peer 布局的内容（SUB_PEER_DROPPED）就在同一把锁里立即按新布局重新发布，不让对等端点一直 404 到下一次发布；
-# 重新发布失败只提示（应撤销的内容已经清除），不阻止本次命令。no-republish: 开机时的 apply-hop 不做发布
-reconcileSubscription() { # reconcileSubscription [no-republish]
+# 订阅已启用，但已发布的内容不完整吗？0 = 不完整（需要重新发布）。只看磁盘上的实际状态，不依赖任何进程内标记，
+# 所以发布失败、进程中断（包括 _swapSubDir 两次 mv 之间：目录不在，或之后被 mkdir -p 建成空目录）、开机任务只撤下没发布，
+# 下一次运行都会再识别出来。订阅或对等分享已关闭时不算不完整：修复检测不会重新打开分享
+_subscriptionIncomplete() {
+    [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 1
+    local u t peer
+    nginxSubLayoutCurrent || return 0
+    peer=$(S '.nginx.subscribe.peer_key // ""')
+    while IFS=$'\t' read -r u t; do
+        [[ -n "${u}" ]] || continue
+        [[ -n "${t}" && -f "${SUB_DIR}/default/${t}" ]] || return 0
+        [[ -z "${peer}" || -f "${SUB_DIR}/peer/${u}/default" ]] || return 0
+    done < <(S '.users[]? | "\(.name)\t\(.sub_token // "")"')
+    return 1
+}
+# 启动时对账：提交之后、清理之前进程被中断，或有人手工动过发布目录，都会留下应被撤销的内容；发布失败或被中断则会留下不完整的发布目录。
+# 只读检查不加锁，真有问题才加锁，并在锁内重新判断（等锁期间别的进程可能已经处理完）。先清除应撤销的内容，再按磁盘状态判断
+# 要不要重新发布。重新发布失败只提示（应撤销的内容已经清除），下一次运行会再试；strict（atr recover）时返回非零。
+# no-republish: 开机时的 apply-hop 只清除不发布，留给下一次运行
+reconcileSubscription() { # reconcileSubscription [no-republish|strict]
     stateExists || return 0
-    [[ -d "${SUB_DIR}" ]] || return 0
-    _pruneRevokedSubscription check
-    (($? == 10)) || return 0
+    local stale=0 rc=0
+    if [[ -d "${SUB_DIR}" ]]; then
+        _pruneRevokedSubscription check
+        (($? == 10)) && stale=1
+    fi
+    ((stale)) || _subscriptionIncomplete || return 0
     lockAcquire || {
-        echoContent red " ---> 发现订阅目录里有应被撤销的内容，但拿不到锁，没有清理。请稍后执行 ${ATR_CMD} restart"
+        echoContent red " ---> 订阅目录需要清理或重新发布，但拿不到锁，没有处理。请稍后执行 ${ATR_CMD} restart"
         return 1
     }
     if ! _requireCleanTransaction; then
         lockRelease
         return 1
     fi
-    echoContent yellow "\n ---> 检测到订阅目录里有已被撤销的内容或旧版目录布局（上次操作可能被中断，或刚从旧版本升级），正在清除…"
-    SUB_PEER_DROPPED=0
-    _pruneRevokedSubscription
-    local rc=$?
-    if ((rc == 0 && SUB_PEER_DROPPED == 1)); then
+    if ((stale)); then
+        echoContent yellow "\n ---> 检测到订阅目录里有已被撤销的内容或旧版目录布局（上次操作可能被中断，或刚从旧版本升级），正在清除…"
+        _pruneRevokedSubscription
+        rc=$?
+    fi
+    if ((rc == 0)) && _subscriptionIncomplete; then
         if [[ "${1:-}" == no-republish ]] || ! declare -F generateSubscription >/dev/null; then
-            echoContent yellow " ---> 旧版目录布局的对等订阅已撤下，下一次发布（${ATR_CMD} sub / ${ATR_CMD} restart）时按新布局恢复"
-            atrLog "reconcile: legacy peer layout removed, republish deferred"
+            echoContent yellow " ---> 已发布的订阅不完整，这次（开机任务）不重新发布；下一次运行 ${ATR_CMD} 时会自动补发"
+            atrLog "reconcile: subscription incomplete, republish deferred"
         else
-            echoContent yellow " ---> 对等订阅是旧版目录布局，已撤下；正在按新布局重新发布（会重新应用一次配置并重启 nginx）…"
+            echoContent yellow " ---> 已发布的订阅不完整（上次发布失败或被中断，或刚从旧版目录布局升级），正在按当前配置重新发布…"
             if ! generateSubscription; then
-                echoContent red " ---> 重新发布失败（应被撤销的内容已经清除）。排除问题后执行 ${ATR_CMD} restart 重新发布"
-                atrLog "reconcile: republish after the legacy peer cleanup FAILED"
+                echoContent red " ---> 重新发布失败（应被撤销的内容已经清除）。下一次运行 ${ATR_CMD} 会自动重试，也可以排除问题后执行 ${ATR_CMD} restart"
+                atrLog "reconcile: republish of an incomplete subscription FAILED"
+                [[ "${1:-}" == strict ]] && rc=1
             fi
         fi
     fi
@@ -4854,10 +4893,8 @@ _showSubscriptionLinksLocked() { # _showSubscriptionLinksLocked [用户名]
         return 1
     }
     ((USER_SECRETS_CHANGED)) && regen=1
-    while IFS= read -r u; do
-        [[ -z "${u}" ]] && continue
-        [[ -e "${SUB_DIR}/default/$(subscriptionToken "${u}")" ]] || regen=1
-    done < <(userNames)
+    # 已发布的内容不完整（某个用户的订阅文件不在、对等分享开着但 peer 文件不在、nginx 订阅配置还是旧格式）也要先重新发布
+    _subscriptionIncomplete && regen=1
     if ((regen)); then
         generateSubscription || {
             echoContent red " ---> 订阅文件未能发布，无法提供可用的订阅链接"
@@ -4898,12 +4935,16 @@ showSubscriptionLinks() { # showSubscriptionLinks [用户名]
 }
 
 # ----------------------------- 自检（回环握手）--------------------------------
-# 本机能否用 sing-box 自检这个协议: 0 能  1 本机没有 sing-box  2 sing-box 客户端不支持该协议（Naive、XHTTP）
+# 本机能否用 sing-box 自检这个协议: 0 能  1 本机没有 sing-box  2 协议表声明 sing-box 客户端不支持（selfcheck:false: Naive、XHTTP）
+#   3 应该能自检，但拿不到自检用的客户端配置（节点生成 / 解析出错）——调用方必须按检测失败处理，不能当成"不支持"
 selfCheckSupported() { # selfCheckSupported <协议id> [用户名]
-    local id=$1 user=${2:-}
+    local id=$1 user=${2:-} views t
+    [[ "$(protoField "${id}" selfcheck)" == "false" ]] && return 2
     [[ -x "${SB_BIN}" ]] || return 1
     [[ -n "${user}" ]] || user=$(userNames | head -n 1)
-    [[ "$(nodeViews "${user}" | jq -r --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0] | (.singbox // null) | type')" == "object" ]] || return 2
+    views=$(nodeViews "${user}") || return 3
+    t=$(jq -r --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0] | if . == null then "missing" else (.singbox|type) end' <<<"${views}") || return 3
+    [[ "${t}" == "object" ]] || return 3
 }
 # 用刚装好的服务端对应的客户端配置，在本机回环上真实握手一次并访问外网。
 # 能发现: 公私钥不匹配、SNI/short_id 写错、端口未放行到进程、证书问题。
@@ -4914,13 +4955,21 @@ selfCheckProtocol() { # selfCheckProtocol <协议id> [用户名]
     [[ -n "${user}" ]] || user=$(userNames | head -n 1)
     local sc=0
     selfCheckSupported "${id}" "${user}" || sc=$?
-    if ((sc == 1)); then
+    case "${sc}" in
+    0) ;;
+    1)
         echoContent yellow "  - ${title}: 未自动验证（本机没有 sing-box，只确认端口监听）"
         return 2
-    elif ((sc != 0)); then
+        ;;
+    2)
         echoContent yellow "  - ${title}: 未自动验证（sing-box 客户端不支持该协议，请用对应客户端确认）"
         return 2
-    fi
+        ;;
+    *)
+        echoContent red "  ✗ ${title}: 自检失败（生成自检用的客户端配置出错，按握手失败处理）"
+        return 1
+        ;;
+    esac
     node=$(nodeViews "${user}" | jq -c --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0]')
     cp=$(randomFreePort)
     cfg="${ATR_TMP:-/tmp}/selfcheck.${id}.json"
@@ -7652,7 +7701,7 @@ cliRecover() { # cliRecover [--abandon]
         else
             recoverIfNeeded || return 1
         fi
-        reconcileSubscription
+        reconcileSubscription strict
         ;;
     --abandon) abandonTransaction ;;
     *)
