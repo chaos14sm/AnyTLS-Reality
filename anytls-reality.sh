@@ -18,7 +18,7 @@
 # =============================================================================
 export LANG=en_US.UTF-8
 
-ATR_VERSION="v1.2.0"
+ATR_VERSION="v1.2.1"
 ATR_PROJECT_NAME="anytls-reality"
 
 # ----------------------------- 路径与常量 -----------------------------------
@@ -312,19 +312,37 @@ download() {
 }
 
 # ----------------------------- 事务锁 ---------------------------------------
+LOCK_DEPTH=0
 lockAcquire() {
-    command -v flock >/dev/null 2>&1 || return 0
+    if ((LOCK_DEPTH > 0)); then # 本进程（或它的子 shell）已经持有：可重入，只增加深度
+        LOCK_DEPTH=$((LOCK_DEPTH + 1))
+        return 0
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        echoContent red " ---> 缺少 flock（util-linux），无法保证并发操作的安全，已中止。请先安装 util-linux 再重试"
+        return 1
+    fi
     mkdir -p "${ATR_HOME}"
-    exec 9>"${LOCK_FILE}" || return 0
+    if ! { exec 9>"${LOCK_FILE}"; } 2>/dev/null; then
+        echoContent red " ---> 无法打开锁文件 ${LOCK_FILE}，已中止（不会在没有锁的情况下修改配置）"
+        return 1
+    fi
     if ! flock -w 60 9; then
+        exec 9>&-
         echoContent red " ---> 另一个 ${ATR_CMD} 操作正在进行，请稍后重试"
         return 1
     fi
+    LOCK_DEPTH=1
 }
 lockRelease() {
-    command -v flock >/dev/null 2>&1 || return 0
+    if ((LOCK_DEPTH > 1)); then
+        LOCK_DEPTH=$((LOCK_DEPTH - 1))
+        return 0
+    fi
+    ((LOCK_DEPTH == 1)) || return 0 # 本来就没持有
     flock -u 9 2>/dev/null
     exec 9>&-
+    LOCK_DEPTH=0
 }
 
 # ----------------------------- 日志跟随 -------------------------------------
@@ -369,9 +387,14 @@ _jqTmpDir() {
 }
 jq() {
     local -a in=("$@") out=() used=()
-    local n=${#in[@]} i=0 a name val f pre="" prog_idx=-1 no_prog=0 rc
+    local n=${#in[@]} i=0 a name val f pre="" prog_idx=-1 no_prog=0 rc has_data=0
+    for a in "$@"; do [[ "${a}" == "--arg" || "${a}" == "--argjson" ]] && has_data=1; done
     if ! _jqTmpDir; then
-        command jq "$@"
+        if ((has_data)); then # 数据不能退回到命令行上：直接失败
+            printf '内部错误: 无法创建 jq 用的私有临时目录，已拒绝把数据放到命令行上执行\n' >&2
+            return 1
+        fi
+        command jq "$@" # 没有任何 --arg/--argjson：命令行上本来就没有数据
         return
     fi
     while ((i < n)); do
@@ -382,8 +405,12 @@ jq() {
             val=${in[i + 2]-}
             _JQ_SEQ=$((_JQ_SEQ + 1))
             f="${_JQ_DIR}/jq.${BASHPID}.${_JQ_SEQ}"
-            printf '%s' "${val}" >"${f}"
             used+=("${f}")
+            if ! printf '%s' "${val}" >"${f}"; then
+                for f in "${used[@]}"; do : >"${f}" 2>/dev/null; done
+                printf '内部错误: 无法写入 jq 参数文件，已中止（不会改用命令行传参）\n' >&2
+                return 1
+            fi
             out+=(--rawfile "${name}" "${f}")
             [[ "${a}" == "--argjson" ]] && pre+="(\$${name} | fromjson) as \$${name} | "
             i=$((i + 3))
@@ -414,14 +441,14 @@ jq() {
     done
     if ((prog_idx >= 0)); then
         out[prog_idx]="${pre}${out[prog_idx]}"
-    elif [[ -n "${pre}" ]]; then # 没有可以加前缀的内联程序（例如 -f）：退回原样调用
-        for f in "${used[@]}"; do : >"${f}"; done
-        command jq "$@"
-        return
+    elif [[ -n "${pre}" ]]; then # 没有可以加前缀的内联程序（例如 -f）：无法安全转换，宁可失败也不改用命令行传参
+        for f in "${used[@]}"; do : >"${f}" 2>/dev/null; done
+        printf '内部错误: 这种 jq 调用形式无法在不暴露参数的前提下转换，已拒绝执行\n' >&2
+        return 1
     fi
     command jq "${out[@]}"
     rc=$?
-    for f in "${used[@]}"; do : >"${f}"; done
+    for f in "${used[@]}"; do : >"${f}" 2>/dev/null; done
     return "${rc}"
 }
 # 外部命令是否存在（jq 有同名包装函数，所以对 jq 必须只看外部命令）
@@ -871,7 +898,9 @@ _applySubTreePerms() { # _applySubTreePerms <目录>
     g=$(ngxWorkerGroup)
     [[ -n "${g}" && -d "${d}" ]] || return 1
     chown -R root:"${g}" "${d}" || return 1
-    find "${d}" -type d -exec chmod 750 {} + && find "${d}" -type f -exec chmod 640 {} +
+    # 目录 750、文件 640。文件名就是令牌/对等密钥，所以不能用 find -exec chmod（会把全部文件名放到 chmod 的命令行上），
+    # 改用一条只带目录路径的递归命令；X 只给目录加执行位，而这里的文件从来不是可执行的
+    chmod -R u=rwX,g=rX,o= "${d}"
 }
 # 目录权限模型:
 #   不需要 nginx: ATR_HOME 与 subscribe/ 只有 root 能进入（700）
@@ -921,7 +950,12 @@ S() { jq -r "$@" "${ATR_STATE}" 2>/dev/null; }
 
 # ----------------------------- 候选状态(暂存) --------------------------------
 NEW_STATE=""
+STAGED_BASE=""
+# state.json 当前内容的指纹: stagedBegin 记下它，applyStaged 拿到锁后再比对。不一致说明这期间有别的操作提交过，
+# 本次基于旧快照构造的整份 state 不能再提交（否则会悄悄覆盖对方刚改的密码、令牌……）。交互提示期间不持有锁，所以用版本校验而不是长期占锁
+stateRevision() { [[ -s "${ATR_STATE}" ]] && sha256sum "${ATR_STATE}" 2>/dev/null | awk '{print $1}'; }
 stagedBegin() {
+    STAGED_BASE=$(stateRevision)
     if stateExists; then NEW_STATE=$(jq . "${ATR_STATE}"); else NEW_STATE=$(stateDefault | jq .); fi
 }
 # stagedEdit <jq 参数...> <过滤器>
@@ -935,7 +969,10 @@ stagedEdit() {
     echoContent red " ---> 内部错误: 状态修改失败"
     return 1
 }
-stagedDiscard() { NEW_STATE=""; }
+stagedDiscard() {
+    NEW_STATE=""
+    STAGED_BASE=""
+}
 # stagedGet <jq 参数...> <过滤器>
 stagedGet() { printf '%s' "${NEW_STATE}" | jq -r "$@" 2>/dev/null; }
 
@@ -2962,16 +2999,22 @@ pruneBackups() { # 只保留最近 10 份（目录名是时间戳，glob 展开�
 recoverIfNeeded() {
     [[ -f "${TXN_MARK}" ]] || return 0
     local bdir
-    bdir=$(cat "${TXN_MARK}")
-    echoContent yellow "\n ---> 检测到上次操作未完成，正在从备份恢复: ${bdir}"
-    if [[ -d "${bdir}" ]] && restoreFromBackup "${bdir}"; then
-        rm -f "${TXN_MARK}"
-        applyServices "${ATR_STATE}" >/dev/null 2>&1
-        atrLog "recovered interrupted transaction from ${bdir}"
-        echoContent green " ---> 已恢复到上次可用配置"
-    else
-        echoContent red " ---> 自动恢复失败，请手动检查 ${ATR_HOME}（备份目录: ${bdir}）"
+    # 标记文件是另一个进程在事务中途写的，也可能正是它还在运行。先拿锁（等它结束），再重新确认标记是否还在，
+    # 否则会把别人进行中的事务"恢复"掉。拿不到锁就什么都不动。
+    lockAcquire || return 0
+    if [[ -f "${TXN_MARK}" ]]; then
+        bdir=$(cat "${TXN_MARK}")
+        echoContent yellow "\n ---> 检测到上次操作未完成，正在从备份恢复: ${bdir}"
+        if [[ -d "${bdir}" ]] && restoreFromBackup "${bdir}"; then
+            rm -f "${TXN_MARK}"
+            applyServices "${ATR_STATE}" >/dev/null 2>&1
+            atrLog "recovered interrupted transaction from ${bdir}"
+            echoContent green " ---> 已恢复到上次可用配置"
+        else
+            echoContent red " ---> 自动恢复失败，请手动检查 ${ATR_HOME}（备份目录: ${bdir}）"
+        fi
     fi
+    lockRelease
 }
 
 # ----------------------------- 资源准备 / 校验 --------------------------------
@@ -3188,6 +3231,13 @@ applyStaged() {
     }
     stateInit
     lockAcquire || return 1
+    if [[ -n "${STAGED_BASE}" && "$(stateRevision)" != "${STAGED_BASE}" ]]; then
+        echoContent red " ---> 本次操作开始之后，配置已被另一个操作修改过（例如另一个终端或定时任务）。为避免覆盖对方的修改，本次操作已取消，请重新进行"
+        NEW_STATE=""
+        STAGED_BASE=""
+        lockRelease
+        return 1
+    fi
     ts=$(date +%Y%m%d-%H%M%S)
     stage="${ATR_TMP:-/tmp}/stage.${ts}.$$"
     mkdir -p "${stage}/sing-box" "${stage}/xray" "${stage}/nginx"
@@ -3303,19 +3353,38 @@ applyStaged() {
     rm -rf "${stage}"
     lockRelease
     NEW_STATE=""
+    STAGED_BASE=""
     echoContent green " ---> 配置已生效（${why}）"
     return 0
 }
 
 # 当前配置不变，仅重启（证书续签 hook / 手动重启使用）
+# 公网出口模式记录的本机网卡地址与现在的网卡地址不一致吗（IP 变了、加了网卡）
+egressAddrsStale() {
+    local cur old
+    cur=$(egressLocalIPs | jq -c 'sort') || return 1
+    old=$(S -c '(.egress.local_ips // []) | sort')
+    [[ "${cur}" != "${old}" ]]
+}
+
 reloadAll() {
     stateExists || return 1
     lockAcquire || return 1
     SB_CHANGED=1
     X_CHANGED=1
     local rc=0
-    applyServices "${ATR_STATE}" force || rc=1
-    verifyRuntime "${ATR_STATE}" || rc=1
+    if [[ "$(S '.egress.mode // ""')" == "public" ]] && egressAddrsStale; then
+        # 本机地址列表只在应用配置时刷新；地址变了就先走一次完整的应用（刷新地址、重新渲染、校验、验证），再做下面的强制重启
+        stagedBegin
+        applyStaged "刷新本机网卡地址（出口访问模式）" || {
+            stagedDiscard
+            rc=1
+        }
+    fi
+    if ((rc == 0)); then
+        applyServices "${ATR_STATE}" force || rc=1
+        verifyRuntime "${ATR_STATE}" || rc=1
+    fi
     # 订阅文件必须与 state 保持一致（令牌或权限模型迁移之后要重新发布，旧文件随之撤销）
     if ((rc == 0)) && [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
         generateSubscription || rc=1
@@ -3582,12 +3651,11 @@ def grp($tag; $members): {type: "selector", tag: $tag, outbounds: $members};
 | {
     log: {disabled: false, level: "info", timestamp: true},
     http_clients: [{tag: "rule_set_http", detour: "本地直连"}],
-    experimental: {
-      # 控制接口只监听回环，并且必须带 secret；不再自动下载面板（经镜像下载的面板代码无法验证完整性，
-      # 而它与控制接口同源，被篡改后能直接操作代理）。需要面板请自行下载并核对后再配置 external_ui
-      clash_api: ({external_controller: "127.0.0.1:9090", default_mode: "rule"} + (if $secret != "" then {secret: $secret} else {} end)),
-      cache_file: {enabled: true}
-    },
+    # 控制接口只监听回环，并且必须带 secret；secret 为空（例如生成失败）时干脆不生成控制接口，绝不退回无认证接口。
+    # 也不再自动下载面板（经镜像下载的面板代码无法验证完整性，而它与控制接口同源，被篡改后能直接操作代理）。
+    # 需要面板请自行下载并核对后再配置 external_ui
+    experimental: ({cache_file: {enabled: true}}
+      + (if $secret != "" then {clash_api: {external_controller: "127.0.0.1:9090", default_mode: "rule", secret: $secret}} else {} end)),
     dns: {
       servers: [
         {tag: "dns_proxy", type: "https", server: "1.1.1.1", server_port: 443, detour: "自动选择", path: "/dns-query"},
@@ -3735,6 +3803,8 @@ def sel($name; $members): {name: $name, type: "select", proxies: $members};
             "RULE-SET,proxy,全球代理", "RULE-SET,gfw,全球代理", "RULE-SET,applications,本地直连", "RULE-SET,ChinaMaxDomain,本地直连",
             "RULE-SET,ChinaMaxIPNoIPv6,本地直连,no-resolve", "RULE-SET,lan,本地直连,no-resolve", "GEOIP,CN,本地直连", "MATCH,漏网之鱼"]
   }
+# secret 为空时不生成控制接口（理由见上面的 sing-box 完整配置）
+| (if $secret == "" then del(.["external-controller"], .["external-controller-cors"], .secret) else . end)
 EOF
 
 # 把一个 JSON 对象整体渲染为 YAML（顶层，不加缩进）
@@ -3764,11 +3834,10 @@ _checkClientFile() { # _checkClientFile <文件> <描述>
 
 # ----------------------------- 生成全部用户的客户端文件 ------------------------
 # 目录: ${CLIENT_DIR}/<用户>/{links.txt, sing-box.json, sing-box-full.json, mihomo-proxies.yaml, mihomo-full.yaml, naive-client.json}
-# shellcheck disable=SC2120
-generateClientFiles() { # generateClientFiles [用户名]
+_generateClientFilesLocked() { # _generateClientFilesLocked [用户名]
     stateExists || return 1
-    local only=${1:-} u d n views dir sbouts mhprox
-    persistUserSecrets
+    local only=${1:-} u d n views dir sbouts mhprox rc=0
+    persistUserSecrets || rc=1
     mkdir -p "${CLIENT_DIR}"
     chmod 700 "${CLIENT_DIR}" 2>/dev/null
     [[ -z "${ATR_PUBLIC_IP:-}" ]] && {
@@ -3810,9 +3879,23 @@ generateClientFiles() { # generateClientFiles [用户名]
         chmod 600 "${dir}"/* 2>/dev/null
     done < <(userNames)
     if stateExists && [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
-        generateSubscription || echoContent red " ---> 订阅文件未能发布，订阅服务暂时不可用（凭据不会以不安全的权限落盘）。请根据上面的提示处理后重试"
+        generateSubscription || {
+            echoContent red " ---> 订阅文件未能发布，订阅服务暂时不可用（凭据不会以不安全的权限落盘）。请根据上面的提示处理后重试"
+            rc=1
+        }
     fi
-    return 0
+    return "${rc}"
+}
+# 整个生成过程持有事务锁（可重入），保证各用户的文件和订阅都来自同一份 state
+# shellcheck disable=SC2120
+generateClientFiles() { # generateClientFiles [用户名]
+    stateExists || return 1
+    local only=${1:-} rc
+    lockAcquire || return 1
+    _generateClientFilesLocked "${only}"
+    rc=$?
+    lockRelease
+    return "${rc}"
 }
 
 # ----------------------------- 二维码 ----------------------------------------
@@ -3910,30 +3993,51 @@ subscriptionBase() { # 订阅 URL 前缀 scheme://host:port
 # 为没有订阅令牌 / 控制接口 secret 的用户补齐随机值，并清掉旧版的全局 salt，直接写入 state.json
 # （旧版本升级，或手工构造的状态）。它们不进入任何内核/nginx 配置，所以无需走完整事务、也无需重启服务。
 # 状态变了就置 USER_SECRETS_CHANGED=1：调用方必须随后重新发布订阅文件，不能只更新 state。
-persistUserSecrets() {
-    USER_SECRETS_CHANGED=0
-    stateExists || return 0
-    local need n st cnt=0 hadSalt=0
+# 还有没有需要补发的令牌/密钥，或需要清除的旧 salt（只读检查，不加锁）
+_userSecretsPending() {
+    [[ -n "$(jq -r '.users[]? | select((.sub_token // "") == "" or (.api_secret // "") == "") | .name' "${ATR_STATE}" 2>/dev/null)" ]] && return 0
+    jq -e '(.nginx.subscribe // {}) | has("salt")' "${ATR_STATE}" >/dev/null 2>&1
+}
+_persistUserSecretsLocked() {
+    local need n st new cnt=0 hadSalt=0
     need=$(jq -r '.users[]? | select((.sub_token // "") == "" or (.api_secret // "") == "") | .name' "${ATR_STATE}" 2>/dev/null)
     jq -e '(.nginx.subscribe // {}) | has("salt")' "${ATR_STATE}" >/dev/null 2>&1 && hadSalt=1
     [[ -z "${need}" && "${hadSalt}" == "0" ]] && return 0
-    st=$(jq '.nginx.subscribe |= ((. // {}) | del(.salt) | . + {peer_key: (.peer_key // ""), remotes: (.remotes // [])})' "${ATR_STATE}") || return 0
+    st=$(jq '.nginx.subscribe |= ((. // {}) | del(.salt) | . + {peer_key: (.peer_key // ""), remotes: (.remotes // [])})' "${ATR_STATE}") || return 1
     while IFS= read -r n; do
         [[ -z "${n}" ]] && continue
         if [[ -z "$(jq -r --arg n "${n}" '.users[]|select(.name==$n)|.sub_token // ""' <<<"${st}")" ]]; then
-            st=$(jq --arg n "${n}" --arg t "$(newSubToken)" '.users |= map(if .name==$n then .sub_token=$t else . end)' <<<"${st}") && cnt=$((cnt + 1))
+            new=$(jq --arg n "${n}" --arg t "$(newSubToken)" '.users |= map(if .name==$n then .sub_token=$t else . end)' <<<"${st}") || return 1
+            st=${new}
+            cnt=$((cnt + 1))
         fi
         if [[ -z "$(jq -r --arg n "${n}" '.users[]|select(.name==$n)|.api_secret // ""' <<<"${st}")" ]]; then
-            st=$(jq --arg n "${n}" --arg t "$(newApiSecret)" '.users |= map(if .name==$n then .api_secret=$t else . end)' <<<"${st}")
+            new=$(jq --arg n "${n}" --arg t "$(newApiSecret)" '.users |= map(if .name==$n then .api_secret=$t else . end)' <<<"${st}") || return 1
+            st=${new}
         fi
     done <<<"${need}"
-    printf '%s\n' "${st}" | atomicWrite "${ATR_STATE}" 600
-    USER_SECRETS_CHANGED=1
+    if ! printf '%s\n' "${st}" | atomicWrite "${ATR_STATE}" 600; then
+        echoContent red " ---> 无法写入 ${ATR_STATE}，用户的订阅令牌/控制接口 secret 没有更新"
+        return 1
+    fi
+    USER_SECRETS_CHANGED=1 # 只有真正写成功了才算数
     if ((cnt > 0)) && [[ "$(S '.nginx.subscribe.enabled')" == "true" ]]; then
         echoContent yellow " ---> 已为 ${cnt} 个用户生成独立的随机订阅令牌：旧订阅链接已失效，请在客户端重新导入新的订阅链接"
     fi
     atrLog "user secrets migrated: sub_token=${cnt}, legacy salt removed=${hadSalt}"
     return 0
+}
+# 写 state 的路径之一，所以必须持锁（可重入）。没有待办事项时不加锁直接返回
+persistUserSecrets() {
+    USER_SECRETS_CHANGED=0
+    stateExists || return 0
+    _userSecretsPending || return 0
+    local rc
+    lockAcquire || return 1
+    _persistUserSecretsLocked
+    rc=$?
+    lockRelease
+    return "${rc}"
 }
 
 # ----------------------------- 合并其他机器的订阅 -----------------------------
@@ -3945,9 +4049,14 @@ _fetchRemote() { # _fetchRemote <url> <输出文件> <https|http> [CA 证书文�
     local url=$1 out=$2 scheme=$3 ca=${4:-} sz
     local -a opt=(-fsS -m 15 --max-redirs 0 --proto "=${scheme}")
     [[ -n "${ca}" ]] && opt+=(--cacert "${ca}")
+    # URL 里带着对等密钥，不能出现在命令行上（/proc/<pid>/cmdline 同机用户可读，而一次请求最长持续 15 秒）：
+    # 用 --config - 从标准输入读 URL，命令行上只剩非敏感选项。配置值里的反斜杠和双引号要转义，换行等控制字符直接拒绝
+    [[ "${url}" =~ [[:cntrl:]] ]] && return 1
+    url=${url//\\/\\\\}
+    url=${url//\"/\\\"}
     # 用 head -c 兜底限制大小（--max-filesize 对未知长度的分块传输不生效）
-    curl "${opt[@]}" "${url}" 2>/dev/null | head -c 2097153 >"${out}"
-    [[ "${PIPESTATUS[0]}" == "0" ]] || return 1
+    printf 'url = "%s"\n' "${url}" | curl "${opt[@]}" --config - 2>/dev/null | head -c 2097153 >"${out}"
+    [[ "${PIPESTATUS[1]}" == "0" && "${PIPESTATUS[2]}" == "0" ]] || return 1
     sz=$(stat -c %s "${out}" 2>/dev/null || echo 0)
     ((sz <= 2097152))
 }
@@ -4022,8 +4131,42 @@ _appendRemoteSubscriptions() { # _appendRemoteSubscriptions <用户名> <default
 
 # 关闭订阅发布: 清空已发布的内容（失败时宁可不提供订阅，也不留下旧链接或可读的残片）
 _closeSubscription() {
-    [[ -d "${SUB_DIR}" ]] && find "${SUB_DIR}" -mindepth 1 -delete 2>/dev/null
-    return 0
+    [[ -d "${SUB_DIR}" ]] || return 0
+    find "${SUB_DIR}" -mindepth 1 -delete 2>/dev/null
+    # 必须确认真的删干净了（只读文件系统等情况下删除会失败，nginx 却会继续提供旧内容）
+    [[ -z "$(find "${SUB_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]] && return 0
+    echoContent red " ---> 无法删除已发布的订阅文件，改为停止 nginx，确保不再提供旧订阅"
+    serviceStop "${NGX_UNIT}"
+    if serviceActive "${NGX_UNIT}"; then
+        echoContent red " ---> nginx 也没能停止！请立即手动处理: systemctl stop ${NGX_UNIT}，并检查 ${SUB_DIR} 所在的文件系统"
+        return 2
+    fi
+    echoContent yellow " ---> nginx 已停止（订阅与伪装站暂不可用）。排除文件系统问题后执行 ${ATR_CMD} restart 恢复"
+    return 1
+}
+# 每个用户的订阅文件是否齐全且结构合法（换入前的最后一道检查）
+_validateSubStage() { # _validateSubStage <staging 目录> <peer 密钥或空>
+    local d=$1 peer=$2 u t
+    while IFS= read -r u; do
+        [[ -z "${u}" ]] && continue
+        t=$(subscriptionToken "${u}")
+        [[ -n "${t}" ]] || return 1
+        [[ -e "${d}/default/${t}" && -e "${d}/clashMeta/${t}" && -s "${d}/clashMetaProfiles/${t}" ]] || return 1
+        # 用标准输入读文件：文件名就是令牌，不能出现在 jq 的命令行上
+        jq -e 'type == "array"' <"${d}/sing-box_profiles/${t}" >/dev/null 2>&1 || return 1
+        if [[ -e "${d}/sing-box/${t}" ]]; then jq -e . <"${d}/sing-box/${t}" >/dev/null 2>&1 || return 1; fi
+        if [[ -n "${peer}" ]]; then [[ -e "${d}/peer/${peer}/${u}/default" ]] || return 1; fi
+    done < <(userNames)
+}
+# 复制文件。目标文件名是令牌/对等密钥，所以不用 cp（会把目标路径放在命令行上），改用 shell 重定向
+_copyFile() { # _copyFile <源> <目标>
+    cat -- "$1" >"$2"
+}
+# 文件内容 -> base64（一行）；任何一环失败都返回非零
+_b64file() { # _b64file <输入文件> <输出文件>
+    base64 -w 0 "$1" >"$2" 2>/dev/null && return 0
+    base64 "$1" 2>/dev/null | tr -d '\n' >"$2"
+    [[ "${PIPESTATUS[0]}" == "0" && "${PIPESTATUS[1]}" == "0" ]]
 }
 # 用 staging 目录整体替换 SUB_DIR（旧令牌对应的文件随旧目录一起消失）
 _swapSubDir() { # _swapSubDir <staging 目录>
@@ -4039,10 +4182,15 @@ _swapSubDir() { # _swapSubDir <staging 目录>
 
 # 发布订阅文件。顺序不能变：
 #   1) 令牌/密钥落到 state  2) nginx 必须已是"专用账号 + 受限权限"模型（否则先迁移，迁移失败就不发布）
-#   3) 在 staging 目录里生成全部文件并设好属主/权限  4) 整体换入。任何一步失败都关闭订阅，不降级成"所有人可读"。
-generateSubscription() {
-    [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 0
-    persistUserSecrets
+#   3) 在独立的 staging 目录里生成全部文件、校验结构、设好属主/权限  4) 整体换入。
+# 全程持有事务锁（和 applyStaged 同一把，可重入）：发布期间 state 不会被别的操作改动，两个进程也不会共用暂存目录。
+# 任何一步失败都关闭订阅（并验证确实关闭了），不降级成"所有人可读"，也不留下已被撤销的旧链接。
+_generateSubscriptionLocked() {
+    [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 0 # 拿到锁之后重新确认（等锁期间可能被关掉）
+    persistUserSecrets || {
+        echoContent red " ---> 无法更新用户令牌/密钥，本次不发布订阅文件（已发布的内容保持不变）"
+        return 1
+    }
     if ! nginxModelCurrent; then
         echoContent yellow " ---> 检测到旧版 nginx 权限模型，发布订阅前先迁移到专用账号模型（会重启 nginx）…"
         if ! migrateNginxModel; then
@@ -4055,65 +4203,88 @@ generateSubscription() {
         ATR_PUBLIC_IP=$(getPublicIP 4)
         [[ -z "${ATR_PUBLIC_IP}" ]] && ATR_PUBLIC_IP=$(getPublicIP 6)
     }
-    local u token base views sbouts mhprox kind w peer old_umask stage
+    local u token base views sbouts kind w="" peer old_umask stage="" fail=0 sbfull
     base=$(subscriptionBase)
     peer=$(S '.nginx.subscribe.peer_key // ""')
-    stage="${SUB_DIR}.new"
-    rm -rf "${stage}" "${SUB_DIR}.old"
+    # 持有锁，所以残留的 .new* / .old 只可能是上次崩溃留下的；本次用独立的 mktemp 暂存目录
+    rm -rf "${SUB_DIR}.new" "${SUB_DIR}".new.* "${SUB_DIR}.old" 2>/dev/null
     # 订阅文件含节点凭据: 创建时就只有 root 可读，换入前再统一交给 nginx 专用组
     old_umask=$(umask)
     umask 077
-    for kind in default clashMeta clashMetaProfiles sing-box sing-box_profiles; do
-        mkdir -p "${stage}/${kind}"
-    done
-    w="${ATR_TMP:-/tmp}/sub.$$"
-    mkdir -p "${w}"
-    while IFS= read -r u; do
+    stage=$(mktemp -d "${SUB_DIR}.new.XXXXXX") || fail=1
+    if ((!fail)); then
+        for kind in default clashMeta clashMetaProfiles sing-box sing-box_profiles; do
+            mkdir -p "${stage}/${kind}" || fail=1
+        done
+        w=$(mktemp -d "${ATR_TMP:-/tmp}/sub.XXXXXX") || fail=1
+    fi
+    while ((!fail)) && IFS= read -r u; do
         [[ -z "${u}" ]] && continue
         token=$(subscriptionToken "${u}")
-        [[ -n "${token}" ]] || continue
-        views=$(nodeViews "${u}")
-        jq -r '.[]|select(.uri!=null)|.uri' <<<"${views}" >"${w}/links"
-        jq -c '[.[]|select(.singbox!=null)|.singbox]' <<<"${views}" >"${w}/sb.json"
-        jq -c '[.[]|select(.mihomo!=null)|.mihomo]' <<<"${views}" >"${w}/mh.json"
-        jsonToMihomoYaml <"${w}/mh.json" >"${w}/clash" 2>/dev/null
+        [[ -n "${token}" ]] || {
+            fail=1
+            break
+        }
+        views=$(nodeViews "${u}") || {
+            fail=1
+            break
+        }
+        jq -r '.[]|select(.uri!=null)|.uri' <<<"${views}" >"${w}/links" || fail=1
+        jq -c '[.[]|select(.singbox!=null)|.singbox]' <<<"${views}" >"${w}/sb.json" || fail=1
+        jq -c '[.[]|select(.mihomo!=null)|.mihomo]' <<<"${views}" >"${w}/mh.json" || fail=1
+        ((fail)) && break
+        jsonToMihomoYaml <"${w}/mh.json" >"${w}/clash" 2>/dev/null || fail=1
         # 本机作为"被合并方"：只放本机自己的节点（不含已合并进来的远程节点，避免两台机器互相合并时重复膨胀）
         if [[ -n "${peer}" ]]; then
-            mkdir -p "${stage}/peer/${peer}/${u}"
-            base64 -w 0 "${w}/links" 2>/dev/null >"${stage}/peer/${peer}/${u}/default" || base64 "${w}/links" | tr -d '\n' >"${stage}/peer/${peer}/${u}/default"
-            cp "${w}/clash" "${stage}/peer/${peer}/${u}/clashMeta"
-            cp "${w}/sb.json" "${stage}/peer/${peer}/${u}/sing-box_profiles"
+            mkdir -p "${stage}/peer/${peer}/${u}" || fail=1
+            _b64file "${w}/links" "${stage}/peer/${peer}/${u}/default" || fail=1
+            _copyFile "${w}/clash" "${stage}/peer/${peer}/${u}/clashMeta" || fail=1
+            _copyFile "${w}/sb.json" "${stage}/peer/${peer}/${u}/sing-box_profiles" || fail=1
         fi
-        _appendRemoteSubscriptions "${u}" "${w}/links" "${w}/clash" "${w}/sb.json"
-        base64 -w 0 "${w}/links" 2>/dev/null >"${stage}/default/${token}" || base64 "${w}/links" | tr -d '\n' >"${stage}/default/${token}"
-        cp "${w}/clash" "${stage}/clashMeta/${token}"
-        cp "${w}/sb.json" "${stage}/sing-box_profiles/${token}"
+        ((fail)) && break
+        _appendRemoteSubscriptions "${u}" "${w}/links" "${w}/clash" "${w}/sb.json" # 远程合并是尽力而为：取不到只跳过并提示
+        _b64file "${w}/links" "${stage}/default/${token}" || fail=1
+        _copyFile "${w}/clash" "${stage}/clashMeta/${token}" || fail=1
+        _copyFile "${w}/sb.json" "${stage}/sing-box_profiles/${token}" || fail=1
         # 完整 mihomo 配置: 用 provider 指向本机订阅
         sbouts=$(cat "${w}/sb.json")
-        cfgClashFull "$(cat "${w}/mh.json")" "${base}/s/clashMeta/${token}" "$(userApiSecret "${u}")" >"${stage}/clashMetaProfiles/${token}" 2>/dev/null
+        cfgClashFull "$(cat "${w}/mh.json")" "${base}/s/clashMeta/${token}" "$(userApiSecret "${u}")" >"${stage}/clashMetaProfiles/${token}" 2>/dev/null || fail=1
         if [[ "$(jq length <<<"${sbouts}")" != "0" ]]; then
-            cfgSbFull "${sbouts}" "$(userApiSecret "${u}")" | jq . >"${stage}/sing-box/${token}"
+            sbfull="${w}/sbfull.json"
+            { cfgSbFull "${sbouts}" "$(userApiSecret "${u}")" >"${sbfull}" && jq . <"${sbfull}" >"${stage}/sing-box/${token}"; } || fail=1
         fi
     done < <(userNames)
-    rm -rf "${w}"
+    [[ -n "${w}" ]] && rm -rf "${w}"
     umask "${old_umask}"
-    if ! _applySubTreePerms "${stage}" || ! _swapSubDir "${stage}"; then
-        echoContent red " ---> 订阅文件发布失败（权限设置或目录替换出错）"
-        rm -rf "${stage}" "${SUB_DIR}.old"
+    # 结构校验 -> 设好属主/权限 -> 整体换入；任何一步失败都不发布，并确认旧内容已被撤下
+    if ((!fail)); then _validateSubStage "${stage}" "${peer}" || fail=1; fi
+    if ((!fail)); then { _applySubTreePerms "${stage}" && _swapSubDir "${stage}"; } || fail=1; fi
+    if ((fail)); then
+        echoContent red " ---> 订阅文件发布失败（磁盘空间、权限、渲染或目录替换出错），不会发布残缺的文件"
+        [[ -n "${stage}" ]] && rm -rf "${stage}"
+        rm -rf "${SUB_DIR}.old"
         _closeSubscription
         return 1
     fi
     return 0
 }
+generateSubscription() {
+    [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 0
+    local rc
+    lockAcquire || return 1
+    _generateSubscriptionLocked
+    rc=$?
+    lockRelease
+    return "${rc}"
+}
 
-showSubscriptionLinks() { # showSubscriptionLinks [用户名]
-    [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || {
-        echoContent yellow " ---> 未启用订阅服务（需要 nginx）"
-        return 1
-    }
+_showSubscriptionLinksLocked() { # _showSubscriptionLinksLocked [用户名]
     local only=${1:-} u token base regen=0
     # 令牌刚变过、或某个用户的订阅文件还不存在 -> 先重新发布，再显示链接（否则会打印出尚未生效的新链接，旧链接还在被提供）
-    persistUserSecrets
+    persistUserSecrets || {
+        echoContent red " ---> 无法更新用户令牌，无法提供可用的订阅链接"
+        return 1
+    }
     ((USER_SECRETS_CHANGED)) && regen=1
     while IFS= read -r u; do
         [[ -z "${u}" ]] && continue
@@ -4144,6 +4315,18 @@ showSubscriptionLinks() { # showSubscriptionLinks [用户名]
             printRaw green "    ${base}/s/sing-box/${token}"
         }
     done < <(userNames)
+}
+showSubscriptionLinks() { # showSubscriptionLinks [用户名]
+    [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || {
+        echoContent yellow " ---> 未启用订阅服务（需要 nginx）"
+        return 1
+    }
+    local rc
+    lockAcquire || return 1
+    _showSubscriptionLinksLocked "$@"
+    rc=$?
+    lockRelease
+    return "${rc}"
 }
 
 # ----------------------------- 自检（回环握手）--------------------------------
@@ -6418,7 +6601,7 @@ pickEgressMode() { # pickEgressMode [当前值] [回车默认: 1|2]
     echoContent skyBlue "\n---------------- 出口访问模式 ----------------"
     echoContent yellow "决定通过节点连进来的客户端，能不能访问这台服务器本机和内网里的服务："
     echoContent yellow "1.公网出口【推荐】  客户端只能访问公网。禁止：本机回环(127.0.0.0/8、::1)、内网/私网、链路本地(含云厂商元数据"
-    echoContent yellow "                   169.254.169.254)、本机自己所有网卡的地址(含公网 IP)；域名解析到这些地址同样会被拦截"
+    echoContent yellow "                   169.254.169.254)、本机自己所有网卡的地址(含公网 IP)；域名解析到这些地址时同样会被拦截（Xray 对域名目标的 DNS rebinding 防护尚未验证）"
     echoContent yellow "2.允许内网访问       不做任何限制。仅当你信任所有节点用户、并且确实需要经节点访问本机/内网服务时选择"
     echoContent yellow "之后可以在 11.分流工具 → 6.出口访问模式 里随时切换。"
     ask c "请选择[回车默认 ${def}]:" || return 1
