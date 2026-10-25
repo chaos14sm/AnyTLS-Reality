@@ -37,12 +37,13 @@ export LANG=en_US.UTF-8
 # - 订阅要不要重新发布按磁盘上的实际状态判断（每个用户的 default/<令牌>、对等分享开着时的 peer/<用户>/default、nginx 订阅配置格式），
 #   不再依赖进程内的标记：发布失败、_swapSubDir 两次 mv 之间被中断、开机任务只撤下没发布，下一次运行 atr 都会自动补发。
 # - 清空/删除之后的复查本身失败（find 出错）按"没删干净"处理，走停止 nginx 的兜底，不再当成已经清空。
-# - 哪些协议不能用 sing-box 自检由协议表声明（selfcheck:false）；其余协议拿不到自检用的客户端配置时按检测失败处理，不再降级为"未验证"。
+# - 自检客户端与节点承载核心一致；Naive 仍需专用客户端验证，节点生成错误按失败处理。
 # v1.2.6（真机审计 2026-10-25）：
 # - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
 # - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
 # - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
-ATR_VERSION="v1.2.7"
+ATR_VERSION="v1.2.8"
+# v1.2.8：按节点所属核心自检；Reality 支持共享/按协议独立配置。
 # v1.2.7：证书导入增加持久撤销日志与开机预恢复；防火墙撤销按后端/地址族记录，
 # 在实际修改前同步日志，配置回滚与崩溃恢复均重放；不再全局 reload firewalld。
 # 管理员在环境里指定的本机公网地址（订阅链接用它；出口访问模式也直接用它，不再联网探测）。只认启动时的环境变量，
@@ -818,8 +819,8 @@ read -r -d '' PROTO_REGISTRY <<'EOF'
  {"id":"vless_reality_grpc","name":"VLESS+Reality+gRPC","short":"VLESS_Reality_gRPC","cores":["sing-box"],"reality":true,"tls":false,"net":"tcp"},
  {"id":"vmess_httpupgrade","name":"VMess+TLS+HTTPUpgrade","short":"VMess_HTTPUpgrade","cores":["sing-box"],"reality":false,"tls":true,"net":"tcp","note":"仅CDN推荐","cdn":true,"nginx":true},
  {"id":"anytls_tls","name":"AnyTLS+TLS(证书)","short":"AnyTLS","cores":["sing-box"],"reality":false,"tls":true,"net":"tcp"},
- {"id":"vless_reality_xhttp","name":"VLESS+Reality+XHTTP","short":"VLESS_Reality_XHTTP","cores":["xray"],"reality":true,"tls":false,"net":"tcp","selfcheck":false},
- {"id":"vless_xhttp_tls","name":"VLESS+XHTTP+TLS","short":"VLESS_XHTTP_TLS","cores":["xray"],"reality":false,"tls":true,"net":"tcp","note":"CDN可用","cdn":true,"selfcheck":false}
+ {"id":"vless_reality_xhttp","name":"VLESS+Reality+XHTTP","short":"VLESS_Reality_XHTTP","cores":["xray"],"reality":true,"tls":false,"net":"tcp"},
+ {"id":"vless_xhttp_tls","name":"VLESS+XHTTP+TLS","short":"VLESS_XHTTP_TLS","cores":["xray"],"reality":false,"tls":true,"net":"tcp","note":"CDN可用","cdn":true}
 ]
 EOF
 
@@ -1107,13 +1108,23 @@ validateState() { # stdin: 候选状态 JSON
     # Reality / TLS 依赖（需要注册表信息，故在这里检查）
     reg_reality=$(jq -r --argjson st "${st}" '[.[]|select(.reality==true)|.id] | map(select(. as $i | ($st.protocols[$i] != null)))|length' <<<"${PROTO_REGISTRY}")
     reg_tls=$(jq -r --argjson st "${st}" '[.[]|select(.tls==true)|.id] | map(select(. as $i | ($st.protocols[$i] != null)))|length' <<<"${PROTO_REGISTRY}")
+    local mode id profile ids f
+    mode=$(jq -r '.reality_mode // "shared"' <<<"${st}")
+    [[ "${mode}" == shared || "${mode}" == independent ]] || echo "Reality 配置方式不合法: ${mode}"
     if [[ "${reg_reality}" != "0" ]]; then
-        local f
-        for f in sni private_key public_key short_id; do
-            if [[ -z "$(printf '%s' "${st}" | jq -r --arg f "${f}" '.reality[$f] // ""')" ]]; then
-                echo "Reality 参数缺失: ${f}"
+        ids=$(jq -r --argjson st "${st}" '.[]|select(.reality==true)|.id|select(. as $i | $st.protocols[$i] != null)' <<<"${PROTO_REGISTRY}")
+        while read -r id; do
+            [[ -n "${id}" ]] || continue
+            profile=$(jq --arg id "${id}" 'if (.reality_mode // "shared") == "independent" then .protocols[$id].reality // {} else .reality // {} end' <<<"${st}")
+            for f in sni private_key public_key short_id; do
+                [[ -n "$(jq -r --arg f "${f}" '.[$f] // ""' <<<"${profile}")" ]] || echo "Reality 参数缺失: ${id}.${f}"
+            done
+            isDomainName "$(jq -r '.sni // ""' <<<"${profile}")" || echo "Reality SNI 不合法: ${id}"
+            isPort "$(jq -r '.dest_port // 443' <<<"${profile}")" || echo "Reality 目标端口不合法: ${id}"
+            if [[ -n "$(jq -r '.private_key // ""' <<<"${profile}")" ]]; then
+                verifyRealityKeypair "$(jq -r '.private_key' <<<"${profile}")" "$(jq -r '.public_key // ""' <<<"${profile}")" || echo "Reality 密钥不匹配或无法校验: ${id}"
             fi
-        done
+        done <<<"${ids}"
     fi
     if [[ "${reg_tls}" != "0" ]]; then
         local d mode
@@ -1476,7 +1487,7 @@ _restorePreviousCore() {
     atomicWrite "${bin}" 755 <"${bin}.prev" && cmp -s "${bin}.prev" "${bin}"
 }
 # 已知有问题的内核版本组合（只提示，不阻止）。按版本号写死的条目不会过时出错，最多只是不再相关。每行: <core>|<tag>|<说明>
-ATR_KNOWN_CORE_ISSUES="xray|v26.10.21|作为 Reality 服务端时与 sing-box 1.14.x 客户端握手失败（reality verification failed；2026-10 在 sing-box 1.14.2、1.14.4 上实测，26.3.27 正常）。需要 Xray 承载 Reality 时，可以用 ATR_XRAY_VERSION=v26.3.27 固定版本"
+ATR_KNOWN_CORE_ISSUES="xray|v26.10.21|作为 Reality 服务端时与 sing-box 1.14.x 客户端握手失败（reality verification failed；2026-10 在 sing-box 1.14.2、1.14.4 上实测）。同核心自检使用 Xray；请为 Xray 节点选择兼容客户端，并验证实际使用的客户端组合"
 warnKnownCoreIssue() { # warnKnownCoreIssue <core> <tag>
     local c t msg
     while IFS='|' read -r c t msg; do
@@ -1484,10 +1495,8 @@ warnKnownCoreIssue() { # warnKnownCoreIssue <core> <tag>
     done <<<"${ATR_KNOWN_CORE_ISSUES}"
     return 0
 }
-# 换内核后的互通检查: 用本机 sing-box 作客户端，对该核心承载的协议逐个做回环握手（selfCheckProtocol）。
-# 返回 1 = 至少一个协议握手失败（含生成自检配置出错），调用方恢复旧内核。无法自动验证的协议（本机没有 sing-box，或协议表声明
-# sing-box 客户端不支持: Naive、VLESS+Reality+XHTTP、VLESS+XHTTP+TLS）不算失败，只列出来——它们只确认了服务启动与端口监听。
-# 注意: 升级 sing-box 时客户端就是新的 sing-box 本身，只能证明自洽，不能证明旧版客户端 / mihomo / Xray 客户端仍然兼容。
+# 换内核后用该核心自身做真实客户端握手；失败时恢复旧内核。Naive 无自动探针。
+# 只能证明当前同版本自洽，不能证明旧版或其他核心客户端仍兼容。
 _checkCoreInterop() {
     local core=$1 id user rc ids fail=0 unverified=()
     stateExists || return 1
@@ -2224,20 +2233,19 @@ realityXrayCompat() { # realityXrayCompat <host> <port>
     return 0
 }
 
-# realityCoreHint [正在安装的核心] —— 只要有 Reality 协议由 Xray 承载（已安装或即将安装），就返回 xray。
-# Reality 目标域名是各协议共用的，所以只要 Xray 参与，就必须选 Xray 能握手的域名。
+# 共享配置考虑所有 Xray Reality 协议；独立配置只考虑指定协议。
 realityCoreHint() {
-    local core=${1:-} id
-    if [[ "${core}" == "xray" ]]; then
-        echo xray
+    local core=${1:-} id=${2:-} mode
+    [[ "${core}" == xray ]] && { echo xray; return; }
+    mode=$(stagedGet '.reality_mode // "shared"')
+    [[ -n "${mode}" ]] || mode=$(realityMode)
+    if [[ "${mode}" == independent ]]; then
+        [[ -n "${core}" ]] || core=$(S --arg id "${id}" '.protocols[$id].core // ""')
+        [[ "${core}" == xray ]] && echo xray || echo ""
         return
     fi
     while read -r id; do
-        [[ -z "${id}" ]] && continue
-        if [[ "$(protoField "${id}" reality)" == "true" ]]; then
-            echo xray
-            return
-        fi
+        [[ "$(protoField "${id}" reality)" == true ]] && { echo xray; return; }
     done < <(installedProtocolsOfCore xray 2>/dev/null)
     echo ""
 }
@@ -2393,26 +2401,122 @@ verifyRealityKeypair() { # verifyRealityKeypair <priv> <pub>
 genShortId() { randHex 16; }
 
 # ----------------------------- 写入候选状态 -----------------------------------
-# stagedSetReality <sni> <dest_port> [重新生成密钥 yes|no] —— 只修改候选状态
-stagedSetReality() {
-    local sni=$1 port=$2 regen=${3:-no} kp priv pub sid
-    local curPriv
-    curPriv=$(stagedGet '.reality.private_key // ""')
-    if [[ -z "${curPriv}" || "${regen}" == "yes" ]]; then
-        kp=$(genRealityKeypair) || {
-            echoContent red " ---> 无法生成 Reality 密钥对（需要先安装 sing-box 或 Xray）"
-            return 1
-        }
-        priv=${kp%% *}
-        pub=${kp##* }
-        stagedEdit --arg p "${priv}" --arg u "${pub}" '.reality.private_key=$p | .reality.public_key=$u' || return 1
-    fi
-    sid=$(stagedGet '.reality.short_id // ""')
-    if [[ -z "${sid}" || "${regen}" == "yes" ]]; then
-        stagedEdit --arg s "$(genShortId)" '.reality.short_id=$s' || return 1
-    fi
-    stagedEdit --arg sni "${sni}" --argjson port "${port}" '.reality.sni=$sni | .reality.dest_port=$port'
+# 未带模式的旧 state 按共享处理；独立模式的参数保存在 protocols.<id>.reality。
+realityMode() { S '.reality_mode // "shared"'; }
+realityProfile() { # <协议 id> [state 文件]
+    jq --arg id "$1" 'if (.reality_mode // "shared") == "independent" then .protocols[$id].reality // {} else .reality // {} end' "${2:-${ATR_STATE}}"
 }
+stagedRealityProfile() {
+    stagedGet --arg id "${1:-}" 'if (.reality_mode // "shared") == "independent" then .protocols[$id].reality // {} else .reality // {} end'
+}
+_realityIDsJson() { jq '[.[]|select(.reality==true)|.id]' <<<"${PROTO_REGISTRY}"; }
+
+stagedRealityMode() { # <shared|independent> [共享时采用的协议 id]
+    local mode=$1 anchor=${2:-} old ids profile
+    [[ "${mode}" == shared || "${mode}" == independent ]] || return 1
+    old=$(stagedGet '.reality_mode // "shared"')
+    [[ "${old}" == "${mode}" ]] && return 0
+    ids=$(_realityIDsJson) || return 1
+    if [[ "${mode}" == independent ]]; then
+        # 复制现有配置，切换本身不使既有客户端失效；新加入的协议稍后配置。
+        stagedEdit --argjson ids "${ids}" '.reality as $r | .reality_mode="independent" | .protocols |= with_entries(if (.key as $i | $ids | index($i)) != null then .value.reality=$r else . end)'
+    else
+        [[ -n "${anchor}" ]] || { echoContent red " ---> 独立模式切回共享模式必须选择采用哪一个协议的配置"; return 1; }
+        profile=$(stagedRealityProfile "${anchor}") || return 1
+        [[ "$(jq -r '.private_key // ""' <<<"${profile}")" != "" ]] || return 1
+        stagedEdit --argjson p "${profile}" '.reality=$p | .reality_mode="shared" | .protocols |= with_entries(.value |= del(.reality))'
+    fi
+}
+
+pickRealityProtocol() { # 现有 Reality 协议，输出放在 PICK_REALITY_ID
+    local id n=0 c ids=()
+    while read -r id; do
+        [[ -n "${id}" ]] || continue
+        ids+=("${id}"); n=$((n+1))
+        echoContent yellow "${n}.$(protoName "${id}") ($(S --arg i "${id}" '.protocols[$i].core'))"
+    done < <(installedRealityProtocols)
+    ((n > 0)) || return 1
+    ask c "请选择协议:" || return 1
+    isInt "${c}" && ((c >= 1 && c <= n)) || return 1
+    PICK_REALITY_ID=${ids[$((c-1))]}
+}
+
+pickRealityMode() {
+    local c current
+    current=$(stagedGet '.reality_mode // "shared"')
+    echoContent yellow "\nReality 配置方式（端口仍需各不相同）:"
+    echoContent yellow "1.共享：所有 Reality 协议使用相同 SNI、密钥对、Short ID"
+    echoContent yellow "2.独立：按协议单独配置，可分别修改/重置"
+    local default=1 anchor=""
+    [[ "${current}" == independent ]] && default=2
+    ask c "请选择[回车沿用当前方式 ${default}]:" "${default}" || return 1
+    case "${c}" in
+    1)
+        if [[ "${current}" == independent ]]; then
+            echoContent yellow "请选择共享配置的来源；其他 Reality 节点的客户端可能需要更新:"
+            pickRealityProtocol || return 1; anchor=${PICK_REALITY_ID}
+            confirm "确认改为共享所选协议的配置？" n || return 1
+        fi
+        stagedRealityMode shared "${anchor}"
+        ;;
+    2) stagedRealityMode independent ;;
+    *) return 1 ;;
+    esac
+}
+
+# independent 时目标 id 必须明确；shared 时空 id 表示修改共享配置。
+stagedSetReality() { # <sni> <dest_port> [regen yes|no] [id]
+    local sni=$1 port=$2 regen=${3:-no} id=${4:-} kp priv pub sid profile mode
+    mode=$(stagedGet '.reality_mode // "shared"')
+    isDomainName "${sni}" && isPort "${port}" || return 1
+    if [[ "${mode}" == independent ]]; then
+        [[ -n "${id}" && "$(protoField "${id}" reality)" == true ]] || return 1
+    fi
+    profile=$(stagedRealityProfile "${id}") || return 1
+    priv=$(jq -r '.private_key // ""' <<<"${profile}")
+    if [[ -z "${priv}" || "${regen}" == yes ]]; then
+        kp=$(genRealityKeypair) || return 1
+        priv=${kp%% *}; pub=${kp##* }
+        profile=$(jq --arg p "${priv}" --arg u "${pub}" '.private_key=$p | .public_key=$u' <<<"${profile}") || return 1
+    fi
+    sid=$(jq -r '.short_id // ""' <<<"${profile}")
+    if [[ -z "${sid}" || "${regen}" == yes ]]; then
+        profile=$(jq --arg s "$(genShortId)" '.short_id=$s' <<<"${profile}") || return 1
+    fi
+    profile=$(jq --arg s "${sni}" --argjson p "${port}" '.sni=$s | .dest_port=$p' <<<"${profile}") || return 1
+    if [[ "${mode}" == independent ]]; then
+        stagedEdit --arg id "${id}" --argjson p "${profile}" '.protocols[$id].reality=$p'
+    else
+        stagedEdit --argjson p "${profile}" '.reality=$p'
+    fi
+}
+
+configureRealityForInstall() { # <core> <所选协议 id...>
+    local core=$1 id profile cur keep mode rc
+    shift
+    pickRealityMode || return 1
+    mode=$(stagedGet '.reality_mode // "shared"')
+    for id in "$@"; do
+        [[ "$(protoField "${id}" reality)" == true ]] || continue
+        profile=$(stagedRealityProfile "${id}") || return 1
+        cur=$(jq -r 'if (.sni // "") != "" then "\(.sni):\(.dest_port // 443)" else "" end' <<<"${profile}")
+        REALITY_CORE_HINT=$(realityCoreHint "${core}" "${id}")
+        keep=n; rc=0
+        echoContent skyBlue "\n配置 $(protoName "${id}") 的 Reality（${mode}）"
+        if [[ -n "${cur}" ]]; then
+            echoContent green " ---> 现有目标 ${cur}，公钥 $(jq -r '.public_key' <<<"${profile}")"
+            [[ "${REALITY_CORE_HINT}" == xray ]] && { realityXrayCompat "${cur%%:*}" "${cur##*:}" || rc=$?; }
+            if ((rc != 1)); then confirm "是否沿用该目标和密钥？" y && keep=y; fi
+        fi
+        if [[ "${keep}" != y ]]; then
+            realityPickSNI "${cur}" || return 1
+            stagedSetReality "${PICK_SNI}" "${PICK_PORT}" no "${id}" || return 1
+        fi
+        [[ "${mode}" == shared ]] && break
+    done
+    return 0
+}
+
 
 # =============================================================================
 #  07  配置渲染: state.json --jq--> sing-box / Xray 配置
@@ -2442,10 +2546,10 @@ read -r -d '' JQ_SINGBOX <<'EOF'
 | def cert: {certificate_path: ($tlsdir + "/" + $D + ".crt"), key_path: ($tlsdir + "/" + $D + ".key")};
   @@EGRESS_DEF@@
   def tlsCert: ({enabled: true, server_name: $D} + cert);
-  def tlsReality: {enabled: true, server_name: $S.reality.sni,
+  def tlsReality($id): (if ($S.reality_mode // "shared") == "independent" then $S.protocols[$id].reality else $S.reality end) as $RE | {enabled: true, server_name: $RE.sni,
       reality: {enabled: true,
-                handshake: {server: $S.reality.sni, server_port: ($S.reality.dest_port // 443)},
-                private_key: $S.reality.private_key, short_id: [$S.reality.short_id]}};
+                handshake: {server: $RE.sni, server_port: ($RE.dest_port // 443)},
+                private_key: $RE.private_key, short_id: [$RE.short_id]}};
   def users($p):
     $S.users | map(
       if ($p == "vless_reality_vision" or $p == "vless_vision_tls") then {name: .name, uuid: .uuid, flow: "xtls-rprx-vision"}
@@ -2455,8 +2559,8 @@ read -r -d '' JQ_SINGBOX <<'EOF'
       elif ($p == "naive") then {username: .name, password: .password}
       else {name: .name, password: .password} end);
   def inbound($id; $c):
-    if $id == "vless_reality_vision" then {type: "vless", tag: "vless-reality-vision", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality}
-    elif $id == "anytls_reality" then {type: "anytls", tag: "anytls-reality", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality}
+    if $id == "vless_reality_vision" then {type: "vless", tag: "vless-reality-vision", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality($id)}
+    elif $id == "anytls_reality" then {type: "anytls", tag: "anytls-reality", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality($id)}
     elif $id == "tuic" then {type: "tuic", tag: "tuic", listen: $listen, listen_port: $c.port, users: users($id), congestion_control: ($c.congestion // "bbr"), tls: (tlsCert + {alpn: ["h3"]})}
     elif $id == "hysteria2" then {type: "hysteria2", tag: "hysteria2", listen: $listen, listen_port: $c.port, users: users($id),
         up_mbps: ($c.down_mbps // 100), down_mbps: ($c.up_mbps // 50), tls: (tlsCert + {alpn: ["h3"]})}
@@ -2467,7 +2571,7 @@ read -r -d '' JQ_SINGBOX <<'EOF'
     elif $id == "vmess_ws" then {type: "vmess", tag: "vmess-ws", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert,
         transport: {type: "ws", path: ("/" + $P + "vws"), max_early_data: 2048, early_data_header_name: "Sec-WebSocket-Protocol"}}
     elif $id == "trojan" then {type: "trojan", tag: "trojan", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert}
-    elif $id == "vless_reality_grpc" then {type: "vless", tag: "vless-reality-grpc", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality,
+    elif $id == "vless_reality_grpc" then {type: "vless", tag: "vless-reality-grpc", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality($id),
         transport: {type: "grpc", service_name: "grpc"}}
     elif $id == "vmess_httpupgrade" then {type: "vmess", tag: "vmess-httpupgrade", listen: "127.0.0.1", listen_port: $hup, users: users($id),
         transport: {type: "httpupgrade", path: ("/" + $P + "hu")}}
@@ -2600,6 +2704,7 @@ read -r -d '' JQ_XRAY <<'EOF'
   # 域名目标（已用 DNS rebinding 实测，见 t_rebind）: 路由检查用的是 Xray 的一次解析，freedom 出站"拨号前"会再解析一次；如果两次解析的结果不同（攻击者控制的域名第一次给公网地址、第二次给 127.0.0.1），
   # 光靠路由规则会被绕过。所以公网出口模式下还要做两件事: 1) 用 DNS 服务器自身的 unexpectedIPs 把落在这些地址段的解析结果丢掉（路由检查和 freedom 的再解析都经过它，拨号只可能用到通过过滤的地址）；
   # 2) 直连出站改用 ForceIP: 解析失败就直接失败，绝不退回去按域名拨号（退回去就是交给系统解析器再解析一次，等于绕过了过滤）。
+  def realityOf($id): if ($S.reality_mode // "shared") == "independent" then $S.protocols[$id].reality else $S.reality end;
   def xpublic: ($S.egress.mode // "") == "public";
   def egress_xip: (egress_cidrs - ["::ffff:0:0/96"]) + egress_self;
   def xdns($a): ($a | if type == "object" then . else {address: .} end)
@@ -2617,10 +2722,10 @@ read -r -d '' JQ_XRAY <<'EOF'
       elif ($p == "vmess_ws") then {id: .uuid, alterId: 0, email: (.name + "@" + $p)}
       elif ($p == "trojan") then {password: .password, email: (.name + "@" + $p)}
       else {id: .uuid, email: (.name + "@" + $p)} end);
-  def realityS($c):
-    {show: false, target: ($S.reality.sni + ":" + (($S.reality.dest_port // 443) | tostring)), xver: 0,
-     serverNames: [$S.reality.sni], privateKey: $S.reality.private_key, shortIds: [$S.reality.short_id]}
-    + (if ($S.reality.mldsa_seed // "") != "" then {mldsa65Seed: $S.reality.mldsa_seed, minClientVer: "1.8.2", maxTimeDiff: 70000} else {} end);
+  def realityS($id): realityOf($id) as $RE |
+    {show: false, target: ($RE.sni + ":" + (($RE.dest_port // 443) | tostring)), xver: 0,
+     serverNames: [$RE.sni], privateKey: $RE.private_key, shortIds: [$RE.short_id]}
+    + (if ($RE.mldsa_seed // "") != "" then {mldsa65Seed: $RE.mldsa_seed, minClientVer: "1.8.2", maxTimeDiff: 70000} else {} end);
   def sniffing: if $sniff == "1" then {sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}} else {} end;
   # Vision 前置的回落链: 默认回落到 nginx(或 Trojan -> nginx)，h2 回落到 31302，WS 按路径回落
   def fallbacks:
@@ -2648,12 +2753,12 @@ read -r -d '' JQ_XRAY <<'EOF'
     elif $id == "vless_reality_vision" then
       {port: $c.port, protocol: "vless", tag: "VLESSReality",
        settings: {clients: xusers($id), decryption: "none"},
-       streamSettings: {network: "tcp", security: "reality", realitySettings: realityS($c)}} + sniffing
+       streamSettings: {network: "tcp", security: "reality", realitySettings: realityS($id)}} + sniffing
     elif $id == "vless_reality_xhttp" then
       {port: $c.port, protocol: "vless", tag: "VLESSRealityXHTTP",
        settings: {clients: xusers($id), decryption: "none"},
-       streamSettings: {network: "xhttp", security: "reality", realitySettings: realityS($c),
-                        xhttpSettings: {host: $S.reality.sni, path: ("/" + $P + "xHTTP"), mode: "auto"}}}
+       streamSettings: {network: "xhttp", security: "reality", realitySettings: realityS($id),
+                        xhttpSettings: {host: (realityOf($id) | .sni), path: ("/" + $P + "xHTTP"), mode: "auto"}}}
     elif $id == "vless_xhttp_tls" then
       {port: $c.port, protocol: "vless", tag: "VLESSXHTTPTLS",
        settings: {clients: xusers($id), decryption: "none"},
@@ -4434,10 +4539,11 @@ read -r -d '' JQ_NODES <<'EOF'
 . as $S
 | ($S.domain // "") as $D
 | ($S.path // "") as $P
-| ($S.reality // {}) as $RE
+
 | ($S.protocols // {}) as $PR
 | (($S.cdn // "") | split(",") | map(select(length > 0))) as $cdns
-| def short($id): ($reg | map(select(.id == $id)) | .[0].short // $id);
+| def realityOf($id): if ($S.reality_mode // "shared") == "independent" then $S.protocols[$id].reality // {} else $S.reality // {} end;
+  def short($id): ($reg | map(select(.id == $id)) | .[0].short // $id);
   def cdnCapable($id): ($reg | map(select(.id == $id)) | .[0].cdn // false);
   def isReality($id): ($reg | map(select(.id == $id)) | .[0].reality // false);
   def vport: ($PR.vless_vision_tls.port // 443);
@@ -4447,18 +4553,18 @@ read -r -d '' JQ_NODES <<'EOF'
   def q($pairs): $pairs | map(.[0] + "=" + .[1]) | join("&");
   def e: @uri;
   # ---- 节点基础字段 ----
-  def mk($u; $id; $c; $server; $suffix):
+  def mk($u; $id; $c; $server; $suffix): realityOf($id) as $RE |
     {name: ($u.name + "-" + short($id) + $suffix), user: $u.name, proto: $id, core: $c.core,
      uuid: $u.uuid, password: $u.password, server: $server, port: portof($id; $c),
      sni: "", host: "", path: "", pbk: ($RE.public_key // ""), sid: ($RE.short_id // ""),
      pqv: (if $c.core == "xray" then ($RE.mldsa_verify // "") else "" end), cc: ($c.congestion // "bbr"),
      up: ($c.up_mbps // 50), down: ($c.down_mbps // 100), hop: ($c.hop // "")};
-  def withReality: . + {sni: ($RE.sni // "")};
+  def withReality: . + {sni: (realityOf(.proto) | .sni // "")};
   def withTLS: . + {sni: $D, host: $D};
   def nodeOf($u; $id; $c; $server; $suffix):
     mk($u; $id; $c; $server; $suffix)
     | if   $id == "vless_reality_vision" or $id == "anytls_reality" or $id == "vless_reality_grpc" then withReality
-      elif $id == "vless_reality_xhttp" then (withReality | . + {host: ($RE.sni // ""), path: ("/" + $P + "xHTTP")})
+      elif $id == "vless_reality_xhttp" then (withReality | . + {host: .sni, path: ("/" + $P + "xHTTP")})
       elif $id == "vless_ws" then (withTLS | . + {path: ("/" + $P + "ws")})
       elif $id == "vmess_ws" then (withTLS | . + {path: ("/" + $P + "vws")})
       elif $id == "vmess_httpupgrade" then (withTLS | . + {path: ("/" + $P + "hu")})
@@ -5368,81 +5474,100 @@ showSubscriptionLinks() { # showSubscriptionLinks [用户名]
 }
 
 # ----------------------------- 自检（回环握手）--------------------------------
-# 本机能否用 sing-box 自检这个协议: 0 能  1 本机没有 sing-box  2 协议表声明 sing-box 客户端不支持（selfcheck:false: Naive、XHTTP）
-#   3 应该能自检，但拿不到自检用的客户端配置（节点生成 / 解析出错）——调用方必须按检测失败处理，不能当成"不支持"
-selfCheckSupported() { # selfCheckSupported <协议id> [用户名]
-    local id=$1 user=${2:-} views t
-    [[ "$(protoField "${id}" selfcheck)" == "false" ]] && return 2
-    [[ -x "${SB_BIN}" ]] || return 1
+# 同核心自检：承载协议的核心也是本次探针客户端，升级验收不再依赖跨核心兼容。
+selfCheckSupported() { # 0 可测；1 缺对应核心；2 不支持；3 配置/节点异常
+    local id=$1 user=${2:-} core views node
+    core=$(S --arg id "${id}" '.protocols[$id].core // ""')
+    case "${core}" in
+    sing-box)
+        [[ "$(protoField "${id}" selfcheck)" == false ]] && return 2
+        [[ -x "${SB_BIN}" ]] || return 1
+        ;;
+    xray)
+        [[ -x "${XRAY_BIN}" ]] || return 1
+        case "${id}" in vless_reality_vision | vless_vision_tls | vless_ws | vmess_ws | trojan | vless_reality_xhttp | vless_xhttp_tls) ;;
+        *) return 2 ;;
+        esac
+        ;;
+    *) return 3 ;;
+    esac
     [[ -n "${user}" ]] || user=$(userNames | head -n 1)
     views=$(nodeViews "${user}") || return 3
-    t=$(jq -r --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0] | if . == null then "missing" else (.singbox|type) end' <<<"${views}") || return 3
-    [[ "${t}" == "object" ]] || return 3
+    node=$(jq -ce --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0] | select(type=="object")' <<<"${views}") || return 3
+    if [[ "${core}" == sing-box ]]; then jq -e '.singbox|type=="object"' <<<"${node}" >/dev/null || return 3; fi
+    return 0
 }
-# 用刚装好的服务端对应的客户端配置，在本机回环上真实握手一次并访问外网。
-# 能发现: 公私钥不匹配、SNI/short_id 写错、端口未放行到进程、证书问题。
-# 返回: 0 通过  1 失败  2 无法自动验证（见 selfCheckSupported）
-selfCheckProtocol() { # selfCheckProtocol <协议id> [用户名]
-    local id=$1 user=${2:-} node out cfg cp pid log code url title
+
+cfgXraySelfcheck() { # <node JSON> <本地 socks 端口>；凭据经 jq 私有文件传递
+    jq -n --argjson n "$1" --argjson cp "$2" --arg cert "${TLS_DIR}/$(S '.domain').crt" '
+      ($n.proto) as $p
+      | ($p == "vless_reality_vision" or $p == "vless_reality_xhttp") as $reality
+      | (if $p == "vmess_ws" then "vmess" elif $p == "trojan" then "trojan" else "vless" end) as $protocol
+      | (if $protocol == "trojan" then {servers:[{address:"127.0.0.1",port:$n.port,password:$n.password}]}
+         else {vnext:[{address:"127.0.0.1",port:$n.port,users:[
+             (if $protocol == "vmess" then {id:$n.uuid,alterId:0,security:"auto"}
+              else {id:$n.uuid,encryption:"none"} + (if ($p=="vless_reality_vision" or $p=="vless_vision_tls") then {flow:"xtls-rprx-vision"} else {} end) end)]}]} end) as $settings
+      | (if ($p=="vless_reality_xhttp" or $p=="vless_xhttp_tls") then "xhttp" elif ($p=="vless_ws" or $p=="vmess_ws") then "ws" else "tcp" end) as $network
+      | ({network:$network,security:(if $reality then "reality" else "tls" end)}
+        + (if $reality then {realitySettings:({serverName:$n.sni,fingerprint:"chrome",publicKey:$n.pbk,shortId:$n.sid}
+                  + (if ($n.pqv // "") != "" then {mldsa65Verify:$n.pqv} else {} end))}
+           else {tlsSettings:{serverName:$n.sni,certificates:[{certificateFile:$cert,usage:"verify"}],alpn:(if $network=="ws" or $protocol=="trojan" then ["http/1.1"] else ["h2","http/1.1"] end)}} end)
+        + (if $network=="ws" then {wsSettings:{path:$n.path,headers:{Host:$n.host}}}
+           elif $network=="xhttp" then {xhttpSettings:{host:$n.host,path:$n.path,mode:"auto"}} else {} end)) as $stream
+      | {log:{loglevel:"warning"},inbounds:[{listen:"127.0.0.1",port:$cp,protocol:"socks",settings:{udp:true}}],
+         outbounds:[{tag:"probe",protocol:$protocol,settings:$settings,streamSettings:$stream}]}'
+}
+
+selfCheckProtocol() { # 0 通过；1 失败；2 无法自动验证
+    local id=$1 user=${2:-} title core sc=0 node cp cfg log bin pid code url out
     title=$(protoName "${id}")
+    core=$(S --arg id "${id}" '.protocols[$id].core // ""')
     [[ -n "${user}" ]] || user=$(userNames | head -n 1)
-    local sc=0
     selfCheckSupported "${id}" "${user}" || sc=$?
     case "${sc}" in
+    1) echoContent yellow "  - ${title}: 未验证（缺少 ${core} 客户端核心）"; return 2 ;;
+    2) echoContent yellow "  - ${title}: 未验证（${core} 自检客户端不支持此协议）"; return 2 ;;
     0) ;;
-    1)
-        echoContent yellow "  - ${title}: 未自动验证（本机没有 sing-box，只确认端口监听）"
-        return 2
-        ;;
-    2)
-        echoContent yellow "  - ${title}: 未自动验证（sing-box 客户端不支持该协议，请用对应客户端确认）"
-        return 2
-        ;;
-    *)
-        echoContent red "  ✗ ${title}: 自检失败（生成自检用的客户端配置出错，按握手失败处理）"
-        return 1
-        ;;
+    *) echoContent red "  ✗ ${title}: 自检失败（节点配置生成异常）"; return 1 ;;
     esac
-    node=$(nodeViews "${user}" | jq -c --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0]')
-    cp=$(randomFreePort)
-    cfg="${ATR_TMP:-/tmp}/selfcheck.${id}.json"
-    log="${ATR_TMP:-/tmp}/selfcheck.${id}.log"
-    # 指向本机回环；TLS 类协议只验证服务端功能，不验证证书链，故 insecure
-    jq -n --argjson n "$(jq -c '.singbox' <<<"${node}")" --argjson cp "${cp}" '
-      ($n | .server = "127.0.0.1" | del(.server_ports)
-          | if (.tls.reality == null) then .tls.insecure = true else . end) as $o
-      | {log: {level: "warn"}, inbounds: [{type: "mixed", tag: "in", listen: "127.0.0.1", listen_port: $cp}],
-         outbounds: [$o], route: {final: $o.tag}}' >"${cfg}"
-    "${SB_BIN}" run -c "${cfg}" >"${log}" 2>&1 &
+    node=$(nodeViews "${user}" | jq -ce --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0]') || return 1
+    cp=$(randomFreePort) || return 1
+    cfg="${ATR_TMP}/selfcheck.${id}.json"; log="${ATR_TMP}/selfcheck.${id}.log"
+    if [[ "${core}" == xray ]]; then
+        bin=${XRAY_BIN}
+        cfgXraySelfcheck "${node}" "${cp}" >"${cfg}" || return 1
+        "${bin}" run -test -c "${cfg}" >"${log}" 2>&1 || { echoContent red "  ✗ ${title}: Xray 自检配置校验失败"; return 1; }
+    else
+        bin=${SB_BIN}
+        jq -n --argjson n "$(jq -c '.singbox' <<<"${node}")" --argjson cp "${cp}" '
+          ($n | .server="127.0.0.1" | del(.server_ports) | if .tls.reality==null then .tls.insecure=true else . end) as $o
+          | {log:{level:"warn"},inbounds:[{type:"mixed",listen:"127.0.0.1",listen_port:$cp}],outbounds:[$o],route:{final:$o.tag}}' >"${cfg}" || return 1
+        "${bin}" check -c "${cfg}" >"${log}" 2>&1 || { echoContent red "  ✗ ${title}: sing-box 自检配置校验失败"; return 1; }
+    fi
+    "${bin}" run -c "${cfg}" >>"${log}" 2>&1 &
     pid=$!
     sleep 2
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}" 2>/dev/null
+        echoContent red "  ✗ ${title}: ${core} 自检客户端启动失败（检查配置或本地端口占用）"
+        return 1
+    fi
     code=000
-    for url in "https://www.cloudflare.com/cdn-cgi/trace" "http://www.gstatic.com/generate_204"; do
+    for url in https://www.cloudflare.com/cdn-cgi/trace http://www.gstatic.com/generate_204; do
         code=$(curl -s -m 15 -x "socks5h://127.0.0.1:${cp}" -o /dev/null -w '%{http_code}' "${url}" 2>/dev/null)
-        [[ "${code}" == "200" || "${code}" == "204" ]] && break
+        [[ "${code}" == 200 || "${code}" == 204 ]] && break
     done
-    kill "${pid}" 2>/dev/null
-    wait "${pid}" 2>/dev/null
-    if [[ "${code}" == "200" || "${code}" == "204" ]]; then
-        echoContent green "  ✓ ${title}: 握手成功，经隧道访问外网正常 (HTTP ${code})"
+    kill "${pid}" 2>/dev/null; wait "${pid}" 2>/dev/null
+    if [[ "${code}" == 200 || "${code}" == 204 ]]; then
+        echoContent green "  ✓ ${title}: ${core} → ${core} 握手成功 (HTTP ${code})"
         return 0
     fi
-    out=$(sed 's/\x1b\[[0-9;]*m//g' "${log}" | grep -iE 'error|fail|reality|tls|handshake' | tail -n 3)
-    echoContent red "  ✗ ${title}: 自检失败 (HTTP ${code})"
-    [[ -n "${out}" ]] && printf '      %s\n' "${out}"
-    if [[ "$(jq -r '.core' <<<"${node}")" == "xray" && "$(protoField "${id}" reality)" == "true" ]]; then
-        # Xray 承载的 Reality: 先看是不是目标域名不兼容（证书链长 + X25519MLKEM768）
-        realityXrayCompat "$(S '.reality.sni')" "$(S '.reality.dest_port')" >/dev/null 2>&1 || {
-            echoContent red "      原因: 目标域名 $(S '.reality.sni') 与 Xray 不兼容（证书链较长且启用 X25519MLKEM768）"
-            echoContent yellow "      请用 Reality 管理 → 修改目标域名(SNI)，选 dl.google.com / www.apple.com / www.python.org 等"
-        }
-    fi
-    if grep -qi 'reality verification failed' "${log}"; then
-        echoContent red "      原因: Reality 校验失败 —— 客户端公钥与服务端私钥不匹配，或 short_id/SNI 不一致；"
-        echoContent red "      也可能是服务端与客户端的内核版本组合不兼容（例如 Xray 26.10.21 服务端 + sing-box 1.14.x 客户端，2026-10 实测），可以先换内核版本再试"
-    fi
+    echoContent red "  ✗ ${title}: ${core} → ${core} 自检失败 (HTTP ${code})"
+    out=$(grep -iE 'error|fail|reality|tls|handshake' "${log}" | tail -n 3)
+    [[ -n "${out}" ]] && printRaw red "${out}"
     return 1
 }
+
 
 selfCheckAll() { # 返回 1 = 至少一个协议握手失败；无法自动验证的协议只列出，不算失败
     stateExists || {
@@ -5883,11 +6008,11 @@ configureProtocol() {
             return $?
         fi
         askPort port "${id}" "${name} " tcp || return 1
-        stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]={core:$c,port:$p}'
+        stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]=((.protocols[$id] // {}) + {core:$c,port:$p})'
         ;;
     vless_vision_tls)
         askPort port "${id}" "${name} " tcp 443 || return 1
-        stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]={core:$c,port:$p}'
+        stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]=((.protocols[$id] // {}) + {core:$c,port:$p})'
         ;;
     tuic)
         askPort port "${id}" "${name} (UDP) " udp || return 1
@@ -5914,7 +6039,7 @@ configureProtocol() {
     *)
         local net=tcp
         askPort port "${id}" "${name} " "${net}" || return 1
-        stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]={core:$c,port:$p}'
+        stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]=((.protocols[$id] // {}) + {core:$c,port:$p})'
         ;;
     esac
 }
@@ -6033,25 +6158,7 @@ installProtocols() {
     if ((needReality)); then
         n=$((n + 1))
         step "${n}" "${total}" "配置 Reality（目标域名 SNI 与密钥对）"
-        local cur="" keep="n" rc
-        # Reality 目标域名由所有 Reality 协议共用；只要有协议跑在 Xray 上，就按 Xray 的兼容性要求检测
-        REALITY_CORE_HINT=$(realityCoreHint "${core}")
-        cur=$(stagedGet 'if (.reality.sni // "") != "" then "\(.reality.sni):\(.reality.dest_port)" else "" end')
-        if [[ -n "${cur}" ]]; then
-            echoContent green " ---> 已有 Reality 配置: ${cur}（公钥 $(stagedGet '.reality.public_key')）"
-            rc=0
-            [[ "${REALITY_CORE_HINT}" == "xray" ]] && { realityXrayCompat "${cur%%:*}" "${cur##*:}" || rc=$?; }
-            if ((rc == 1)); then
-                echoContent yellow " ---> 现有目标域名不适合 Xray，需要重新选择（目标域名各协议共用，更换后已有 Reality 客户端需同步 SNI）"
-            else
-                confirm "是否沿用现有目标域名与密钥对？" y && keep=y
-            fi
-        fi
-        if [[ "${keep}" != "y" ]]; then
-            realityPickSNI "${cur}" || return 1
-            stagedSetReality "${PICK_SNI}" "${PICK_PORT}" no || return 1
-            echoContent green " ---> 已生成 Reality 密钥对与 Short ID（尚未写盘，校验通过后一并生效）"
-        fi
+        configureRealityForInstall "${core}" "${ids[@]}" || return 1
     fi
 
     # --- 用户 ---
@@ -6138,10 +6245,11 @@ installOneClickFlow() {
 
 # 非交互入口: atr install-anytls-reality [--port N] [--sni host[:port]] [--user name]
 cliInstallAnyTLSReality() {
-    local port="" sni="" user="" egress="" a
+    local port="" sni="" user="" egress="" mode="" a profile
     while [[ $# -gt 0 ]]; do
         a=$1
         case "${a}" in
+        --reality-mode) [[ $# -ge 2 ]] || return 1; mode=$2; shift ;;
         --port)
             port=$2
             shift
@@ -6181,29 +6289,39 @@ cliInstallAnyTLSReality() {
         echoContent red " ---> SNI 不合法"
         return 1
     fi
+    [[ -z "${mode}" || "${mode}" == shared || "${mode}" == independent ]] || { echoContent red " ---> --reality-mode 只能是 shared 或 independent"; return 1; }
+    # 合并独立配置必须显式选择来源，避免非交互安装意外覆盖其他节点。
+    if [[ "${mode}" == shared && "$(realityMode)" == independent ]]; then
+        echoContent red " ---> 请先用 reality-mode shared --from 协议ID 选择共享参数来源"
+        return 1
+    fi
     installTools min 1 5 || return 1
     ensureCore sing-box 2 5 || return 1
     stateInit
     stagedBegin
+    [[ -z "${mode}" ]] || stagedRealityMode "${mode}" || return 1
     # 未指定时：已经选过就沿用，否则默认公网出口（更安全的一侧）
     [[ -z "${egress}" ]] && egress=$(stagedGet '.egress.mode // ""')
     stagedEdit --arg m "${egress:-public}" '.egress.mode=$m' || return 1
     stagedRefreshEgressPublicIPs
     [[ -z "${port}" ]] && port=$(suggestPort tcp anytls_reality)
     if [[ -z "${sni}" ]]; then
-        SNI_HOST=www.microsoft.com
-        SNI_PORT=443
+        profile=$(stagedRealityProfile anytls_reality) || return 1
+        SNI_HOST=$(jq -r '.sni // ""' <<<"${profile}")
+        SNI_PORT=$(jq -r '.dest_port // 443' <<<"${profile}")
+        [[ -n "${SNI_HOST}" ]] || SNI_HOST=www.microsoft.com
     fi
     step 3 5 "检测 Reality 目标 ${SNI_HOST}:${SNI_PORT}"
+    REALITY_CORE_HINT=$(realityCoreHint sing-box anytls_reality)
     checkRealityTarget "${SNI_HOST}" "${SNI_PORT}" || {
         echoContent red " ---> 目标未通过检测，请换一个 --sni"
         return 1
     }
-    stagedSetReality "${SNI_HOST}" "${SNI_PORT}" no || return 1
+    stagedSetReality "${SNI_HOST}" "${SNI_PORT}" no anytls_reality || return 1
     if [[ "$(stagedGet '.users|length')" == "0" ]]; then
         stagedUserAdd "${user:-$(randHex 6)}" || return 1
     fi
-    stagedEdit --argjson p "${port}" '.protocols.anytls_reality={core:"sing-box",port:$p}' || return 1
+    stagedEdit --argjson p "${port}" '.protocols.anytls_reality=((.protocols.anytls_reality // {}) + {core:"sing-box",port:$p})' || return 1
     step 4 5 "应用配置"
     applyStaged "安装 AnyTLS+Reality" || {
         stagedDiscard
@@ -6241,85 +6359,68 @@ installedRealityProtocols() {
 # ----------------------------- 5. REALITY 管理 --------------------------------
 realityShowParams() {
     echoContent skyBlue "\n---------------- 当前 Reality 参数 ----------------"
-    echoContent yellow "目标域名(SNI): \c"
-    printRaw green "$(S '.reality.sni'):$(S '.reality.dest_port')"
-    echoContent yellow "公钥(客户端用): \c"
-    printRaw green "$(S '.reality.public_key')"
-    echoContent yellow "Short ID      : \c"
-    printRaw green "$(S '.reality.short_id')"
-    local id
+    echoContent yellow "配置方式: $(realityMode)"
+    local id profile
     while read -r id; do
-        [[ -z "${id}" ]] && continue
-        echoContent yellow "$(protoName "${id}") 端口: \c"
-        printRaw green "$(protoPort "${id}")  (核心: $(S --arg i "${id}" '.protocols[$i].core'))"
+        [[ -n "${id}" ]] || continue
+        profile=$(realityProfile "${id}")
+        echoContent yellow "$(protoName "${id}")（$(S --arg id "${id}" '.protocols[$id].core')，端口 $(protoPort "${id}")）"
+        printRaw green "  SNI: $(jq -r '.sni' <<<"${profile}"):$(jq -r '.dest_port // 443' <<<"${profile}")"
+        printRaw green "  公钥: $(jq -r '.public_key' <<<"${profile}")"
+        printRaw green "  Short ID: $(jq -r '.short_id' <<<"${profile}")"
     done < <(installedRealityProtocols)
 }
 
 manageReality() {
     requireInstalled || return 1
-    [[ -n "$(installedRealityProtocols)" ]] || {
-        echoContent red " ---> 请先安装 Reality 类协议（VLESS+Reality+Vision / AnyTLS+Reality 等）"
-        return 1
-    }
-    echoContent skyBlue "\n功能 1/1 : REALITY 管理"
-    echoContent red "\n=============================================================="
-    echoContent yellow "1.查看当前 Reality 参数"
-    echoContent yellow "2.修改目标域名(SNI)   [保留密钥对，客户端需同步 SNI]"
-    echoContent yellow "3.修改协议端口        [客户端需同步端口]"
-    echoContent yellow "4.重置密钥对与 Short ID [所有 Reality 客户端全部失效]"
-    echoContent yellow "5.自检(回环握手测试)"
-    echoContent red "=============================================================="
-    local c id cur port
+    [[ -n "$(installedRealityProtocols)" ]] || { echoContent red " ---> 请先安装 Reality 类协议"; return 1; }
+    echoContent skyBlue "\nREALITY 管理（当前 $(realityMode)）"
+    echoContent yellow "1.查看各协议 Reality 参数"
+    echoContent yellow "2.修改 SNI（保留密钥，独立模式先选协议）"
+    echoContent yellow "3.修改协议端口"
+    echoContent yellow "4.重置密钥对和 Short ID（独立模式只影响所选协议）"
+    echoContent yellow "5.按各自核心自检"
+    echoContent yellow "6.切换共享 / 独立配置"
+    local c id="" profile port scope="全部 Reality 协议"
     ask c "请选择:" || return 1
     case "${c}" in
     1) realityShowParams ;;
-    2)
-        cur="$(S '.reality.sni'):$(S '.reality.dest_port')"
-        REALITY_CORE_HINT=$(realityCoreHint)
-        realityPickSNI "${cur}" || return 1
-        stagedBegin
-        stagedSetReality "${PICK_SNI}" "${PICK_PORT}" no || return 1
-        if applyStaged "修改 Reality SNI"; then
-            postChangeShow "" "Reality 目标域名已改为 ${PICK_SNI}:${PICK_PORT}"
-            selfCheckAll
-        else stagedDiscard; fi
+    2 | 4)
+        if [[ "$(realityMode)" == independent ]]; then
+            pickRealityProtocol || return 1
+            id=${PICK_REALITY_ID}; scope=$(protoName "${id}")
+        fi
+        profile=$(realityProfile "${id}")
+        if [[ "${c}" == 2 ]]; then
+            REALITY_CORE_HINT=$(realityCoreHint "" "${id}")
+            echoContent yellow "影响范围: ${scope}；已有客户端需同步 SNI"
+            realityPickSNI "$(jq -r '.sni' <<<"${profile}"):$(jq -r '.dest_port // 443' <<<"${profile}")" || return 1
+            stagedBegin
+            stagedSetReality "${PICK_SNI}" "${PICK_PORT}" no "${id}" || return 1
+        else
+            confirm "重置 ${scope} 的密钥和 Short ID？相关客户端必须更新，失败自动回滚。" n || return 0
+            stagedBegin
+            stagedSetReality "$(jq -r '.sni' <<<"${profile}")" "$(jq -r '.dest_port // 443' <<<"${profile}")" yes "${id}" || return 1
+        fi
+        if applyStaged "修改 Reality ${scope}"; then postChangeShow "" "Reality 参数已更新"; selfCheckAll; else stagedDiscard; return 1; fi
         ;;
     3)
-        echoContent yellow "请选择要修改端口的协议:"
-        local -a ids=()
-        local i=0
-        while read -r id; do
-            [[ -z "${id}" ]] && continue
-            ids+=("${id}")
-            i=$((i + 1))
-            echoContent yellow "${i}.$(protoName "${id}") (当前 $(protoPort "${id}"))"
-        done < <(installedRealityProtocols)
-        ask c "请选择:" || return 1
-        if ! isInt "${c}" || ((c < 1 || c > i)); then
-            echoContent red " ---> 选择错误"
-            return 1
-        fi
-        id=${ids[$((c - 1))]}
+        pickRealityProtocol || return 1; id=${PICK_REALITY_ID}
         stagedBegin
         askPort port "${id}" "$(protoName "${id}") 新" tcp "$(protoPort "${id}")" || return 1
         stagedEdit --arg id "${id}" --argjson p "${port}" '.protocols[$id].port=$p' || return 1
-        if applyStaged "修改 ${id} 端口"; then
-            postChangeShow "" "$(protoName "${id}") 端口已改为 ${port}"
-        else stagedDiscard; fi
-        ;;
-    4)
-        confirm "重置后所有 Reality 客户端都需要更新公钥/Short ID，确认？(先备份，失败自动回滚)" n || return 0
-        stagedBegin
-        stagedSetReality "$(S '.reality.sni')" "$(S '.reality.dest_port')" yes || return 1
-        if applyStaged "重置 Reality 密钥对"; then
-            postChangeShow "" "Reality 密钥对已重置"
-            selfCheckAll
-        else stagedDiscard; fi
+        if applyStaged "修改 ${id} 端口"; then postChangeShow "" "端口已更新"; else stagedDiscard; return 1; fi
         ;;
     5) selfCheckAll ;;
-    *) echoContent red " ---> 选择错误" ;;
+    6)
+        stagedBegin
+        pickRealityMode || return 1
+        if applyStaged "切换 Reality 配置方式"; then postChangeShow "" "Reality 配置方式已更新"; selfCheckAll; else stagedDiscard; return 1; fi
+        ;;
+    *) echoContent red " ---> 选择错误"; return 1 ;;
     esac
 }
+
 
 # ----------------------------- 端口跳跃 (Hysteria2 / Tuic) --------------------
 HOP_UNIT="atr-hop"
@@ -8186,14 +8287,16 @@ ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+R
   (无命令)                         打开交互式管理菜单
   install-anytls-reality [选项]    非交互一键安装 AnyTLS+Reality
         --port N        监听端口(默认 443，被占用则随机)
-        --sni host[:p]  Reality 目标域名(默认 www.microsoft.com)
+        --sni host[:p]  Reality 目标域名(省略沿用已有配置，新配置默认 www.microsoft.com)
         --user name     首个用户名(默认随机)
+        --reality-mode shared|independent  共享或按协议独立配置（省略沿用当前方式，新安装默认共享）
         --egress MODE   出口访问模式: public 公网出口(默认，禁止客户端访问本机与内网) | full 允许内网访问
   status                           查看服务与端口状态
   show [用户] [1]                  查看账号(第二个参数 1 同时显示二维码)
   sub [用户]                       查看订阅链接
-  selfcheck                        自检(回环握手测试)
-  sni <host[:port]> [--force]      修改 Reality 目标域名(SNI)
+  selfcheck                        按节点所属核心做真实回环握手测试
+  reality-mode shared|independent [--from 协议ID]  切换 Reality 参数方式
+  sni <host[:port]> [--protocol 协议ID] [--force]      修改 Reality 目标域名(SNI)
   passwd <用户> [新密码] [--keep-sub]  重置密码(不给则随机)；订阅已启用时默认同时更换订阅链接，--keep-sub 保留旧链接
   adduser <用户> [uuid] [密码]     添加用户
         (密码参数写成 - 表示从标准输入读取，避免密码出现在 ps / shell 历史里；passwd 同理)
@@ -8227,34 +8330,60 @@ cliRecover() { # cliRecover [--abandon]
 }
 
 # ----------------------------- 命令行子命令 ----------------------------------
-cliSetSNI() { # cliSetSNI <host[:port]> [--force]
-    local target=${1:-} force=${2:-}
+cliRealityMode() { # reality-mode shared|independent [--from protocol]
+    local mode=${1:-} anchor=""
+    [[ $# -gt 0 ]] && shift
+    if [[ $# -gt 0 ]]; then
+        [[ $# == 2 && "$1" == --from ]] || { echoContent red " ---> 用法: ${ATR_CMD} reality-mode shared|independent [--from 协议ID]"; return 1; }
+        anchor=$2
+    fi
+    [[ "${mode}" == shared || "${mode}" == independent ]] || { echoContent red " ---> 配置方式只能是 shared 或 independent"; return 1; }
     requireInstalled || return 1
-    [[ -n "$(installedRealityProtocols)" ]] || {
-        echoContent red " ---> 未安装 Reality 类协议"
-        return 1
-    }
-    parseSniInput "${target}" || {
-        echoContent red " ---> SNI 不合法: ${target}"
-        return 1
-    }
-    REALITY_CORE_HINT=$(realityCoreHint)
-    if ! checkRealityTarget "${SNI_HOST}" "${SNI_PORT}" && [[ "${force}" != "--force" ]]; then
-        echoContent red " ---> 目标未通过检测（加 --force 可强制使用）"
-        return 1
+    [[ -n "$(installedRealityProtocols)" ]] || return 1
+    if [[ -n "${anchor}" ]]; then
+        installedRealityProtocols | grep -Fxq "${anchor}" || { echoContent red " ---> --from 必须是已安装的 Reality 协议"; return 1; }
     fi
     stagedBegin
-    stagedSetReality "${SNI_HOST}" "${SNI_PORT}" no || return 1
-    if applyStaged "修改 Reality SNI"; then
+    stagedRealityMode "${mode}" "${anchor}" || return 1
+    if applyStaged "Reality ${mode}"; then
+        postChangeShow "" "Reality 已切换为 ${mode}；切回共享时请同步客户端参数" || return 1
+        selfCheckAll
+    else stagedDiscard; return 1; fi
+}
+
+cliSetSNI() { # sni <host[:port]> [--protocol id] [--force]
+    local target=${1:-} force=no id=""
+    [[ $# -gt 0 ]] && shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        --force) force=yes; shift ;;
+        --protocol) [[ $# -ge 2 ]] || return 1; id=$2; shift 2 ;;
+        *) echoContent red " ---> 未知参数: $1"; return 1 ;;
+        esac
+    done
+    requireInstalled || return 1
+    [[ -n "$(installedRealityProtocols)" ]] || { echoContent red " ---> 未安装 Reality 类协议"; return 1; }
+    if [[ "$(realityMode)" == independent ]]; then
+        [[ -n "${id}" ]] && installedRealityProtocols | grep -Fxq "${id}" || { echoContent red " ---> 独立模式必须使用 --protocol 指定已安装的 Reality 协议"; return 1; }
+    elif [[ -n "${id}" ]]; then
+        echoContent red " ---> 共享模式会影响全部 Reality 协议；请去掉 --protocol，或先切换独立模式"
+        return 1
+    fi
+    parseSniInput "${target}" || { echoContent red " ---> SNI 不合法: ${target}"; return 1; }
+    REALITY_CORE_HINT=$(realityCoreHint "" "${id}")
+    if ! checkRealityTarget "${SNI_HOST}" "${SNI_PORT}" && [[ "${force}" != yes ]]; then
+        echoContent red " ---> 目标未通过检测（加 --force 可强制使用）"; return 1
+    fi
+    stagedBegin
+    stagedSetReality "${SNI_HOST}" "${SNI_PORT}" no "${id}" || return 1
+    if applyStaged "修改 Reality SNI ${id}"; then
         local rc=0
         postChangeShow "" "Reality 目标域名已改为 ${SNI_HOST}:${SNI_PORT}" || rc=1
         selfCheckAll || rc=1
         return "${rc}"
-    else
-        stagedDiscard
-        return 1
-    fi
+    else stagedDiscard; return 1; fi
 }
+
 
 # 命令行参数会出现在 ps 与 shell 历史里。密码参数写成 "-" 表示改从标准输入读取一行
 _secretArg() { # _secretArg <值>
@@ -8441,7 +8570,7 @@ main() {
     esac
     # 先校验命令是否合法: 输错命令不应该产生任何副作用（装 atr、建目录、装依赖）
     case "${cmd}" in
-    menu | install-anytls-reality | reload-core | restart | renew-tls | update-geo | apply-hop | status | show | sub | selfcheck | sni | passwd | adduser | deluser | log | uninstall | recover) ;;
+    menu | install-anytls-reality | reload-core | restart | renew-tls | update-geo | apply-hop | status | show | sub | selfcheck | sni | reality-mode | passwd | adduser | deluser | log | uninstall | recover) ;;
     *)
         usage
         exit 1
@@ -8504,7 +8633,8 @@ main() {
     show) showAccounts "${1:-}" "${2:-0}" ;;
     sub) showSubscriptionLinks "${1:-}" ;;
     selfcheck) selfCheckAll ;;
-    sni) cliSetSNI "${1:-}" "${2:-}" ;;
+    sni) cliSetSNI "$@" ;;
+    reality-mode) cliRealityMode "$@" ;;
     passwd) cliPasswd "$@" ;;
     adduser) cliAddUser "${1:-}" "${2:-}" "${3:-}" ;;
     deluser) cliDelUser "${1:-}" ;;
