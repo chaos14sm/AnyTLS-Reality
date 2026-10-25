@@ -1,10 +1,12 @@
 # AnyTLS-Reality
 
+> 本目录是尚未发布到 GitHub 的 v1.2.8 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
+
 sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
 界面、菜单编号和操作习惯参考并派生自 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent)（v2ray-agent 目前没有 AnyTLS + Reality 这个组合），安装后直接输入 `atr` 进入管理菜单。本项目是独立的派生作品，与 v2ray-agent 官方无关联。
 
-> **项目状态**：开发期间在隔离沙箱中，用真实的 sing-box / Xray / mihomo / nginx 二进制做过端到端验证（包括 AnyTLS + Reality 的回环握手）。2026-10-25 又在一台全新的 Debian 13 VPS（systemd 257、nginx 1.26）上做过一次完整的实机审计（v1.2.5）：真实 systemd 服务管理与沙箱、nginx 降权到 `atr-nginx`、真实 iptables 端口跳跃、各协议的真实数据转发（含 Windows 上的 sing-box 客户端经公网连接、官方 NaiveProxy 客户端、Xray 原生 XHTTP 客户端）、事务回滚与恢复、订阅撤销、DNS rebinding 对照实验，以及用 `strace` 核对凭据不出现在命令行上；v1.2.6 增加了相关修复；v1.2.7 进一步修复证书崩溃恢复和防火墙事务边界，并在原 Debian 13 VPS 上重新回归。详见 CHANGELOG.md 和随版本提供的测试报告。**仍未在真实服务器上验证**的：acme.sh 真实签发与 DNS API、WARP 注册、IPv6 专属流程与 NAT64、RHEL 系 + SELinux、arm64、BBR/DD、长时间压力测试。建议先在测试机上试用，遇到问题请到 Issues 反馈。
+> **项目状态**：开发期间在隔离沙箱中，用真实的 sing-box / Xray / mihomo / nginx 二进制做过端到端验证（包括 AnyTLS + Reality 的回环握手）。2026-10-25 又在一台全新的 Debian 13 VPS（systemd 257、nginx 1.26）上做过一次完整的实机审计（v1.2.5）：真实 systemd 服务管理与沙箱、nginx 降权到 `atr-nginx`、真实 iptables 端口跳跃、各协议的真实数据转发（含 Windows 上的 sing-box 客户端经公网连接、官方 NaiveProxy 客户端、Xray 原生 XHTTP 客户端）、事务回滚与恢复、订阅撤销、DNS rebinding 对照实验，以及用 `strace` 核对凭据不出现在命令行上；v1.2.6 增加了相关修复；v1.2.7 进一步修复证书崩溃恢复和防火墙事务边界；v1.2.8 增加同核心自检与 Reality 共享/独立配置，并在原 Debian 13 VPS 上重新回归。详见 CHANGELOG.md 和随版本提供的测试报告。**仍未在真实服务器上验证**的：acme.sh 真实签发与 DNS API、WARP 注册、IPv6 专属流程与 NAT64、RHEL 系 + SELinux、arm64、BBR/DD、长时间压力测试。建议先在测试机上试用，遇到问题请到 Issues 反馈。
 
 ## 特性
 
@@ -78,7 +80,7 @@ atr
 | 2 | 任意组合安装 | 列出全部协议，前 5 个预设仍排在最前 |
 | 3 | 一键无域名 AnyTLS+Reality | 只装 sing-box 与 AnyTLS+Reality，不需要域名和证书 |
 | 4 | Hysteria2 管理 | 重新配置、卸载、端口跳跃 |
-| 5 | REALITY 管理 | 查看参数、修改 SNI、修改端口、重置密钥对与 Short ID、自检 |
+| 5 | REALITY 管理 | 查看各协议参数、修改 SNI/端口、按协议重置密钥与 Short ID、自检、切换共享/独立配置 |
 | 6 | Tuic 管理 | 重新配置、卸载、端口跳跃 |
 | 7 | 用户管理 | 查看账号 / 订阅、更换订阅链接、合并其他机器的订阅、添加 / 删除用户、重置密码或 UUID、重新生成全部客户端配置 |
 | 8 | 伪装站管理 | 模板站点、302 重定向（需要 nginx） |
@@ -120,7 +122,7 @@ atr
 
 交互安装：菜单 `3`，或菜单 `1` 选 sing-box 后选 `2`。
 
-非交互安装（`--port` 缺省为 443，被占用则随机；`--sni` 缺省为 `www.microsoft.com`；`--user` 缺省为随机名）：
+非交互安装（`--port` 缺省为 443，被占用则随机；`--sni` 省略时沿用已有配置，新配置缺省为 `www.microsoft.com`；`--user` 缺省为随机名）：
 
 ```bash
 atr install-anytls-reality --port 443 --sni dl.google.com --user alice
@@ -132,7 +134,32 @@ atr install-anytls-reality --port 443 --sni dl.google.com --user alice
 - 公钥、Short ID、SNI 必须与服务端一致；公钥填错时客户端会报 `reality verification failed`。`atr selfcheck`（菜单 5 → 5）会用 sing-box 客户端对本机做一次回环握手来检测这类问题。
 - **mihomo / Clash.Meta 官方不支持 AnyTLS + Reality**，所以这个协议只输出 sing-box JSON 和参数说明，没有分享链接，也没有 mihomo YAML。
 - Reality 目标域名（SNI）：推荐列表前 5 个（`dl.google.com`、`www.apple.com`、`download-installer.cdn.mozilla.net`、`www.python.org`、`www.amd.com`）证书链较短，sing-box 与 Xray 作服务端都能完成握手。其余域名（如 `www.microsoft.com`、`addons.mozilla.org`）在 **Xray 作服务端**时可能握手失败，脚本会在检测时给出提示；sing-box 作服务端不受影响。
-- 修改 SNI：菜单 `5` → `2`，或 `atr sni <域名[:端口]>`。只改目标域名，密钥对保留，所有客户端需同步新的 SNI。
+- 修改 SNI：菜单 `5` → `2`；独立模式先选协议。命令行见下方，只改 SNI 会保留该配置的密钥和 Short ID，相关客户端需同步。
+
+## 双核心与 Reality 配置方式（v1.2.8）
+
+先在安装菜单选择 Xray，安装 VLESS+Reality+Vision；再选择 sing-box，追加 AnyTLS+Reality。两种协议必须使用不同监听端口。每次安装 Reality 协议会询问配置方式，回车沿用当前方式，新安装默认为共享：
+
+- **共享**：所有 Reality 协议使用同一套 SNI、X25519 密钥对与 Short ID。SNI 检测会同时考虑已安装的 Xray Reality 协议。
+- **独立**：每个 Reality 协议单独保存配置，可以使用不同 SNI、密钥对和 Short ID，也允许部分值恰好相同。新加入的协议单独选择 SNI并生成密钥；已存在的协议可保留当前参数。菜单 `5 → 2` 单独改 SNI，`5 → 4` 单独重新生成密钥对与 Short ID。
+
+菜单 `5 → 6` 随时切换。共享转独立时复制当前参数，切换本身不会使原客户端失效；之后可分别修改。独立转共享时必须选择一个协议作为参数来源，确认后其他 Reality 节点的客户端需同步该套参数。
+
+```bash
+atr reality-mode independent
+atr sni www.python.org --protocol anytls_reality
+atr sni www.apple.com --protocol vless_reality_vision
+# 将所有 Reality 协议统一为 VLESS 节点当前的一套配置
+atr reality-mode shared --from vless_reality_vision
+```
+
+独立模式的 `sni` 命令必须指定已安装的 Reality 协议，避免误改全部节点；共享模式请省略 `--protocol`。非交互安装可用 `--reality-mode independent`，省略时沿用当前方式；不能用安装命令隐式覆盖已有的独立配置，应先用 `reality-mode shared --from ...` 选择来源。
+
+状态缺少 `reality_mode` 时按旧版共享配置处理。独立配置保存在 `protocols.<协议ID>.reality`，客户端链接、sing-box JSON、mihomo YAML和订阅均读取对应协议的参数。需要回退旧脚本时，先切回共享或恢复旧版完整备份，旧版无法识别独立配置。
+
+`atr selfcheck` 会按服务端核心选择探针：Xray 节点使用本机 Xray，sing-box 节点使用本机 sing-box；输出明确显示 `xray → xray` 或 `sing-box → sing-box`。Xray 的 Reality XHTTP 和 TLS XHTTP 现在也能自动检查。内核升级/回退验收复用同一检查逻辑，真实握手失败仍会回滚。
+
+自检通过证明当前同核心客户端能完成回环握手及访问测试站点，不能证明所有第三方或旧版客户端兼容，也不能证明公网防火墙已经正确放行。Xray 与 sing-box 的跨核心 Reality 兼容问题仍应按实际客户端组合确认；共享密钥不会消除该差异。Naive 仍需其专用客户端验证。Xray TLS 探针信任本机已配置证书，sing-box 非 Reality TLS 探针仍跳过证书链验证，均不等同于公众 CA 信任验证。
 
 ## 命令行
 
@@ -140,14 +167,16 @@ atr install-anytls-reality --port 443 --sni dl.google.com --user alice
 atr                                打开交互式管理菜单
 atr install-anytls-reality [选项]  非交互一键安装 AnyTLS+Reality
       --port N        监听端口(默认 443，被占用则随机)
-      --sni host[:p]  Reality 目标域名(默认 www.microsoft.com)
+      --sni host[:p]  Reality 目标域名(省略沿用已有配置，新配置默认 www.microsoft.com)
       --user name     首个用户名(默认随机)
+      --reality-mode shared|independent  共享/按协议独立（省略沿用当前方式）
       --egress MODE   出口访问模式: public 公网出口(默认，禁止客户端访问本机与内网) | full 允许内网访问
 atr status                         查看服务与端口状态
 atr show [用户] [1]                查看账号(第二个参数 1 同时显示二维码)
 atr sub [用户]                     查看订阅链接
-atr selfcheck                      自检(回环握手测试；Naive / XHTTP 等无法自动验证的协议只列出)
-atr sni <host[:port]> [--force]    修改 Reality 目标域名(SNI)
+atr selfcheck                      按节点所属核心做真实回环握手测试（Naive 需专用客户端）
+atr sni <host[:port]> [--protocol ID] [--force]  修改对应 Reality SNI
+atr reality-mode shared|independent [--from ID]  切换参数方式
 atr passwd <用户> [新密码] [--keep-sub]  重置密码(不给则随机)；订阅已启用时默认同时更换订阅链接，--keep-sub 保留旧链接
 atr adduser <用户> [uuid] [密码]   添加用户
       (密码参数写成 - 表示从标准输入读取，避免密码出现在 ps / shell 历史里；passwd 同理)
