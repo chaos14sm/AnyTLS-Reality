@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.2.9 — 2026-10-26
+
+- HTTP-01 申请前的 `allowPort80Hint` 改用 `fwApplyList open`，统一显示防火墙新建、已有放行、nftables 手动规则和自动放行失败等结果。
+- 卸载使用 `fwApplyList close`，逐端口显示自动回收失败及 nftables 手动清理提示；自动回收失败时继续卸载其余内容，最终返回非零并提示遗留规则。
+- 状态显示增加 Reality 配置方式、订阅配置状态，保留已有出口模式和监听检查。缺少 `reality_mode` 的旧状态显示 `shared`；订阅配置状态与 nginx 实际运行状态分别显示。
+- 在原 Debian VPS 的私有测试目录完成 16 项针对性回归；防火墙、服务、账户、cron 与 ACME 均使用替身，不修改实际防火墙、不申请真实证书。Bash 语法及 ShellCheck warning 级检查通过。
+
 ## v1.2.8 — 2026-10-26
 
 基于本地 v1.2.7 修复版，增加双核心独立运行时的自检与 Reality 配置管理。
