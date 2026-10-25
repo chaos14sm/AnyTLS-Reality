@@ -42,7 +42,8 @@ export LANG=en_US.UTF-8
 # - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
 # - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
 # - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
-ATR_VERSION="v1.2.8"
+ATR_VERSION="v1.2.9"
+# v1.2.9：补齐 ACME / 卸载防火墙提示；状态显示 Reality 与订阅配置。
 # v1.2.8：按节点所属核心自检；Reality 支持共享/按协议独立配置。
 # v1.2.7：证书导入增加持久撤销日志与开机预恢复；防火墙撤销按后端/地址族记录，
 # 在实际修改前同步日志，配置回滚与崩溃恢复均重放；不再全局 reload firewalld。
@@ -2102,9 +2103,7 @@ tlsSetupInteractive() {
 }
 
 # HTTP-01 需要 80/tcp 对外开放：尝试放行
-allowPort80Hint() {
-    fwOpen 80 tcp
-}
+allowPort80Hint() { printf 'tcp 80\n' | fwApplyList open; }
 
 # 把 tlsSetupInteractive 的结果写入候选状态
 stagedSetTLS() {
@@ -8078,7 +8077,9 @@ showInstallStatus() {
         protoNames+="$(protoName "${x}") "
     done < <(installedProtocols)
     [[ -n "${protoNames}" ]] && echoContent yellow "已安装协议: ${protoNames}"
+    echoContent yellow "Reality 配置方式: $(realityMode)"
     echoContent yellow "出口访问模式: $(egressModeLabel "$(S '.egress.mode // ""')")"
+    echoContent yellow "订阅状态: $(S 'if .nginx.subscribe.enabled == true then "已启用（配置）" else "未启用" end')"
     if stateNeedsNginx "${ATR_STATE}"; then
         if serviceActive "${NGX_UNIT}"; then echoContent yellow "nginx: 运行中"; else echoContent yellow "nginx: 未运行"; fi
     fi
@@ -8220,7 +8221,7 @@ updateScript() {
 
 # ----------------------------- 20. 卸载 ---------------------------------------
 uninstallAll() {
-    local proto port
+    local fwCleanupRC=0
     # 防御: ATR_HOME 被误设成系统目录时拒绝删除；并要求目录里确实有本脚本的痕迹
     case "${ATR_HOME%/}" in
     "" | /etc | /usr | /var | /home | /root | /opt | /bin | /sbin | /lib | /tmp | /boot | /srv | /mnt)
@@ -8245,10 +8246,7 @@ uninstallAll() {
 
     if stateExists; then
         # 回收防火墙放行
-        while read -r proto port; do
-            [[ -z "${port}" ]] && continue
-            fwClose "${port}" "${proto}"
-        done < <(desiredFirewallPorts "${ATR_STATE}")
+        fwApplyList close < <(desiredFirewallPorts "${ATR_STATE}") || fwCleanupRC=1
     fi
     hopRulesRemoveAll
     local u
@@ -8270,8 +8268,12 @@ uninstallAll() {
     removeNginxAccount
     rm -f "${ATR_BIN_DIR}/${ATR_CMD}"
     rm -rf "${ATR_HOME}"
-    echoContent green " ---> 卸载完成"
-    exit 0
+    if ((fwCleanupRC)); then
+        echoContent yellow " ---> 安装内容已卸载，但部分防火墙规则未能自动回收，请按上方提示手动清理"
+    else
+        echoContent green " ---> 卸载完成"
+    fi
+    exit "${fwCleanupRC}"
 }
 
 # =============================================================================
