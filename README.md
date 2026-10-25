@@ -1,6 +1,6 @@
 # AnyTLS-Reality
 
-> 本目录是尚未发布到 GitHub 的 v1.2.8 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
+> 本目录是尚未发布到 GitHub 的 v1.2.9 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
 
 sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
@@ -160,6 +160,12 @@ atr reality-mode shared --from vless_reality_vision
 `atr selfcheck` 会按服务端核心选择探针：Xray 节点使用本机 Xray，sing-box 节点使用本机 sing-box；输出明确显示 `xray → xray` 或 `sing-box → sing-box`。Xray 的 Reality XHTTP 和 TLS XHTTP 现在也能自动检查。内核升级/回退验收复用同一检查逻辑，真实握手失败仍会回滚。
 
 自检通过证明当前同核心客户端能完成回环握手及访问测试站点，不能证明所有第三方或旧版客户端兼容，也不能证明公网防火墙已经正确放行。Xray 与 sing-box 的跨核心 Reality 兼容问题仍应按实际客户端组合确认；共享密钥不会消除该差异。Naive 仍需其专用客户端验证。Xray TLS 探针信任本机已配置证书，sing-box 非 Reality TLS 探针仍跳过证书链验证，均不等同于公众 CA 信任验证。
+
+## v1.2.9 状态与防火墙提示
+
+`atr status` 及菜单顶部状态现在显示 Reality 配置方式、出口访问模式和订阅配置状态。旧状态没有 `reality_mode` 时显示 `shared`。订阅的“已启用（配置）”表示已在配置中启用；nginx 运行状态、监听情况仍单独显示，不等于订阅链路健康检查。回退到不支持独立配置的旧脚本前，请先查看此处的 Reality 模式。
+
+HTTP-01 申请前的 80/tcp 放行、卸载时的规则回收统一使用 `fwApplyList` 提示逻辑：nftables 给出手动处理提示，自动操作失败明确报错。HTTP-01 仍会继续尝试申请。卸载遇到自动回收失败时继续清理其余安装内容，最后提示遗留规则并返回非零；nftables 的手动管理提示不算自动操作失败。
 
 ## 命令行
 
