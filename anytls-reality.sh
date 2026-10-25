@@ -42,7 +42,9 @@ export LANG=en_US.UTF-8
 # - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
 # - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
 # - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
-ATR_VERSION="v1.2.6"
+ATR_VERSION="v1.2.7"
+# v1.2.7：证书导入增加持久撤销日志与开机预恢复；防火墙撤销按后端/地址族记录，
+# 在实际修改前同步日志，配置回滚与崩溃恢复均重放；不再全局 reload firewalld。
 # 管理员在环境里指定的本机公网地址（订阅链接用它；出口访问模式也直接用它，不再联网探测）。只认启动时的环境变量，
 # 运行中 ATR_PUBLIC_IP 会被当作缓存改写，不能用来判断"管理员是否指定过"
 ATR_PUBLIC_IP_ENV="${ATR_PUBLIC_IP:-}"
@@ -374,8 +376,14 @@ lockRelease() {
 
 # 事务标记: applyStaged 落盘期间存在，内容是本次备份目录；崩溃或回滚失败后保留，作为恢复依据
 TXN_MARK="${ATR_HOME}/.txn"
+TLS_TXN_MARK="${ATR_HOME}/.tls-txn"
+TLS_RECOVERY_UNIT="atr-tls-recover"
 # 获锁后检查：未完成的事务不能被新的配置、重启或发布覆盖。
 _requireCleanTransaction() {
+    if [[ -e "${TLS_TXN_MARK}" || -L "${TLS_TXN_MARK}" ]]; then
+        echoContent red " ---> 存在尚未恢复完成的证书事务: ${TLS_TXN_MARK}。已拒绝修改/重启/发布，请执行 ${ATR_CMD} recover"
+        return 1
+    fi
     if [[ -e "${TXN_MARK}" || -L "${TXN_MARK}" ]]; then
         echoContent red " ---> 存在尚未恢复完成的事务: ${TXN_MARK}。已拒绝修改/重启/发布。排除问题后执行 ${ATR_CMD} recover 重试恢复，或 ${ATR_CMD} recover --abandon 放弃这次恢复（status / show / log 仍可使用）"
         return 1
@@ -1795,59 +1803,106 @@ tlsReusable() { # tlsReusable <域名>
 }
 
 # ----------------------------- 导入已有证书 ----------------------------------
+# TLS 两文件导入使用持久撤销日志。标记删除并同步之前，操作尚未提交；
+# SIGKILL 后下一次 atr（以及开机依赖单元）恢复原来的文件。不是双文件原子 rename。
+_tlsRestoreLocked() {
+    local st domain hadCrt hadKey f live had mode rc=0
+    [[ -e "${TLS_TXN_MARK}" || -L "${TLS_TXN_MARK}" ]] || return 0
+    st=$(cat "${TLS_TXN_MARK}" 2>/dev/null) || return 1
+    # 恢复依据只能指向本机私有 TLS 暂存目录，不能接受任意路径或符号链接。
+    if [[ "${st%/*}" != "${TLS_DIR}" || ! "${st##*/}" =~ ^\.import\.[A-Za-z0-9]+$ || ! -d "${st}" || -L "${st}" ]]; then
+        echoContent red " ---> 证书事务标记不合法，已保留恢复依据: ${TLS_TXN_MARK}"
+        return 1
+    fi
+    domain=$(jq -er '.domain' "${st}/manifest.json") || return 1
+    isDomainName "${domain}" || return 1
+    hadCrt=$(jq -er '.had_crt | select(. == 0 or . == 1)' "${st}/manifest.json") || return 1
+    hadKey=$(jq -er '.had_key | select(. == 0 or . == 1)' "${st}/manifest.json") || return 1
+    for f in crt key; do
+        live="${TLS_DIR}/${domain}.${f}"; had=${hadCrt}; mode=644
+        [[ "${f}" == key ]] && had=${hadKey} && mode=600
+        if ((had)); then
+            { atomicWrite "${live}" "${mode}" <"${st}/old.${f}" && cmp -s "${st}/old.${f}" "${live}"; } || rc=1
+        else
+            _removeLive "${live}" || rc=1
+        fi
+    done
+    if ((rc == 0)) && sync -f "${TLS_DIR}" && _removeLive "${TLS_TXN_MARK}" && sync -f "${ATR_HOME}"; then
+        rm -rf "${st}"
+        atrLog "TLS transaction recovered (${domain})"
+        return 0
+    fi
+    echoContent red " ---> 证书恢复没有完成，标记和备份已保留；已拒绝新的修改。请处理后执行 ${ATR_CMD} recover"
+    return 1
+}
+
+recoverTLSIfNeeded() {
+    [[ -e "${TLS_TXN_MARK}" || -L "${TLS_TXN_MARK}" ]] || return 0
+    local rc
+    lockAcquire || return 1
+    _tlsRestoreLocked; rc=$?
+    lockRelease
+    return "${rc}"
+}
+
 tlsImportCustom() { # tlsImportCustom <域名> <crt 路径> <key 路径>
-    local domain=$1 crt=$2 key=$3 st fail="" hadCrt=0 hadKey=0 f
+    local domain=$1 crt=$2 key=$3 st hadCrt=0 hadKey=0 rc=0
     local dcrt="${TLS_DIR}/${domain}.crt" dkey="${TLS_DIR}/${domain}.key"
+    isDomainName "${domain}" || return 1
     if ! tlsValidate "${crt}" "${key}" "${domain}"; then
         echoContent red " ---> 证书不可用: ${TLS_ERR}"
         return 1
     fi
     mkdir -p "${TLS_DIR}" || return 1
     lockAcquire || return 1
-    st=$(mktemp -d "${TLS_DIR}/.import.XXXXXX") || {
-        lockRelease
-        echoContent red " ---> 无法创建证书暂存目录，没有导入"
+    if ! _requireCleanTransaction; then lockRelease; return 1; fi
+    st=$(mktemp -d "${TLS_DIR}/.import.XXXXXX") || { lockRelease; return 1; }
+    [[ -e "${dcrt}" || -L "${dcrt}" ]] && hadCrt=1
+    [[ -e "${dkey}" || -L "${dkey}" ]] && hadKey=1
+    # 完整准备并核对新旧文件，所有数据同步成功之前不碰 live 文件。
+    if ! { atomicWrite "${st}/new.crt" 644 <"${crt}" && cmp -s "${crt}" "${st}/new.crt" &&
+           atomicWrite "${st}/new.key" 600 <"${key}" && cmp -s "${key}" "${st}/new.key" &&
+           tlsValidate "${st}/new.crt" "${st}/new.key" "${domain}"; } ||
+       ! { ((hadCrt == 0)) || { atomicWrite "${st}/old.crt" 644 <"${dcrt}" && cmp -s "${dcrt}" "${st}/old.crt"; }; } ||
+       ! { ((hadKey == 0)) || { atomicWrite "${st}/old.key" 600 <"${dkey}" && cmp -s "${dkey}" "${st}/old.key"; }; } ||
+       ! { jq -n --arg domain "${domain}" --argjson c "${hadCrt}" --argjson k "${hadKey}" \
+              '{domain:$domain,had_crt:$c,had_key:$k}' | atomicWrite "${st}/manifest.json" 600; } ||
+       ! sync -f "${st}"; then
+        rm -rf "${st}"; lockRelease
+        echoContent red " ---> 无法准备证书及备份，原来的证书没有改动"
         return 1
-    }
-    [[ -e "${dcrt}" ]] && hadCrt=1
-    [[ -e "${dkey}" ]] && hadKey=1
-    # 1) 新的一对先复制进私有暂存目录并重新校验（复制本身也可能失败或写不全）；2) 现有的文件留底；
-    # 3) 逐个原子替换，替换后再校验线上这一对。任何一步失败都恢复原来的文件（原来没有的就删掉新写的），返回非零
-    if ! { atomicWrite "${st}/new.crt" 644 <"${crt}" && atomicWrite "${st}/new.key" 600 <"${key}" && tlsValidate "${st}/new.crt" "${st}/new.key" "${domain}"; }; then
-        fail="新证书复制到暂存目录失败${TLS_ERR:+（${TLS_ERR}）}，原来的证书没有改动"
-    elif ! { ((hadCrt == 0)) || atomicWrite "${st}/old.crt" 644 <"${dcrt}"; } || ! { ((hadKey == 0)) || atomicWrite "${st}/old.key" 600 <"${dkey}"; }; then
-        fail="无法备份现有的证书，没有导入"
-    elif ! { atomicWrite "${dkey}" 600 <"${st}/new.key" && atomicWrite "${dcrt}" 644 <"${st}/new.crt" && tlsValidate "${dcrt}" "${dkey}" "${domain}"; }; then
-        fail="替换证书失败${TLS_ERR:+（${TLS_ERR}）}"
-        local ok=1
-        for f in crt key; do
-            local live="${TLS_DIR}/${domain}.${f}" had=${hadCrt} mode=644
-            [[ "${f}" == key ]] && had=${hadKey} && mode=600
-            if ((had)); then
-                { atomicWrite "${live}" "${mode}" <"${st}/old.${f}" && cmp -s "${st}/old.${f}" "${live}"; } || ok=0
-            else
-                rm -f "${live}"
-                [[ -e "${live}" ]] && ok=0
-            fi
-        done
-        if ((ok)); then
-            fail+="，已恢复原来的证书"
-        else
-            lockRelease
-            echoContent red " ---> ${fail}，而且没能恢复原来的证书！请检查 ${TLS_DIR}（原来的文件在 ${st}）"
-            return 1
-        fi
+    fi
+    # WAL：先持久化撤销依据，再替换任一 live 文件。
+    if ! { printf '%s' "${st}" | atomicWrite "${TLS_TXN_MARK}" 600 &&
+           [[ "$(cat "${TLS_TXN_MARK}")" == "${st}" ]] && sync -f "${ATR_HOME}"; }; then
+        # 写标记可能已成功；保留备份并尝试恢复，不能直接删除恢复依据。
+        if [[ -e "${TLS_TXN_MARK}" || -L "${TLS_TXN_MARK}" ]]; then _tlsRestoreLocked; else rm -rf "${st}"; fi
+        lockRelease
+        echoContent red " ---> 证书事务标记没有确认持久化，未报告导入成功"
+        return 1
+    fi
+    if ! { atomicWrite "${dkey}" 600 <"${st}/new.key" && sync -f "${TLS_DIR}" &&
+           atomicWrite "${dcrt}" 644 <"${st}/new.crt" &&
+           cmp -s "${st}/new.key" "${dkey}" && cmp -s "${st}/new.crt" "${dcrt}" &&
+           tlsValidate "${dcrt}" "${dkey}" "${domain}" && sync -f "${TLS_DIR}"; }; then
+        echoContent red " ---> 替换证书失败，正在恢复原来的证书"
+        _tlsRestoreLocked || rc=1
+        lockRelease
+        ((rc == 0)) && echoContent yellow " ---> 已恢复原来的证书"
+        return 1
+    fi
+    if ! { _removeLive "${TLS_TXN_MARK}" && sync -f "${ATR_HOME}"; }; then
+        echoContent red " ---> 新证书已经落盘，但事务提交未完成；保留备份，未报告成功，请执行 ${ATR_CMD} recover"
+        lockRelease
+        return 1
     fi
     rm -rf "${st}"
     lockRelease
-    if [[ -n "${fail}" ]]; then
-        echoContent red " ---> ${fail}"
-        return 1
-    fi
     echoContent green " ---> 已导入证书（有效期剩余 $(tlsDaysLeft "${dcrt}") 天）"
     echoContent yellow " ---> 自定义证书不会自动续签，请在到期前更换"
     return 0
 }
+
 
 # ----------------------------- acme.sh 申请 ----------------------------------
 # 80 端口准备: 被本脚本的 nginx 占用则临时停掉；被其他进程占用则失败
@@ -2044,8 +2099,11 @@ allowPort80Hint() {
 
 # 把 tlsSetupInteractive 的结果写入候选状态
 stagedSetTLS() {
-    stagedEdit --arg d "${TLS_DOMAIN}" --arg m "${TLS_MODE}" --arg ca "${TLS_CA}" --arg api "${TLS_DNS_API}" --argjson w "${TLS_WILDCARD}" \
-        '.domain=$d | .tls.mode=$m | .tls.ca=$ca | .tls.dns_api=$api | .tls.wildcard=$w'
+    local fingerprint
+    fingerprint=$(sha256Of "${TLS_DIR}/${TLS_DOMAIN}.crt")
+    [[ "${fingerprint}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    stagedEdit --arg d "${TLS_DOMAIN}" --arg m "${TLS_MODE}" --arg ca "${TLS_CA}" --arg api "${TLS_DNS_API}" --argjson w "${TLS_WILDCARD}" --arg fp "${fingerprint}" \
+        '.domain=$d | .tls.mode=$m | .tls.ca=$ca | .tls.dns_api=$api | .tls.wildcard=$w | .tls.cert_sha256=$fp'
 }
 
 # ----------------------------- 管理/续签 -------------------------------------
@@ -2966,14 +3024,31 @@ _writeUnitFile() { # _writeUnitFile <单元名> (内容来自 stdin)
     }
 }
 
+writeTLSRecoveryUnit() {
+    _writeUnitFile "${TLS_RECOVERY_UNIT}" <<EOF
+[Unit]
+Description=Recover interrupted TLS import (${ATR_PROJECT_NAME})
+After=local-fs.target
+Before=${SB_UNIT}.service ${XRAY_UNIT}.service ${NGX_UNIT}.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=${ATR_SCRIPT_PATH} recover-tls
+UMask=0077
+EOF
+}
+
 writeUnit() { # writeUnit <sing-box|xray|nginx>
+    writeTLSRecoveryUnit || return 1
     case "$1" in
     sing-box)
         _writeUnitFile "${SB_UNIT}" <<EOF
 [Unit]
 Description=Sing-Box Service (${ATR_PROJECT_NAME})
 Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
+Requires=${TLS_RECOVERY_UNIT}.service
+After=network.target nss-lookup.target ${TLS_RECOVERY_UNIT}.service
 
 [Service]
 User=root
@@ -3012,7 +3087,8 @@ EOF
 [Unit]
 Description=Xray Service (${ATR_PROJECT_NAME})
 Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
+Requires=${TLS_RECOVERY_UNIT}.service
+After=network.target nss-lookup.target ${TLS_RECOVERY_UNIT}.service
 
 [Service]
 User=root
@@ -3049,7 +3125,8 @@ EOF
         _writeUnitFile "${NGX_UNIT}" <<EOF
 [Unit]
 Description=nginx for ${ATR_PROJECT_NAME} (isolated instance)
-After=network.target nss-lookup.target
+Requires=${TLS_RECOVERY_UNIT}.service
+After=network.target nss-lookup.target ${TLS_RECOVERY_UNIT}.service
 
 [Service]
 Type=simple
@@ -3167,7 +3244,13 @@ _nftDropInput() {
 }
 # ufw 里已经有放行这个端口的规则吗（以 ufw status 为准，不只看 allow / delete 的返回值）
 _ufwHas() { # _ufwHas <端口|a:b> <tcp|udp>
-    ufw status 2>/dev/null | grep -qE "^${1}/${2}[[:space:]]+ALLOW"
+    local status family=${3:-v4}
+    status=$(ufw status 2>/dev/null) || return 2
+    if [[ "${family}" == v6 ]]; then
+        grep -qE "^${1}/${2}[[:space:]]+\(v6\)[[:space:]]+ALLOW" <<<"${status}"
+    else
+        grep -qE "^${1}/${2}[[:space:]]+ALLOW" <<<"${status}"
+    fi
 }
 # 给管理员的手动命令
 _fwManualCmd() { # _fwManualCmd <ufw|firewalld|iptables|nft> <open|close> <端口|a:b> <tcp|udp>
@@ -3187,113 +3270,190 @@ _fwManualCmd() { # _fwManualCmd <ufw|firewalld|iptables|nft> <open|close> <端�
     esac
 }
 
-# fwOpen <端口|范围a:b> <tcp|udp>  —— 0 已放行（本次新建）  10 规则原本就有  20 nftables 默认拒绝（本脚本不支持自动放行）
-#   30 没有需要处理的防火墙  1 放行失败（命令返回非零，或放行后复核不到规则）
+# 后端查询统一返回 0=存在、1=不存在、2=无法确认。错误不能被当作规则不存在。
+_fwQuery() { # <kind> <part> <port> <proto>
+    local kind=$1 part=$2 port=$3 proto=$4 rc cmd
+    case "${kind}:${part}" in
+    ufw:v4 | ufw:v6) _ufwHas "${port}" "${proto}" "${part}"; return $? ;;
+    firewalld:permanent) firewall-cmd --permanent --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 ;;
+    firewalld:runtime) firewall-cmd --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 ;;
+    iptables:v4 | iptables:v6)
+        cmd=iptables; [[ "${part}" == v6 ]] && cmd=ip6tables
+        command -v "${cmd}" >/dev/null 2>&1 || return 2
+        "${cmd}" -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT >/dev/null 2>&1
+        ;;
+    *) return 2 ;;
+    esac
+    rc=$?; ((rc == 0 || rc == 1)) && return "${rc}"
+    return 2
+}
+
+# 调用真正的防火墙命令之前先记撤销动作。配置事务中还会将其同步到备份目录，SIGKILL 后可重放。
+# 逐个记录永久/运行时、IPv4/IPv6，只记录操作前不存在的部分，绝不删除管理员已有的部分。
+FW_CREATED=""
+FW_JOURNAL_FILE=""
+_fwRecordUndo() { # <kind> <part> <port> <proto>
+    local line old="" expected
+    printf -v line '%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4"
+    if [[ -n "${FW_JOURNAL_FILE:-}" ]]; then
+        if [[ -f "${FW_JOURNAL_FILE}" ]]; then old=$(cat "${FW_JOURNAL_FILE}") || return 1; fi
+        expected="${old}${old:+$'\n'}${line}"
+        printf '%s\n' "${expected}" | atomicWrite "${FW_JOURNAL_FILE}" 600 || return 1
+        [[ "$(cat "${FW_JOURNAL_FILE}")" == "${expected}" ]] && sync -f "${FW_JOURNAL_FILE}" || return 1
+    fi
+    FW_CREATED+="${line}"$'\n'
+}
+
+_fwDelete() { # <kind> <part> <port> <proto>；删除后必须确认不存在
+    local kind=$1 part=$2 port=$3 proto=$4 rc cmd
+    _fwQuery "$@"; rc=$?
+    ((rc == 1)) && return 0
+    ((rc == 0)) || return 1
+    case "${kind}:${part}" in
+    ufw:v4) ufw delete allow proto "${proto}" from 0.0.0.0/0 to 0.0.0.0/0 port "${port}" >/dev/null 2>&1 ;;
+    ufw:v6) ufw delete allow proto "${proto}" from ::/0 to ::/0 port "${port}" >/dev/null 2>&1 ;;
+    firewalld:permanent) firewall-cmd --permanent --zone=public --remove-port="${port//:/-}/${proto}" >/dev/null 2>&1 ;;
+    firewalld:runtime) firewall-cmd --zone=public --remove-port="${port//:/-}/${proto}" >/dev/null 2>&1 ;;
+    iptables:v4 | iptables:v6)
+        cmd=iptables; [[ "${part}" == v6 ]] && cmd=ip6tables
+        # 只删除带 atr 注释的规则；同规则重复时全部清理。
+        while "${cmd}" -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT >/dev/null 2>&1; do :; done
+        ;;
+    *) return 1 ;;
+    esac
+    _fwQuery "$@"; rc=$?
+    ((rc == 1))
+}
+
+_fwSave() {
+    if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1; else return 0; fi
+}
+
+fwRollbackJournal() { # <撤销日志文件>；可重入，失败保留日志和配置事务标记
+    local f=$1 lines=() i kind part port proto extra rc=0
+    [[ -e "${f}" ]] || return 0
+    [[ -f "${f}" && ! -L "${f}" ]] || return 1
+    mapfile -t lines <"${f}" || return 1
+    for ((i=${#lines[@]}-1; i>=0; i--)); do
+        IFS=$'\t' read -r kind part port proto extra <<<"${lines[i]}"
+        if [[ -n "${extra}" || ! "${port}" =~ ^[0-9]+(:[0-9]+)?$ || ! "${proto}" =~ ^(tcp|udp)$ ]]; then
+            echoContent red " ---> 防火墙撤销日志损坏，已保留恢复依据: ${f}"
+            rc=1; continue
+        fi
+        case "${kind}:${part}" in ufw:v4 | ufw:v6 | firewalld:permanent | firewalld:runtime | iptables:v4 | iptables:v6) ;;
+        *) rc=1; continue ;;
+        esac
+        if ! _fwDelete "${kind}" "${part}" "${port}" "${proto}"; then
+            echoContent red " ---> 防火墙撤销未完成: ${kind}/${part} ${proto}/${port}"
+            rc=1
+        elif [[ "${kind}" == iptables ]] && ! _fwSave; then
+            echoContent red " ---> 防火墙规则已撤销，但持久保存失败"
+            rc=1
+        fi
+    done
+    return "${rc}"
+}
+
+_fwHasGlobalIPv6() { ip -o -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; }
+
+# 0=本次添加；10=已有；20=nft 手动管理；30=无需防火墙；1=失败。
 fwOpen() {
-    local port=$1 proto=$2 kind rc=0
+    local port=$1 proto=$2 kind part rc changed=0 cmd parts=()
     kind=$(_fwKind)
     case "${kind}" in
     none) return 30 ;;
     nft) return 20 ;;
-    ufw)
-        _ufwHas "${port}" "${proto}" && return 10
-        ufw allow "${port}/${proto}" >/dev/null 2>&1 || return 1
-        _ufwHas "${port}" "${proto}" || return 1
-        ;;
-    firewalld)
-        firewall-cmd --permanent --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 && return 10
-        firewall-cmd --permanent --zone=public --add-port="${port//:/-}/${proto}" >/dev/null 2>&1 || return 1
-        firewall-cmd --reload >/dev/null 2>&1 || return 1
-        firewall-cmd --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 || return 1
-        ;;
-    iptables)
-        if iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; then
-            rc=10
-        else
-            iptables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null || return 1
-            iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null || return 1
+    ufw) parts=(v4 v6) ;;
+    firewalld) parts=(permanent runtime) ;;
+    iptables) parts=(v4 v6) ;;
+    *) return 1 ;;
+    esac
+    for part in "${parts[@]}"; do
+        if [[ "${kind}:${part}" == ufw:v6 ]] && grep -qi '^IPV6=no' /etc/default/ufw 2>/dev/null; then
+            if _fwHasGlobalIPv6; then echoContent red " ---> UFW 没有管理本机的全球 IPv6，请手动处理或用 ATR_SKIP_FIREWALL=1"; return 1; fi
+            continue
         fi
-        # IPv6: 先查重再插入（以前每放行一次就多一条）；没有 IPv6 的机器上 ip6tables 本来就可能报错，所以只提示、不算放行失败
-        if command -v ip6tables >/dev/null 2>&1 && ! ip6tables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; then
-            ip6tables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null ||
-                echoContent yellow " ---> 提示: ip6tables 没能放行 ${proto}/${port}（本机不用 IPv6 时可以忽略）"
-        fi
-        if ((rc == 0)); then
-            if command -v netfilter-persistent >/dev/null 2>&1; then
-                netfilter-persistent save >/dev/null 2>&1 || echoContent yellow " ---> 提示: netfilter-persistent 保存失败，重启后 ${proto}/${port} 的放行规则可能丢失"
-            else
-                echoContent yellow " ---> 提示: 已用 iptables 放行 ${port}/${proto}，但系统未安装 netfilter-persistent，重启后规则可能丢失"
+        _fwQuery "${kind}" "${part}" "${port}" "${proto}"; rc=$?
+        ((rc == 0)) && continue
+        if ((rc != 1)); then
+            if [[ "${kind}:${part}" == iptables:v6 ]] && ! _fwHasGlobalIPv6; then
+                echoContent yellow " ---> 本机没有全球 IPv6，未能查询 ip6tables；只处理 IPv4"
+                continue
             fi
+            echoContent red " ---> 无法确认 ${kind}/${part} 的原有规则，拒绝修改"
+            return 1
         fi
-        ;;
-    esac
-    return "${rc}"
+        _fwRecordUndo "${kind}" "${part}" "${port}" "${proto}" || return 1
+        case "${kind}:${part}" in
+        ufw:v4) ufw allow proto "${proto}" from 0.0.0.0/0 to 0.0.0.0/0 port "${port}" >/dev/null 2>&1 || return 1 ;;
+        ufw:v6) ufw allow proto "${proto}" from ::/0 to ::/0 port "${port}" >/dev/null 2>&1 || return 1 ;;
+        firewalld:permanent) firewall-cmd --permanent --zone=public --add-port="${port//:/-}/${proto}" >/dev/null 2>&1 || return 1 ;;
+        firewalld:runtime) firewall-cmd --zone=public --add-port="${port//:/-}/${proto}" >/dev/null 2>&1 || return 1 ;;
+        iptables:v4 | iptables:v6)
+            cmd=iptables; [[ "${part}" == v6 ]] && cmd=ip6tables
+            "${cmd}" -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT >/dev/null 2>&1 || return 1
+            ;;
+        esac
+        _fwQuery "${kind}" "${part}" "${port}" "${proto}" || return 1
+        changed=1
+    done
+    if [[ "${kind}" == iptables ]] && ((changed)); then
+        _fwSave || return 1
+        command -v netfilter-persistent >/dev/null 2>&1 || echoContent yellow " ---> 提示: 未安装 netfilter-persistent，重启后放行规则可能丢失"
+    fi
+    ((changed)) && return 0
+    return 10
 }
 
-fwClose() { # fwClose <端口|范围> <tcp|udp>  —— 0 已回收  10 本来就没有  20 nftables（不管理）  30 没有防火墙  1 回收失败
-    local port=$1 proto=$2 kind rc=0
+fwClose() { # 与放行相同，分别处理运行时/永久及 IPv4/IPv6，不执行全局 firewalld reload
+    local port=$1 proto=$2 kind part rc changed=0 fail=0 parts=()
     kind=$(_fwKind)
     case "${kind}" in
-    none) return 30 ;;
-    nft) return 20 ;;
-    ufw)
-        _ufwHas "${port}" "${proto}" || return 10
-        ufw delete allow "${port}/${proto}" >/dev/null 2>&1
-        _ufwHas "${port}" "${proto}" && return 1
-        ;;
-    firewalld)
-        firewall-cmd --permanent --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 || return 10
-        firewall-cmd --permanent --zone=public --remove-port="${port//:/-}/${proto}" >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-        firewall-cmd --permanent --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 && return 1
-        ;;
-    iptables)
-        iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null || rc=10
-        while iptables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; do :; done
-        command -v ip6tables >/dev/null 2>&1 && while ip6tables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; do :; done
-        iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null && return 1
-        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
-        ;;
+    none) return 30 ;; nft) return 20 ;;
+    ufw) parts=(v4 v6) ;; firewalld) parts=(runtime permanent) ;; iptables) parts=(v4 v6) ;;
+    *) return 1 ;;
     esac
-    return "${rc}"
+    for part in "${parts[@]}"; do
+        _fwQuery "${kind}" "${part}" "${port}" "${proto}"; rc=$?
+        ((rc == 1)) && continue
+        if ((rc != 0)); then
+            [[ "${kind}:${part}" == iptables:v6 ]] && ! _fwHasGlobalIPv6 && continue
+            fail=1; continue
+        fi
+        changed=1
+        _fwDelete "${kind}" "${part}" "${port}" "${proto}" || fail=1
+    done
+    if [[ "${kind}" == iptables ]] && ((changed)); then _fwSave || fail=1; fi
+    ((fail)) && return 1
+    ((changed)) && return 0
+    return 10
 }
 
-# 把"期望端口"与"已放行端口"做差，打印需要新增/回收的项
-# fwDiff <旧state.json> <新state.json> <add|remove>
-fwDiff() {
+# 把期望端口与旧 state 做差。
+fwDiff() { # <旧 state> <新 state> <add|remove>
     local old=$1 new=$2 mode=$3 tmpo tmpn
     tmpo=$(mktemp "${ATR_TMP:-/tmp}/fw.XXXXXX") || return 1
-    tmpn=$(mktemp "${ATR_TMP:-/tmp}/fw.XXXXXX") || return 1
+    tmpn=$(mktemp "${ATR_TMP:-/tmp}/fw.XXXXXX") || { rm -f "${tmpo}"; return 1; }
     [[ -s "${old}" ]] && desiredFirewallPorts "${old}" | sort -u >"${tmpo}"
     desiredFirewallPorts "${new}" | sort -u >"${tmpn}"
-    if [[ "${mode}" == "add" ]]; then comm -13 "${tmpo}" "${tmpn}"; else comm -23 "${tmpo}" "${tmpn}"; fi
+    if [[ "${mode}" == add ]]; then comm -13 "${tmpo}" "${tmpn}"; else comm -23 "${tmpo}" "${tmpn}"; fi
     rm -f "${tmpo}" "${tmpn}"
 }
 
-# 放行 / 回收一组端口。open: 有一项放行失败（识别到 ufw / firewalld / iptables 却放行不了: 环境异常，配置生效也连不上）就返回 1，
-# 调用方回滚；本次新建的规则追加到 FW_CREATED，回滚时只删这些（管理员原有的规则不动）。没有防火墙时什么都不说；
-# nftables 默认拒绝不在自动放行的支持范围内: 不算失败，给出可以直接执行的命令。close: 只提示，不返回失败（配置本身已经生效）
-FW_CREATED=""
-fwApplyList() { # fwApplyList <open|close>  (stdin: "proto port" 每行)
+fwApplyList() { # <open|close>，失败返回非零；只有已核实的结果才显示成功
     local action=$1 proto port rc fail=0 kind manual=()
     kind=$(_fwKind)
     while read -r proto port; do
         [[ -z "${port}" ]] && continue
         rc=0
-        if [[ "${action}" == "open" ]]; then
+        if [[ "${action}" == open ]]; then
             fwOpen "${port}" "${proto}" || rc=$?
             case "${rc}" in
-            0)
-                echoContent green " ---> 已放行 ${proto}/${port}"
-                FW_CREATED+="${proto} ${port}"$'\n'
-                ;;
+            0) echoContent green " ---> 已放行 ${proto}/${port}" ;;
             10) echoContent green " ---> 防火墙原本就放行了 ${proto}/${port}" ;;
             20) manual+=("$(_fwManualCmd nft open "${port}" "${proto}")") ;;
             30) ;;
-            *)
-                echoContent red " ---> 未能自动放行 ${proto}/${port}（${kind} 返回失败，或放行后查不到这条规则）。可以手动执行: $(_fwManualCmd "${kind}" open "${port}" "${proto}")"
-                fail=1
-                ;;
+            *) echoContent red " ---> 未能自动放行 ${proto}/${port}（${kind}）；请检查日志或手动处理"; fail=1 ;;
             esac
         else
             fwClose "${port}" "${proto}" || rc=$?
@@ -3301,24 +3461,17 @@ fwApplyList() { # fwApplyList <open|close>  (stdin: "proto port" 每行)
             0) echoContent yellow " ---> 已回收 ${proto}/${port}" ;;
             10 | 30) ;;
             20) manual+=("$(_fwManualCmd nft close "${port}" "${proto}")") ;;
-            *) echoContent red " ---> 未能回收 ${proto}/${port} 的放行规则，请手动执行: $(_fwManualCmd "${kind}" close "${port}" "${proto}")" ;;
+            *) echoContent red " ---> 未能完整回收 ${proto}/${port} 的放行规则（${kind}），请手动检查"; fail=1 ;;
             esac
         fi
     done
     if ((${#manual[@]})); then
-        if [[ "${action}" == "open" ]]; then
-            echoContent yellow " ---> 检测到 nftables 默认拒绝策略（$(_nftDropInput)），本脚本不支持自动放行（配置照常生效），请手动执行:"
-        else
-            echoContent yellow " ---> nftables 由你自己管理:"
-        fi
+        echoContent yellow " ---> nftables 由你自己管理（配置照常生效），请确认下面的规则:"
         printf '      %s\n' "${manual[@]}"
     fi
-    if ((fail)); then
-        echoContent yellow "      如果防火墙由你自己管理，可以用 ATR_SKIP_FIREWALL=1 运行脚本，跳过自动放行"
-        return 1
-    fi
-    return 0
+    return "${fail}"
 }
+
 
 # ----------------------------- 备份 / 回滚 -----------------------------------
 # 受事务管理的文件
@@ -3329,6 +3482,7 @@ _txnFiles() {
     echo "${ATR_SYSTEMD_DIR}/${SB_UNIT}.service"
     echo "${ATR_SYSTEMD_DIR}/${XRAY_UNIT}.service"
     echo "${ATR_SYSTEMD_DIR}/${NGX_UNIT}.service"
+    echo "${ATR_SYSTEMD_DIR}/${TLS_RECOVERY_UNIT}.service"
     echo "${NGX_CONF}"
     local f
     for f in "${NGX_CONFD}"/atr_*.conf; do [[ -e "${f}" ]] && echo "${f}"; done
@@ -3440,13 +3594,14 @@ pruneBackups() { # 只保留最近 10 份（目录名是时间戳，glob 展开�
 
 # 若上次事务在落盘途中被中断（.txn 仍存在），自动从备份恢复
 recoverIfNeeded() {
+    recoverTLSIfNeeded || return 1
     [[ -e "${TXN_MARK}" || -L "${TXN_MARK}" ]] || return 0
     local bdir rc=0
     lockAcquire || return 1
     if [[ -e "${TXN_MARK}" || -L "${TXN_MARK}" ]]; then
         bdir=$(cat "${TXN_MARK}" 2>/dev/null) || rc=1
         echoContent yellow "\n ---> 检测到上次操作未完成，正在从备份恢复: ${bdir}"
-        if ((rc == 0)) && [[ -d "${bdir}" ]] && restoreFromBackup "${bdir}"; then
+        if ((rc == 0)) && [[ -d "${bdir}" ]] && restoreFromBackup "${bdir}" && fwRollbackJournal "${bdir}/firewall.undo"; then
             SB_CHANGED=1
             X_CHANGED=1
             if ! applyServices "${ATR_STATE}" force || ! verifyRuntime "${ATR_STATE}"; then
@@ -3471,6 +3626,10 @@ recoverIfNeeded() {
 # 放弃未完成的事务（atr recover --abandon）: 不再自动恢复，事务标记改名归档，备份目录原样保留。
 # 之后以磁盘上现有的配置为准——它可能是变更前、变更后或恢复到一半的状态，所以必须由管理员确认
 abandonTransaction() {
+    if [[ -e "${TLS_TXN_MARK}" || -L "${TLS_TXN_MARK}" ]]; then
+        echoContent red " ---> 证书事务必须先恢复，不支持放弃；请执行 ${ATR_CMD} recover"
+        return 1
+    fi
     local bdir arch
     if [[ ! -e "${TXN_MARK}" && ! -L "${TXN_MARK}" ]]; then
         echoContent green " ---> 没有未完成的事务"
@@ -4014,6 +4173,8 @@ egressPublicStaleNotice() {
 
 applyStaged() {
     local why=${1:-变更} ts stage bdir st oldst errs core
+    # Bash 动态作用域：fwOpen 的记录只属于本次事务，嵌套调用也不会污染外层。
+    local FW_CREATED="" FW_JOURNAL_FILE="" fwCleanupFailed=0
     [[ -n "${NEW_STATE}" ]] || {
         echoContent red " ---> 内部错误: 没有待应用的状态"
         return 1
@@ -4081,14 +4242,14 @@ applyStaged() {
     fi
 
     # 5) 备份 + 事务标记（崩溃后可恢复）。备份和标记没有确认写成功之前不能动 live 文件，否则之后失败就没有可恢复的依据
-    bdir="${BACKUP_DIR}/${ts}"
+    bdir=$(mktemp -d "${BACKUP_DIR}/${ts}.XXXXXX") || { rm -rf "${stage}"; lockRelease; return 1; }
     if ! backupLive "${bdir}"; then
         echoContent red " ---> 无法完整备份当前配置（磁盘空间或权限问题？）。为保证随时可以回滚，本次没有做任何改动"
         rm -rf "${bdir}" "${stage}"
         lockRelease
         return 1
     fi
-    if ! { printf '%s' "${bdir}" >"${TXN_MARK}" && [[ "$(cat "${TXN_MARK}" 2>/dev/null)" == "${bdir}" ]]; }; then
+    if ! { printf '%s' "${bdir}" | atomicWrite "${TXN_MARK}" 600 && [[ "$(cat "${TXN_MARK}" 2>/dev/null)" == "${bdir}" ]] && sync -f "${ATR_HOME}"; }; then
         echoContent red " ---> 无法写入事务标记 ${TXN_MARK}。本次没有做任何改动"
         rm -f "${TXN_MARK}" 2>/dev/null
         rm -rf "${bdir}" "${stage}"
@@ -4097,11 +4258,12 @@ applyStaged() {
     fi
     oldst="${bdir}/files/$(printf '%s' "${ATR_STATE}" | sed 's#/#%#g')"
     [[ -f "${oldst}" ]] || oldst=""
+    FW_JOURNAL_FILE="${bdir}/firewall.undo"
 
     # 6) 判断各核心配置是否有变化（无变化则不重启）
     SB_CHANGED=1
     X_CHANGED=1
-    if [[ -n "${oldst}" ]]; then
+    if [[ -n "${oldst}" && "$(jq -r '.tls.cert_sha256 // ""' "${oldst}")" == "$(jq -r '.tls.cert_sha256 // ""' "${st}")" ]]; then
         cmp -s "${stage}/sing-box/config.json" "${SB_CONF}" 2>/dev/null && SB_CHANGED=0
         cmp -s "${stage}/xray/config.json" "${XRAY_CONF}" 2>/dev/null && X_CHANGED=0
     fi
@@ -4113,7 +4275,6 @@ applyStaged() {
         failWhy="配置文件没能写入（磁盘已满、只读文件系统或权限问题？）"
     else
         addList=$(fwDiff "${oldst}" "${st}" add)
-        FW_CREATED=""
         if [[ -n "${addList}" ]] && ! fwApplyList open <<<"${addList}"; then
             failWhy="防火墙放行失败（配置即使生效，客户端也连不上）"
         else
@@ -4128,7 +4289,7 @@ applyStaged() {
     if [[ -n "${failWhy}" ]]; then
         echoContent red "\n ---> ${failWhy}，正在自动回滚到变更前的状态…"
         restoreFromBackup "${bdir}" || restored=0
-        [[ -n "${FW_CREATED}" ]] && fwApplyList close <<<"${FW_CREATED}" # 只回收本次新建的规则
+        fwRollbackJournal "${FW_JOURNAL_FILE}" || restored=0
         SB_CHANGED=1
         X_CHANGED=1
         if ((restored)); then
@@ -4156,7 +4317,7 @@ applyStaged() {
     # 10) 成功: 回收不再需要的端口、清理标记、保留备份
     local delList prc=0
     delList=$(fwDiff "${oldst}" "${st}" remove)
-    [[ -n "${delList}" ]] && fwApplyList close <<<"${delList}"
+    if [[ -n "${delList}" ]] && ! fwApplyList close <<<"${delList}"; then fwCleanupFailed=1; fi
     rm -f "${TXN_MARK}"
     if [[ -e "${TXN_MARK}" ]]; then
         # 标记留着，下次运行会把它当作"上次操作未完成"并回滚到旧配置——必须明说，不能报成功
@@ -4181,6 +4342,10 @@ applyStaged() {
         echoContent red " ---> 配置已写入，但「撤销未完成」：已发布的订阅目录里仍留有应被撤销的文件，nginx 也没能停止（见上面的提示）。请先处理再继续使用订阅"
         atrLog "APPLIED but subscription revocation incomplete (${why}) rc=${prc}"
         return 3
+    fi
+    if ((fwCleanupFailed)); then
+        echoContent red " ---> 配置已生效，但旧防火墙规则没有完整回收；请按上面的提示手动处理，未报告全部成功"
+        return 1
     fi
     echoContent green " ---> 配置已生效（${why}）"
     return 0
@@ -7986,7 +8151,7 @@ uninstallAll() {
     fi
     hopRulesRemoveAll
     local u
-    for u in "${SB_UNIT}" "${XRAY_UNIT}" "${NGX_UNIT}" "${HOP_UNIT}"; do
+    for u in "${SB_UNIT}" "${XRAY_UNIT}" "${NGX_UNIT}" "${HOP_UNIT}" "${TLS_RECOVERY_UNIT}"; do
         serviceActive "${u}" && serviceStop "${u}"
         serviceDisable "${u}"
         rm -f "${ATR_SYSTEMD_DIR}/${u}.service"
@@ -8046,7 +8211,7 @@ EOF
 cliRecover() { # cliRecover [--abandon]
     case "${1:-}" in
     "")
-        if [[ ! -e "${TXN_MARK}" && ! -L "${TXN_MARK}" ]]; then
+        if [[ ! -e "${TXN_MARK}" && ! -L "${TXN_MARK}" && ! -e "${TLS_TXN_MARK}" && ! -L "${TLS_TXN_MARK}" ]]; then
             echoContent green " ---> 没有未完成的事务"
         else
             recoverIfNeeded || return 1
@@ -8266,6 +8431,12 @@ main() {
     help | -h | --help)
         usage
         return 0
+        ;;
+    recover-tls)
+        # 开机依赖单元：只恢复证书，不启动服务、不迁移订阅，避免服务依赖递归。
+        checkRoot
+        recoverTLSIfNeeded
+        return $?
         ;;
     esac
     # 先校验命令是否合法: 输错命令不应该产生任何副作用（装 atr、建目录、装依赖）
