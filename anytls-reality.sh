@@ -38,7 +38,14 @@ export LANG=en_US.UTF-8
 #   不再依赖进程内的标记：发布失败、_swapSubDir 两次 mv 之间被中断、开机任务只撤下没发布，下一次运行 atr 都会自动补发。
 # - 清空/删除之后的复查本身失败（find 出错）按"没删干净"处理，走停止 nginx 的兜底，不再当成已经清空。
 # - 哪些协议不能用 sing-box 自检由协议表声明（selfcheck:false）；其余协议拿不到自检用的客户端配置时按检测失败处理，不再降级为"未验证"。
-ATR_VERSION="v1.2.5"
+# v1.2.6（真机审计 2026-10-25）：
+# - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
+# - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
+# - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
+ATR_VERSION="v1.2.6"
+# 管理员在环境里指定的本机公网地址（订阅链接用它；出口访问模式也直接用它，不再联网探测）。只认启动时的环境变量，
+# 运行中 ATR_PUBLIC_IP 会被当作缓存改写，不能用来判断"管理员是否指定过"
+ATR_PUBLIC_IP_ENV="${ATR_PUBLIC_IP:-}"
 ATR_PROJECT_NAME="anytls-reality"
 
 # ----------------------------- 路径与常量 -----------------------------------
@@ -1070,6 +1077,10 @@ def netof($id): if (udp_ids | index($id)) != null then "udp" else "tcp" end;
      then "Socks5 入站的来源 IP 白名单为空（空白名单等于允许所有来源）；请在 11.分流工具→Socks5入站→3 里重新设置" else empty end),
     # 出口访问模式只能是 空(未选择) / public / full
     ((.egress.mode // "") as $m | if (["", "public", "full"] | index($m)) != null then empty else "出口访问模式不合法: \($m)" end),
+    # 出口访问模式里的本机地址（探测到的公网地址、管理员手动补充的地址）只能是 IP / CIDR
+    ([(.egress.public_ips // [])[], (.egress.extra_ips // [])[]][]
+       | select((type != "string") or ((test("^([0-9]{1,3}\\.){3}[0-9]{1,3}(/[0-9]{1,2})?$") or test("^[0-9A-Fa-f:]+(/[0-9]{1,3})?$")) | not))
+       | "出口访问模式的本机地址不合法: \(.)"),
     # 对等密钥会被写进 nginx 配置作为路径片段：只能是空(未启用)或 16-64 位字母数字
     ((.nginx.subscribe.peer_key // "") as $k | if $k == "" or ($k | test("^[A-Za-z0-9]{16,64}$")) then empty else "对等密钥格式不合法（需要 16-64 位字母数字）" end)
   ]
@@ -1420,6 +1431,7 @@ ensureCore() {
     while true; do
         if tag=$(resolveLatestVersion "${core}"); then
             echoContent green " ---> 最新稳定版本: ${tag}（来源: $(lastResolveSource)）"
+            warnKnownCoreIssue "${core}" "${tag}"
             if installCoreBinary "${core}" "${tag}"; then
                 [[ "${core}" == "xray" ]] && ensureXrayGeo
                 return 0
@@ -1454,6 +1466,15 @@ _restorePreviousCore() {
     bin=$(coreBin "$1")
     [[ -f "${bin}.prev" ]] || { echoContent red " ---> 没有旧内核备份可恢复"; return 1; }
     atomicWrite "${bin}" 755 <"${bin}.prev" && cmp -s "${bin}.prev" "${bin}"
+}
+# 已知有问题的内核版本组合（只提示，不阻止）。按版本号写死的条目不会过时出错，最多只是不再相关。每行: <core>|<tag>|<说明>
+ATR_KNOWN_CORE_ISSUES="xray|v26.10.21|作为 Reality 服务端时与 sing-box 1.14.x 客户端握手失败（reality verification failed；2026-10 在 sing-box 1.14.2、1.14.4 上实测，26.3.27 正常）。需要 Xray 承载 Reality 时，可以用 ATR_XRAY_VERSION=v26.3.27 固定版本"
+warnKnownCoreIssue() { # warnKnownCoreIssue <core> <tag>
+    local c t msg
+    while IFS='|' read -r c t msg; do
+        [[ -n "${c}" && "${c}" == "$1" && "${t}" == "v${2#v}" ]] && echoContent yellow " ---> 已知问题: $(coreLabel "$1") ${t} ${msg}"
+    done <<<"${ATR_KNOWN_CORE_ISSUES}"
+    return 0
 }
 # 换内核后的互通检查: 用本机 sing-box 作客户端，对该核心承载的协议逐个做回环握手（selfCheckProtocol）。
 # 返回 1 = 至少一个协议握手失败（含生成自检配置出错），调用方恢复旧内核。无法自动验证的协议（本机没有 sing-box，或协议表声明
@@ -1551,6 +1572,7 @@ upgradeCore() {
         want=$(resolveLatestVersion "${core}") || return 1
         cur=$(coreVersion "${core}")
         echoContent green " ---> 当前版本: ${cur:-未安装}   候选稳定版: ${want}（来源: $(lastResolveSource)）"
+        warnKnownCoreIssue "${core}" "${want}"
         noteUncheckableProtocols "${core}"
         if [[ -n "${cur}" && "v${cur#v}" == "${want}" ]]; then
             confirm "当前版本与候选相同，是否重新安装？" n || return 0
@@ -1595,6 +1617,7 @@ rollbackCore() {
         echoContent red " ---> 输入有误"
         return 1
     fi
+    warnKnownCoreIssue "${core}" "${chosen}"
     noteUncheckableProtocols "${core}"
     confirm "回退版本为 ${chosen}，是否继续？" n || return 0
     upgradeCore "${core}" "${chosen}"
@@ -1773,15 +1796,55 @@ tlsReusable() { # tlsReusable <域名>
 
 # ----------------------------- 导入已有证书 ----------------------------------
 tlsImportCustom() { # tlsImportCustom <域名> <crt 路径> <key 路径>
-    local domain=$1 crt=$2 key=$3
+    local domain=$1 crt=$2 key=$3 st fail="" hadCrt=0 hadKey=0 f
+    local dcrt="${TLS_DIR}/${domain}.crt" dkey="${TLS_DIR}/${domain}.key"
     if ! tlsValidate "${crt}" "${key}" "${domain}"; then
         echoContent red " ---> 证书不可用: ${TLS_ERR}"
         return 1
     fi
-    mkdir -p "${TLS_DIR}"
-    install -m 644 "${crt}" "${TLS_DIR}/${domain}.crt"
-    install -m 600 "${key}" "${TLS_DIR}/${domain}.key"
-    echoContent green " ---> 已导入证书（有效期剩余 $(tlsDaysLeft "${TLS_DIR}/${domain}.crt") 天）"
+    mkdir -p "${TLS_DIR}" || return 1
+    lockAcquire || return 1
+    st=$(mktemp -d "${TLS_DIR}/.import.XXXXXX") || {
+        lockRelease
+        echoContent red " ---> 无法创建证书暂存目录，没有导入"
+        return 1
+    }
+    [[ -e "${dcrt}" ]] && hadCrt=1
+    [[ -e "${dkey}" ]] && hadKey=1
+    # 1) 新的一对先复制进私有暂存目录并重新校验（复制本身也可能失败或写不全）；2) 现有的文件留底；
+    # 3) 逐个原子替换，替换后再校验线上这一对。任何一步失败都恢复原来的文件（原来没有的就删掉新写的），返回非零
+    if ! { atomicWrite "${st}/new.crt" 644 <"${crt}" && atomicWrite "${st}/new.key" 600 <"${key}" && tlsValidate "${st}/new.crt" "${st}/new.key" "${domain}"; }; then
+        fail="新证书复制到暂存目录失败${TLS_ERR:+（${TLS_ERR}）}，原来的证书没有改动"
+    elif ! { ((hadCrt == 0)) || atomicWrite "${st}/old.crt" 644 <"${dcrt}"; } || ! { ((hadKey == 0)) || atomicWrite "${st}/old.key" 600 <"${dkey}"; }; then
+        fail="无法备份现有的证书，没有导入"
+    elif ! { atomicWrite "${dkey}" 600 <"${st}/new.key" && atomicWrite "${dcrt}" 644 <"${st}/new.crt" && tlsValidate "${dcrt}" "${dkey}" "${domain}"; }; then
+        fail="替换证书失败${TLS_ERR:+（${TLS_ERR}）}"
+        local ok=1
+        for f in crt key; do
+            local live="${TLS_DIR}/${domain}.${f}" had=${hadCrt} mode=644
+            [[ "${f}" == key ]] && had=${hadKey} && mode=600
+            if ((had)); then
+                { atomicWrite "${live}" "${mode}" <"${st}/old.${f}" && cmp -s "${st}/old.${f}" "${live}"; } || ok=0
+            else
+                rm -f "${live}"
+                [[ -e "${live}" ]] && ok=0
+            fi
+        done
+        if ((ok)); then
+            fail+="，已恢复原来的证书"
+        else
+            lockRelease
+            echoContent red " ---> ${fail}，而且没能恢复原来的证书！请检查 ${TLS_DIR}（原来的文件在 ${st}）"
+            return 1
+        fi
+    fi
+    rm -rf "${st}"
+    lockRelease
+    if [[ -n "${fail}" ]]; then
+        echoContent red " ---> ${fail}"
+        return 1
+    fi
+    echoContent green " ---> 已导入证书（有效期剩余 $(tlsDaysLeft "${dcrt}") 天）"
     echoContent yellow " ---> 自定义证书不会自动续签，请在到期前更换"
     return 0
 }
@@ -2305,9 +2368,11 @@ stagedSetReality() {
 
 # 「公网出口」模式下，客户端不得访问的地址段（两个核心共用）: 回环、私网、CGNAT、链路本地(含云厂商元数据 169.254.169.254)、
 # 组播/保留、IPv4 映射的 IPv6（::ffff:0:0/96 里的 IPv4 地址不会被 IPv4 段匹配到，必须单独列出）、ULA、IPv6 链路本地。
-# 不含 NAT64(64:ff9b::/96)，否则会让纯 IPv6 主机无法经 NAT64 访问 IPv4 网站。再加上 state.egress.local_ips（本机所有网卡地址）。
+# 不含 NAT64(64:ff9b::/96)，否则会让纯 IPv6 主机无法经 NAT64 访问 IPv4 网站。再加上本机自己的地址 egress_self:
+# local_ips（网卡地址，每次应用配置时刷新）、public_ips（探测到的公网地址: NAT / 1:1 映射时它不在任何网卡上）、extra_ips（管理员手动补充）。
 read -r -d '' JQ_EGRESS_DEF <<'EOF'
 def egress_cidrs: ["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","::ffff:0:0/96","100::/64","fc00::/7","fe80::/10","ff00::/8"];
+def egress_self: (($S.egress.local_ips // []) + ($S.egress.public_ips // []) + ($S.egress.extra_ips // [])) | unique;
 EOF
 
 # ----------------------------- sing-box --------------------------------------
@@ -2406,10 +2471,17 @@ read -r -d '' JQ_SINGBOX <<'EOF'
                     peers: [{address: "162.159.192.1", port: 2408, public_key: $W.public_key, reserved: $W.reserved, allowed_ips: ["0.0.0.0/0", "::/0"]}]}] else [] end)),
       route: {
         default_domain_resolver: "local",
-        rules: ([{action: "sniff"}, {protocol: "dns", action: "hijack-dns"}]
+        # Socks5 入站的来源白名单最先检查（在嗅探和 DNS 劫持之前）: 否则来自非白名单来源的 DNS 请求会先被 hijack-dns 处理，
+        # 绕过来源限制。invert 只写在子规则上，只取反"来源在白名单里"这一项；白名单为空时整个 Socks5 入站直接拒绝。
+        # 末尾那条 Socks5 reject 保留作兜底
+        rules: ((if $haveS5in then
+                   (if (($R.socks5_in.allow_ips // []) | length) == 0 then [{inbound: ["socks5_inbound"], action: "reject"}]
+                    else [{type: "logical", mode: "and", rules: [{inbound: ["socks5_inbound"]}, {source_ip_cidr: $R.socks5_in.allow_ips, invert: true}], action: "reject"}] end)
+                 else [] end)
+                + [{action: "sniff"}, {protocol: "dns", action: "hijack-dns"}]
                 # 出口访问模式 = 公网出口: 先把域名解析成 IP（resolve 只补充目的地址，域名规则照常匹配），再拒绝一切指向
                 # 回环/私网/链路本地/本机自身地址的连接。必须排在所有放行规则之前，Socks5 入站的放行规则也不例外
-                + (if ($S.egress.mode // "") == "public" then [{action: "resolve"}, {ip_cidr: (egress_cidrs + ($S.egress.local_ips // [])), action: "reject"}] else [] end)
+                + (if ($S.egress.mode // "") == "public" then [{action: "resolve"}, {ip_cidr: (egress_cidrs + egress_self), action: "reject"}] else [] end)
                 # Socks5 入站: 仅允许指定来源 IP 访问指定目标，其余一律拒绝（它是明文代理，绝不能对外开放）
                 + (if $haveS5in then
                      ((if ($R.socks5_in.ip_strategy // "") != "" then [{inbound: "socks5_inbound", action: "resolve", strategy: $R.socks5_in.ip_strategy}] else [] end)
@@ -2471,7 +2543,7 @@ read -r -d '' JQ_XRAY <<'EOF'
   # 光靠路由规则会被绕过。所以公网出口模式下还要做两件事: 1) 用 DNS 服务器自身的 unexpectedIPs 把落在这些地址段的解析结果丢掉（路由检查和 freedom 的再解析都经过它，拨号只可能用到通过过滤的地址）；
   # 2) 直连出站改用 ForceIP: 解析失败就直接失败，绝不退回去按域名拨号（退回去就是交给系统解析器再解析一次，等于绕过了过滤）。
   def xpublic: ($S.egress.mode // "") == "public";
-  def egress_xip: (egress_cidrs - ["::ffff:0:0/96"]) + ($S.egress.local_ips // []);
+  def egress_xip: (egress_cidrs - ["::ffff:0:0/96"]) + egress_self;
   def xdns($a): ($a | if type == "object" then . else {address: .} end)
       | if xpublic then . + {unexpectedIPs: ((.unexpectedIPs // []) + egress_xip | unique)} else . end;
   def egress_x: if xpublic then
@@ -2906,15 +2978,18 @@ After=network.target nss-lookup.target
 [Service]
 User=root
 WorkingDirectory=${SB_DIR}
-# 只保留服务端真正需要的能力。安装目录（脚本、二进制、配置、state）对服务只读：服务被攻陷也改不了管理脚本，
-# 不会借管理员运行 atr、cron 或证书续签钩子在沙箱之外执行被篡改的内容
+# 只保留服务端真正需要的能力。整个系统（含安装目录: 脚本、二进制、配置、state）对服务只读（ProtectSystem=strict），
+# 也不能创建 Unix 套接字（RestrictAddressFamilies），所以在服务自身的沙箱里改不了管理脚本，连不上 systemd / D-Bus 去启动沙箱之外的任务，
+# 也写不了 cron 等系统目录。它仍以 root 运行、能读取宿主上的大多数文件: 内核被攻陷仍应按已获得 root 权限处理。
+# sing-box 需要 AF_NETLINK（监控网卡，2026-10 strace 实测），两个内核都不需要 AF_UNIX
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ProtectSystem=full
+ProtectSystem=strict
 ReadOnlyPaths=${ATR_HOME}
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -2943,13 +3018,15 @@ After=network.target nss-lookup.target
 User=root
 WorkingDirectory=${XRAY_DIR}
 Environment="XRAY_LOCATION_ASSET=${XRAY_DIR}"
+# 沙箱与 sing-box 相同（见上面的说明）；Xray 只用 AF_INET / AF_INET6
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ProtectSystem=full
+ProtectSystem=strict
 ReadOnlyPaths=${ATR_HOME}
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -3073,52 +3150,112 @@ _fwKind() {
         echo firewalld
     elif command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)'; then
         echo iptables
+    elif command -v nft >/dev/null 2>&1 && _nftDropInput >/dev/null; then
+        echo nft
     else
         echo none
     fi
 }
-
-# fwOpen <端口|范围a:b> <tcp|udp>
-fwOpen() {
-    local port=$1 proto=$2 kind
-    kind=$(_fwKind)
+# 原生 nftables 里默认拒绝的 input 链: 打印 "<族> <表> <链>"（第一个），没有就返回 1。本脚本不管理 nftables 规则（另建一张表放行
+# 抵消不了别的表的 drop，要放行就得改管理员自己的规则集），只用来准确提示。iptables-nft 的规则在上面已经按 iptables 处理
+_nftDropInput() {
+    nft list ruleset 2>/dev/null | awk '
+        $1 == "table" { fam = $2; tbl = $3 }
+        $1 == "chain" { ch = $2 }
+        /hook input/ && /policy drop/ { print fam, tbl, ch; found = 1; exit }
+        END { exit !found }'
+}
+# ufw 里已经有放行这个端口的规则吗（以 ufw status 为准，不只看 allow / delete 的返回值）
+_ufwHas() { # _ufwHas <端口|a:b> <tcp|udp>
+    ufw status 2>/dev/null | grep -qE "^${1}/${2}[[:space:]]+ALLOW"
+}
+# 给管理员的手动命令
+_fwManualCmd() { # _fwManualCmd <ufw|firewalld|iptables|nft> <open|close> <端口|a:b> <tcp|udp>
+    local kind=$1 act=$2 port=$3 proto=$4 fam tbl ch
     case "${kind}" in
-    ufw) ufw allow "${port}/${proto}" >/dev/null 2>&1 ;;
-    firewalld)
-        firewall-cmd --permanent --zone=public --add-port="${port//:/-}/${proto}" >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-        ;;
-    iptables)
-        if ! iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; then
-            iptables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null
-        fi
-        command -v ip6tables >/dev/null 2>&1 && ip6tables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1
+    ufw) if [[ "${act}" == open ]]; then echo "ufw allow ${port}/${proto}"; else echo "ufw delete allow ${port}/${proto}"; fi ;;
+    firewalld) echo "firewall-cmd --permanent --zone=public --$([[ "${act}" == open ]] && echo add || echo remove)-port=${port//:/-}/${proto} && firewall-cmd --reload" ;;
+    iptables) echo "iptables -$([[ "${act}" == open ]] && echo I || echo D) INPUT -p ${proto} --dport ${port} -j ACCEPT" ;;
+    nft)
+        read -r fam tbl ch <<<"$(_nftDropInput)"
+        if [[ "${act}" == open ]]; then
+            echo "nft insert rule ${fam:-inet} ${tbl:-filter} ${ch:-input} ${proto} dport ${port//:/-} accept"
         else
-            echoContent yellow " ---> 提示: 已用 iptables 放行 ${port}/${proto}，但系统未安装 netfilter-persistent，重启后规则可能丢失"
+            echo "（如果之前手动加过）从 nftables 规则集里删除 ${proto} dport ${port//:/-} 的放行规则"
         fi
         ;;
     esac
-    return 0
 }
 
-fwClose() {
-    local port=$1 proto=$2 kind
+# fwOpen <端口|范围a:b> <tcp|udp>  —— 0 已放行（本次新建）  10 规则原本就有  20 nftables 默认拒绝（本脚本不支持自动放行）
+#   30 没有需要处理的防火墙  1 放行失败（命令返回非零，或放行后复核不到规则）
+fwOpen() {
+    local port=$1 proto=$2 kind rc=0
     kind=$(_fwKind)
     case "${kind}" in
-    ufw) ufw delete allow "${port}/${proto}" >/dev/null 2>&1 ;;
+    none) return 30 ;;
+    nft) return 20 ;;
+    ufw)
+        _ufwHas "${port}" "${proto}" && return 10
+        ufw allow "${port}/${proto}" >/dev/null 2>&1 || return 1
+        _ufwHas "${port}" "${proto}" || return 1
+        ;;
     firewalld)
-        firewall-cmd --permanent --zone=public --remove-port="${port//:/-}/${proto}" >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
+        firewall-cmd --permanent --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 && return 10
+        firewall-cmd --permanent --zone=public --add-port="${port//:/-}/${proto}" >/dev/null 2>&1 || return 1
+        firewall-cmd --reload >/dev/null 2>&1 || return 1
+        firewall-cmd --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 || return 1
         ;;
     iptables)
+        if iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; then
+            rc=10
+        else
+            iptables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null || return 1
+            iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null || return 1
+        fi
+        # IPv6: 先查重再插入（以前每放行一次就多一条）；没有 IPv6 的机器上 ip6tables 本来就可能报错，所以只提示、不算放行失败
+        if command -v ip6tables >/dev/null 2>&1 && ! ip6tables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; then
+            ip6tables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null ||
+                echoContent yellow " ---> 提示: ip6tables 没能放行 ${proto}/${port}（本机不用 IPv6 时可以忽略）"
+        fi
+        if ((rc == 0)); then
+            if command -v netfilter-persistent >/dev/null 2>&1; then
+                netfilter-persistent save >/dev/null 2>&1 || echoContent yellow " ---> 提示: netfilter-persistent 保存失败，重启后 ${proto}/${port} 的放行规则可能丢失"
+            else
+                echoContent yellow " ---> 提示: 已用 iptables 放行 ${port}/${proto}，但系统未安装 netfilter-persistent，重启后规则可能丢失"
+            fi
+        fi
+        ;;
+    esac
+    return "${rc}"
+}
+
+fwClose() { # fwClose <端口|范围> <tcp|udp>  —— 0 已回收  10 本来就没有  20 nftables（不管理）  30 没有防火墙  1 回收失败
+    local port=$1 proto=$2 kind rc=0
+    kind=$(_fwKind)
+    case "${kind}" in
+    none) return 30 ;;
+    nft) return 20 ;;
+    ufw)
+        _ufwHas "${port}" "${proto}" || return 10
+        ufw delete allow "${port}/${proto}" >/dev/null 2>&1
+        _ufwHas "${port}" "${proto}" && return 1
+        ;;
+    firewalld)
+        firewall-cmd --permanent --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 || return 10
+        firewall-cmd --permanent --zone=public --remove-port="${port//:/-}/${proto}" >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        firewall-cmd --permanent --zone=public --query-port="${port//:/-}/${proto}" >/dev/null 2>&1 && return 1
+        ;;
+    iptables)
+        iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null || rc=10
         while iptables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; do :; done
         command -v ip6tables >/dev/null 2>&1 && while ip6tables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null; do :; done
+        iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "atr:${proto}/${port}" -j ACCEPT 2>/dev/null && return 1
         command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
         ;;
     esac
-    return 0
+    return "${rc}"
 }
 
 # 把"期望端口"与"已放行端口"做差，打印需要新增/回收的项
@@ -3133,18 +3270,54 @@ fwDiff() {
     rm -f "${tmpo}" "${tmpn}"
 }
 
+# 放行 / 回收一组端口。open: 有一项放行失败（识别到 ufw / firewalld / iptables 却放行不了: 环境异常，配置生效也连不上）就返回 1，
+# 调用方回滚；本次新建的规则追加到 FW_CREATED，回滚时只删这些（管理员原有的规则不动）。没有防火墙时什么都不说；
+# nftables 默认拒绝不在自动放行的支持范围内: 不算失败，给出可以直接执行的命令。close: 只提示，不返回失败（配置本身已经生效）
+FW_CREATED=""
 fwApplyList() { # fwApplyList <open|close>  (stdin: "proto port" 每行)
-    local action=$1 proto port
+    local action=$1 proto port rc fail=0 kind manual=()
+    kind=$(_fwKind)
     while read -r proto port; do
         [[ -z "${port}" ]] && continue
+        rc=0
         if [[ "${action}" == "open" ]]; then
-            fwOpen "${port}" "${proto}"
-            echoContent green " ---> 已放行 ${proto}/${port}"
+            fwOpen "${port}" "${proto}" || rc=$?
+            case "${rc}" in
+            0)
+                echoContent green " ---> 已放行 ${proto}/${port}"
+                FW_CREATED+="${proto} ${port}"$'\n'
+                ;;
+            10) echoContent green " ---> 防火墙原本就放行了 ${proto}/${port}" ;;
+            20) manual+=("$(_fwManualCmd nft open "${port}" "${proto}")") ;;
+            30) ;;
+            *)
+                echoContent red " ---> 未能自动放行 ${proto}/${port}（${kind} 返回失败，或放行后查不到这条规则）。可以手动执行: $(_fwManualCmd "${kind}" open "${port}" "${proto}")"
+                fail=1
+                ;;
+            esac
         else
-            fwClose "${port}" "${proto}"
-            echoContent yellow " ---> 已回收 ${proto}/${port}"
+            fwClose "${port}" "${proto}" || rc=$?
+            case "${rc}" in
+            0) echoContent yellow " ---> 已回收 ${proto}/${port}" ;;
+            10 | 30) ;;
+            20) manual+=("$(_fwManualCmd nft close "${port}" "${proto}")") ;;
+            *) echoContent red " ---> 未能回收 ${proto}/${port} 的放行规则，请手动执行: $(_fwManualCmd "${kind}" close "${port}" "${proto}")" ;;
+            esac
         fi
     done
+    if ((${#manual[@]})); then
+        if [[ "${action}" == "open" ]]; then
+            echoContent yellow " ---> 检测到 nftables 默认拒绝策略（$(_nftDropInput)），本脚本不支持自动放行（配置照常生效），请手动执行:"
+        else
+            echoContent yellow " ---> nftables 由你自己管理:"
+        fi
+        printf '      %s\n' "${manual[@]}"
+    fi
+    if ((fail)); then
+        echoContent yellow "      如果防火墙由你自己管理，可以用 ATR_SKIP_FIREWALL=1 运行脚本，跳过自动放行"
+        return 1
+    fi
+    return 0
 }
 
 # ----------------------------- 备份 / 回滚 -----------------------------------
@@ -3690,18 +3863,30 @@ _pruneRevokedSubscription() {
     echoContent red " ---> 无法清除已被撤销的订阅文件（文件系统只读或没有权限？）"
     _closeSubscription
 }
-# 订阅已启用，但已发布的内容不完整吗？0 = 不完整（需要重新发布）。只看磁盘上的实际状态，不依赖任何进程内标记，
+# 订阅已启用，但已发布的内容不完整吗？0 = 不完整（需要重新发布）。按生成逻辑检查每个用户应有的全部类型，只看磁盘上的实际状态，不依赖任何进程内标记，
 # 所以发布失败、进程中断（包括 _swapSubDir 两次 mv 之间：目录不在，或之后被 mkdir -p 建成空目录）、开机任务只撤下没发布，
 # 下一次运行都会再识别出来。订阅或对等分享已关闭时不算不完整：修复检测不会重新打开分享
 _subscriptionIncomplete() {
     [[ "$(S '.nginx.subscribe.enabled')" == "true" ]] || return 1
-    local u t peer
+    local u t peer kind
     nginxSubLayoutCurrent || return 0
     peer=$(S '.nginx.subscribe.peer_key // ""')
     while IFS=$'\t' read -r u t; do
         [[ -n "${u}" ]] || continue
-        [[ -n "${t}" && -f "${SUB_DIR}/default/${t}" ]] || return 0
-        [[ -z "${peer}" || -f "${SUB_DIR}/peer/${u}/default" ]] || return 0
+        [[ -n "${t}" ]] || return 0
+        # 这四种每个用户都会生成（AnyTLS+Reality 这类 mihomo 不支持的协议只是不出现在 clashMeta 里，文件照样有）
+        for kind in default clashMeta clashMetaProfiles sing-box_profiles; do
+            [[ -f "${SUB_DIR}/${kind}/${t}" ]] || return 0
+        done
+        # sing-box 完整配置只在这个用户有 sing-box 能用的节点时生成，即已发布的 sing-box_profiles 不是空数组（bash 内建读取，不调外部命令）
+        if [[ "$(<"${SUB_DIR}/sing-box_profiles/${t}")" != "[]" ]]; then
+            [[ -f "${SUB_DIR}/sing-box/${t}" ]] || return 0
+        fi
+        if [[ -n "${peer}" ]]; then
+            for kind in default clashMeta sing-box_profiles; do
+                [[ -f "${SUB_DIR}/peer/${u}/${kind}" ]] || return 0
+            done
+        fi
     done < <(S '.users[]? | "\(.name)\t\(.sub_token // "")"')
     return 1
 }
@@ -3766,6 +3951,65 @@ egressLocalIPs() {
             echo "${a,,}/128"
         fi
     done <<<"${raw}" | sort -u | jq -R . | jq -sc .
+}
+
+# 本机的公网地址（NAT / 云厂商 1:1 映射时它不在任何网卡上，egressLocalIPs 看不到）。用 getPublicIP 探测（Cloudflare trace，
+# 取不到再试另外几个 HTTPS 服务），只接受合法 IP；打印 JSON 数组（/32、/128），一个都没探测到返回 1。会联网: 只在安装、
+# atr restart 和出口访问模式菜单这些低频时机调用，不在 applyStaged 里调用，也不要在持锁时调用
+egressDetectPublicIPs() {
+    local a out=()
+    if [[ -n "${ATR_PUBLIC_IP_ENV}" ]]; then # 管理员指定的地址优先，不联网
+        a=${ATR_PUBLIC_IP_ENV}
+        if isIPv4 "${a}"; then out+=("${a}/32"); elif isIPv6 "${a}"; then out+=("${a,,}/128"); fi
+        ((${#out[@]})) || return 1
+        printf '%s\n' "${out[@]}" | jq -R . | jq -sc 'unique'
+        return 0
+    fi
+    _PUBLIC_IP_CACHE_4=""
+    _PUBLIC_IP_CACHE_6=""
+    a=$(getPublicIP 4)
+    isIPv4 "${a}" && out+=("${a}/32")
+    a=$(getPublicIP 6)
+    isIPv6 "${a}" && out+=("${a,,}/128")
+    ((${#out[@]})) || return 1
+    printf '%s\n' "${out[@]}" | jq -R . | jq -sc 'unique'
+}
+egressDetectFailedHint() {
+    echoContent yellow " ---> 未能探测本机的公网地址（沿用上次的结果）。如果这台机器在 NAT 后面，公网地址不在网卡上，"
+    echoContent yellow "      请在 11.分流工具 → 6.出口访问模式 → 3 里手动补充（egress.extra_ips）"
+}
+EGRESS_CDN_NOTE="如果本机在 CDN/反代后面，或出站经过代理/隧道（例如系统级 WARP），探测值可能不是本机的公网地址，请在 11.分流工具 → 6 里用手动地址（egress.extra_ips）覆盖"
+EGRESS_PUBLIC_MAX_AGE=$((7 * 86400))
+# 把探测到的本机公网地址写进暂存状态（只在公网出口模式、且没有关闭自动探测时）。探测失败保留原来的值并提示手动补充，从不让调用方失败。
+# 在 stagedBegin 之后、applyStaged 之前调用（会联网，所以不要在持锁时调用）
+stagedRefreshEgressPublicIPs() {
+    [[ "$(stagedGet '.egress.mode // ""')" == "public" ]] || return 0
+    [[ "$(stagedGet '.egress.public_detect != false')" == "true" ]] || return 0 # 注意不能写 // true: jq 的 // 把 false 也当成空
+    local ips
+    if ips=$(egressDetectPublicIPs); then
+        stagedEdit --argjson ips "${ips}" --argjson t "$(date +%s)" '.egress.public_ips=$ips | .egress.public_ips_at=$t' || return 0
+        echoContent green " ---> 本机公网地址: $(jq -r 'join(", ")' <<<"${ips}")（公网出口模式会禁止客户端经节点访问它）"
+        echoContent yellow "      ${EGRESS_CDN_NOTE}"
+    else
+        egressDetectFailedHint
+    fi
+    return 0
+}
+# 公网出口模式下，本机公网地址超过 7 天没刷新（或从来没探测过）就提示一次（打开菜单、atr status 时）
+egressPublicStaleNotice() {
+    stateExists || return 0
+    [[ "$(S '.egress.mode // ""')" == "public" && "$(S '.egress.public_detect != false')" == "true" ]] || return 0
+    local at now
+    at=$(S '.egress.public_ips_at // 0')
+    [[ "${at}" =~ ^[0-9]+$ ]] || at=0
+    now=$(date +%s)
+    ((now - at > EGRESS_PUBLIC_MAX_AGE)) || return 0
+    if ((at == 0)); then
+        echoContent yellow "\n ---> 出口访问模式: 还没有探测过本机的公网地址（NAT 后的公网 IP 不在网卡上，探测后才能禁止客户端经节点访问它）"
+    else
+        echoContent yellow "\n ---> 出口访问模式: 本机公网地址上次探测是 $(((now - at) / 86400)) 天前"
+    fi
+    echoContent yellow "      执行 ${ATR_CMD} restart 刷新，或在 11.分流工具 → 6.出口访问模式 → 2 里重新探测"
 }
 
 applyStaged() {
@@ -3869,18 +4113,22 @@ applyStaged() {
         failWhy="配置文件没能写入（磁盘已满、只读文件系统或权限问题？）"
     else
         addList=$(fwDiff "${oldst}" "${st}" add)
-        [[ -n "${addList}" ]] && fwApplyList open <<<"${addList}"
-        echoContent green " ---> 应用配置并重启服务…"
-        if ! applyServices "${st}" || ! verifyRuntime "${st}"; then
-            failWhy="新配置运行异常"
-        elif ! _verifyCommitted "${stage}" "${st}"; then
-            failWhy="落盘的配置与候选内容不一致"
+        FW_CREATED=""
+        if [[ -n "${addList}" ]] && ! fwApplyList open <<<"${addList}"; then
+            failWhy="防火墙放行失败（配置即使生效，客户端也连不上）"
+        else
+            echoContent green " ---> 应用配置并重启服务…"
+            if ! applyServices "${st}" || ! verifyRuntime "${st}"; then
+                failWhy="新配置运行异常"
+            elif ! _verifyCommitted "${stage}" "${st}"; then
+                failWhy="落盘的配置与候选内容不一致"
+            fi
         fi
     fi
     if [[ -n "${failWhy}" ]]; then
         echoContent red "\n ---> ${failWhy}，正在自动回滚到变更前的状态…"
         restoreFromBackup "${bdir}" || restored=0
-        [[ -n "${addList}" ]] && fwApplyList close <<<"${addList}" >/dev/null
+        [[ -n "${FW_CREATED}" ]] && fwApplyList close <<<"${FW_CREATED}" # 只回收本次新建的规则
         SB_CHANGED=1
         X_CHANGED=1
         if ((restored)); then
@@ -3949,18 +4197,38 @@ egressAddrsStale() {
 
 reloadAll() {
     stateExists || return 1
+    local rc=0 pubips="" pubok=0 need=0 at now
+    # 本机公网地址要联网探测（最多几十秒）: 在拿锁之前做，锁内只比较、写入
+    if [[ "$(S '.egress.mode // ""')" == "public" && "$(S '.egress.public_detect != false')" == "true" ]]; then
+        if pubips=$(egressDetectPublicIPs); then pubok=1; else egressDetectFailedHint; fi
+    fi
     lockAcquire || return 1
-    if ! _requireCleanTransaction; then lockRelease; return 1; fi
+    if ! _requireCleanTransaction; then
+        lockRelease
+        return 1
+    fi
     SB_CHANGED=1
     X_CHANGED=1
-    local rc=0
-    if [[ "$(S '.egress.mode // ""')" == "public" ]] && egressAddrsStale; then
-        # 本机地址列表只在应用配置时刷新；地址变了就先走一次完整的应用（刷新地址、重新渲染、校验、验证），再做下面的强制重启
+    if [[ "$(S '.egress.mode // ""')" == "public" ]]; then
+        # 本机地址列表只在应用配置时刷新；网卡地址或公网地址变了（或公网地址的探测时间已超过一天）就先走一次完整的应用
+        egressAddrsStale && need=1
+        if ((pubok)); then
+            at=$(S '.egress.public_ips_at // 0')
+            [[ "${at}" =~ ^[0-9]+$ ]] || at=0
+            now=$(date +%s)
+            [[ "$(jq -c 'sort' <<<"${pubips}")" != "$(S -c '(.egress.public_ips // []) | sort')" ]] && need=1
+            ((now - at > 86400)) && need=1
+        fi
+    fi
+    if ((need)); then
         stagedBegin
-        applyStaged "刷新本机网卡地址（出口访问模式）" || {
-            stagedDiscard
-            rc=1
-        }
+        if ((pubok)); then
+            stagedEdit --argjson ips "${pubips}" --argjson t "$(date +%s)" '.egress.public_ips=$ips | .egress.public_ips_at=$t' || rc=1
+        fi
+        if ((rc == 0)); then
+            applyStaged "刷新本机地址（出口访问模式）" || rc=1
+        fi
+        ((rc == 0)) || stagedDiscard
     fi
     if ((rc == 0)); then
         applyServices "${ATR_STATE}" force || rc=1
@@ -5005,7 +5273,8 @@ selfCheckProtocol() { # selfCheckProtocol <协议id> [用户名]
         }
     fi
     if grep -qi 'reality verification failed' "${log}"; then
-        echoContent red "      原因: Reality 校验失败 —— 客户端公钥与服务端私钥不匹配，或 short_id/SNI 不一致"
+        echoContent red "      原因: Reality 校验失败 —— 客户端公钥与服务端私钥不匹配，或 short_id/SNI 不一致；"
+        echoContent red "      也可能是服务端与客户端的内核版本组合不兼容（例如 Xray 26.10.21 服务端 + sing-box 1.14.x 客户端，2026-10 实测），可以先换内核版本再试"
     fi
     return 1
 }
@@ -5564,6 +5833,7 @@ installProtocols() {
     fi
 
     stagedEdit --arg m "${egress}" '.egress.mode=$m' || return 1
+    stagedRefreshEgressPublicIPs
 
     # 协议若已在另一个核心上，需要确认迁移
     for id in "${ids[@]}"; do
@@ -5753,6 +6023,7 @@ cliInstallAnyTLSReality() {
     # 未指定时：已经选过就沿用，否则默认公网出口（更安全的一侧）
     [[ -z "${egress}" ]] && egress=$(stagedGet '.egress.mode // ""')
     stagedEdit --arg m "${egress:-public}" '.egress.mode=$m' || return 1
+    stagedRefreshEgressPublicIPs
     [[ -z "${port}" ]] && port=$(suggestPort tcp anytls_reality)
     if [[ -z "${sni}" ]]; then
         SNI_HOST=www.microsoft.com
@@ -7275,23 +7546,102 @@ egressModeLabel() { # egressModeLabel <mode>
 # 11.分流工具 → 6.出口访问模式
 egressMenu() {
     requireInstalled || return 1
-    local cur
+    local cur c det pub extra v out ips arr at when=""
     cur=$(S '.egress.mode // ""')
+    det=$(S '.egress.public_detect != false') # true = 开启（没设置过也算开启）
     echoContent skyBlue "\n功能 1/1 : 出口访问模式"
     echoContent yellow "当前: $(egressModeLabel "${cur}")"
-    pickEgressMode "${cur}" || return 1
-    if [[ "${EGRESS_PICK}" == "${cur}" ]]; then
-        echoContent green " ---> 没有变化"
-        return 0
-    fi
-    stagedBegin
-    stagedEdit --arg m "${EGRESS_PICK}" '.egress.mode=$m' || return 1
-    if applyStaged "出口访问模式: $(egressModeLabel "${EGRESS_PICK}")"; then
-        echoContent green " ---> 已切换为: $(egressModeLabel "${EGRESS_PICK}")（新连接立即生效）"
+    pub=$(S '(.egress.public_ips // []) | join(", ")')
+    extra=$(S '(.egress.extra_ips // []) | join(", ")')
+    at=$(S '.egress.public_ips_at // 0')
+    if [[ "${det}" == "false" ]]; then
+        echoContent yellow "本机公网地址自动探测: 已关闭"
     else
-        stagedDiscard
-        return 1
+        [[ "${at}" =~ ^[0-9]+$ ]] && ((at > 0)) && when="，$(date -d "@${at}" '+%F %T' 2>/dev/null)"
+        echoContent yellow "本机公网地址（自动探测${when}）: ${pub:-（无）}"
     fi
+    echoContent yellow "手动补充的本机地址: ${extra:-（无）}"
+    [[ "${cur}" == "public" ]] || echoContent yellow "（本机地址只在「公网出口」模式下起作用）"
+    echoContent yellow "1.切换出口访问模式"
+    echoContent yellow "2.重新探测本机公网地址"
+    echoContent yellow "3.手动补充本机地址（NAT、CDN/反代后面、出站经代理/隧道等探测不准的场景）"
+    echoContent yellow "4.$([[ "${det}" == "false" ]] && echo 开启 || echo 关闭)本机公网地址自动探测"
+    ask c "请选择:" || return 1
+    case "${c}" in
+    1)
+        pickEgressMode "${cur}" || return 1
+        if [[ "${EGRESS_PICK}" == "${cur}" ]]; then
+            echoContent green " ---> 没有变化"
+            return 0
+        fi
+        stagedBegin
+        stagedEdit --arg m "${EGRESS_PICK}" '.egress.mode=$m' || return 1
+        stagedRefreshEgressPublicIPs
+        if applyStaged "出口访问模式: $(egressModeLabel "${EGRESS_PICK}")"; then
+            echoContent green " ---> 已切换为: $(egressModeLabel "${EGRESS_PICK}")（新连接立即生效）"
+        else
+            stagedDiscard
+            return 1
+        fi
+        ;;
+    2)
+        [[ "${det}" != "false" ]] || {
+            echoContent yellow " ---> 自动探测已关闭（选 4 开启）"
+            return 0
+        }
+        if ! ips=$(egressDetectPublicIPs); then
+            egressDetectFailedHint
+            return 1
+        fi
+        stagedBegin
+        stagedEdit --argjson ips "${ips}" --argjson t "$(date +%s)" '.egress.public_ips=$ips | .egress.public_ips_at=$t' || return 1
+        if applyStaged "刷新本机公网地址"; then
+            echoContent green " ---> 本机公网地址: $(jq -r 'join(", ")' <<<"${ips}")"
+            echoContent yellow "      ${EGRESS_CDN_NOTE}"
+        else
+            stagedDiscard
+            return 1
+        fi
+        ;;
+    3)
+        ask v "请输入本机地址（IP 或 CIDR，多个用英文逗号分隔；直接回车清空）:" || return 1
+        if [[ -z "$(trim "${v}")" ]]; then
+            arr='[]'
+        else
+            out=$(parseIPList "${v}") || true
+            ips=$(printf '%s\n' "${out}" | sed -n 's/^ip://p')
+            [[ -n "${ips}" ]] || {
+                echoContent red " ---> 没有有效的 IP/CIDR（这里不支持 geoip），没有修改"
+                return 1
+            }
+            arr=$(printf '%s\n' "${ips}" | jq -R . | jq -sc 'unique')
+        fi
+        stagedBegin
+        stagedEdit --argjson ips "${arr}" '.egress.extra_ips=$ips' || return 1
+        if applyStaged "手动补充本机地址"; then
+            echoContent green " ---> 手动补充的本机地址: $(jq -r 'if length == 0 then "（无）" else join(", ") end' <<<"${arr}")"
+        else
+            stagedDiscard
+            return 1
+        fi
+        ;;
+    4)
+        stagedBegin
+        if [[ "${det}" == "false" ]]; then
+            stagedEdit '.egress.public_detect=true' || return 1
+            stagedRefreshEgressPublicIPs
+        else
+            stagedEdit '.egress.public_detect=false | .egress.public_ips=[] | del(.egress.public_ips_at)' || return 1
+        fi
+        if applyStaged "本机公网地址自动探测: $([[ "${det}" == "false" ]] && echo 开启 || echo 关闭)"; then
+            echoContent green " ---> 已$([[ "${det}" == "false" ]] && echo 开启 || echo 关闭)自动探测"
+        else
+            stagedDiscard
+            return 1
+        fi
+        ;;
+    *) echoContent red " ---> 选择错误" ;;
+    esac
 }
 
 # 老安装（升级前没有这个选项）打开菜单时问一次；回车 = 保持现状，所以不选也不会改变任何行为
@@ -7968,6 +8318,7 @@ main() {
         warnV2rayAgentConflict
         securityUpgradeNotice
         egressModeNotice
+        egressPublicStaleNotice
         menuLoop
         ;;
     install-anytls-reality) cliInstallAnyTLSReality "$@" ;;
@@ -7975,7 +8326,10 @@ main() {
     renew-tls) renewTLSNow ;;
     update-geo) updateGeoAll ;;
     apply-hop) reconcileHopRules "${ATR_STATE}" ;;
-    status) showStatusCLI ;;
+    status)
+        showStatusCLI
+        egressPublicStaleNotice
+        ;;
     show) showAccounts "${1:-}" "${2:-0}" ;;
     sub) showSubscriptionLinks "${1:-}" ;;
     selfcheck) selfCheckAll ;;
