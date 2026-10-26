@@ -42,7 +42,8 @@ export LANG=en_US.UTF-8
 # - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
 # - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
 # - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
-ATR_VERSION="v1.2.9"
+ATR_VERSION="v1.3.0"
+# v1.3.0：独立 REALITY 能力检测，实际捕获 KeyShare、受控协商及认证后转发。
 # v1.2.9：补齐 ACME / 卸载防火墙提示；状态显示 Reality 与订阅配置。
 # v1.2.8：按节点所属核心自检；Reality 支持共享/按协议独立配置。
 # v1.2.7：证书导入增加持久撤销日志与开机预恢复；防火墙撤销按后端/地址族记录，
@@ -6355,6 +6356,539 @@ installedRealityProtocols() {
     done < <(installedProtocols)
 }
 
+# 能力诊断的解释器与临时探针完全独立；不安装别名、不迁移状态、不改服务。
+realityCapabilities() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echoContent yellow " ---> 未能确认: 能力检测需要 Python 3（标准库），未安装任何依赖"
+        return 2
+    fi
+    local sb="" xr=""
+    [[ -x "${SB_BIN}" ]] && sb=${SB_BIN}
+    [[ -x "${XRAY_BIN}" ]] && xr=${XRAY_BIN}
+    ATR_PROBE_SB="${sb}" ATR_PROBE_XRAY="${xr}" ATR_PROBE_STATE="${ATR_STATE}" ATR_PROBE_SCRIPT="${BASH_SOURCE[0]}" ATR_PROBE_VERSION="${ATR_VERSION}" python3 - "$@" <<'ATR_REALITY_PROBE_PY'
+"""Embedded stdlib-only REALITY diagnostic. AGPL-3.0, same as parent script.
+Only temporary loopback services and one-time credentials are used.
+"""
+import argparse, base64, datetime, hashlib, http.server, json, mmap, os, pathlib
+import platform, re, secrets, shutil, signal, socket, struct, subprocess, sys
+import tempfile, threading, time, urllib.request, uuid, zipfile
+os.umask(0o077)
+
+MLKEM = 0x11EC
+X25519 = 29
+NAMES = {MLKEM:'X25519MLKEM768', X25519:'X25519', 23:'P256', 24:'P384', 25:'P521', 0x6399:'X25519Kyber768Draft00'}
+HRR = bytes.fromhex('cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c')
+REFERENCE_TAG = 'v26.10.21'
+PROCESSES = []
+SOCKS_USER = secrets.token_hex(12)
+SOCKS_PASS = secrets.token_urlsafe(24)
+
+class ProbeError(Exception): pass
+def group_name(n): return NAMES.get(n, 'GREASE' if n & 0x0f0f == 0x0a0a else '0x%04x'%n)
+def u16(b,p):
+    if p+2>len(b): raise ProbeError('TLS 消息截断')
+    return int.from_bytes(b[p:p+2],'big')
+
+def parse_hello(data, server=False):
+    """Parse a complete handshake message, not a TCP packet or byte substring."""
+    if len(data)<4 or data[0] != (2 if server else 1): raise ProbeError('不是预期的 TLS Hello')
+    n=int.from_bytes(data[1:4],'big')
+    if n!=len(data)-4 or n<35: raise ProbeError('TLS Hello 长度不合法')
+    b=data[4:]; p=34; sid=b[p]; p+=1+sid
+    if server: p+=3
+    else:
+        p+=2+u16(b,p)
+        if p>=len(b): raise ProbeError('TLS 压缩字段截断')
+        p+=1+b[p]
+    total=u16(b,p); p+=2; end=p+total
+    if end!=len(b): raise ProbeError('TLS 扩展长度不合法')
+    out={'groups':[], 'key_shares':[]} if not server else {'selected_group':None, 'hello_retry_request':b[2:34]==HRR}
+    seen=set()
+    while p<end:
+        typ=u16(b,p); size=u16(b,p+2); p+=4
+        if p+size>end or typ in seen: raise ProbeError('TLS 扩展重复或截断')
+        seen.add(typ); e=b[p:p+size]; p+=size
+        if not server and typ==10:
+            if u16(e,0)!=len(e)-2 or (len(e)-2)%2: raise ProbeError('supported_groups 不合法')
+            out['groups']=[u16(e,i) for i in range(2,len(e),2)]
+        if typ==51:
+            if server:
+                g=u16(e,0); out['selected_group']=g
+                if out['hello_retry_request']:
+                    if len(e)!=2: raise ProbeError('HRR key_share 不合法')
+                elif len(e)<4 or u16(e,2)!=len(e)-4: raise ProbeError('服务端 key_share 长度不合法')
+            else:
+                if u16(e,0)!=len(e)-2: raise ProbeError('key_share 列表截断')
+                q=2
+                while q<len(e):
+                    g=u16(e,q); k=u16(e,q+2); q+=4
+                    if q+k>len(e): raise ProbeError('key_share 内容截断')
+                    out['key_shares'].append({'group':g,'bytes':k}); q+=k
+    return out
+
+class TLSRecords:
+    """Reassemble TLS records AND handshake messages across arbitrary TCP splits."""
+    def __init__(self,server=False): self.buf=bytearray(); self.hs=bytearray(); self.server=server; self.hello=None; self.error=None
+    def feed(self,data):
+        if self.hello is not None or self.error: return
+        self.buf.extend(data)
+        try:
+            if len(self.buf)+len(self.hs)>262144: raise ProbeError('TLS 捕获超出长度上限')
+            while len(self.buf)>=5:
+                typ=self.buf[0]; n=u16(self.buf,3)
+                if n>18432: raise ProbeError('TLS record 超出长度上限')
+                if len(self.buf)<5+n: break
+                payload=bytes(self.buf[5:5+n]); del self.buf[:5+n]
+                if typ!=22: continue
+                self.hs.extend(payload)
+                while len(self.hs)>=4:
+                    k=int.from_bytes(self.hs[1:4],'big')
+                    if k>131072: raise ProbeError('TLS handshake 超出长度上限')
+                    if len(self.hs)<4+k: break
+                    msg=bytes(self.hs[:4+k]); del self.hs[:4+k]
+                    if msg[0]==(2 if self.server else 1): self.hello=parse_hello(msg,self.server); return
+        except (ProbeError,IndexError) as e: self.error=str(e)
+
+def metadata(binary):
+    if not binary or not os.path.isfile(binary) or not os.access(binary,os.X_OK):
+        return {'available':False,'reason':'未找到可执行核心'}
+    h=hashlib.sha256()
+    with open(binary,'rb') as f:
+        for block in iter(lambda:f.read(1048576),b''): h.update(block)
+    out={'available':True,'path':os.path.realpath(binary),'sha256':h.hexdigest(),'go_version':None,'utls_module':None}
+    try:
+        p=subprocess.run([binary,'version'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,text=True)
+        out['version_output']=p.stdout[:2000].strip()
+        if p.returncode: out.update(available=False,reason='核心无法运行')
+    except (OSError,subprocess.TimeoutExpired): out.update(available=False,reason='核心无法运行或读取版本超时')
+    try:
+        with open(binary,'rb') as f, mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as b:
+            at=b.find(b'\xff Go buildinf:')
+            if at>=0 and at+32<len(b) and b[at+15]&2:
+                def string_at(p):
+                    n=0; shift=0
+                    while shift<64:
+                        v=b[p]; p+=1; n|=(v&127)<<shift
+                        if not v&128: break
+                        shift+=7
+                    if shift>=64 or n>1048576 or p+n>len(b): raise ValueError()
+                    return bytes(b[p:p+n]),p+n
+                ver,pos=string_at(at+32); mods,pos=string_at(pos)
+                out['go_version']=ver.decode('utf8','replace')
+                if len(mods)>=32: mods=mods[16:-16]
+                last_utls=False
+                for line in mods.decode('utf8','replace').splitlines():
+                    fields=line.split('\t')
+                    if len(fields)>=3 and fields[0]=='dep' and fields[1] in ('github.com/metacubex/utls','github.com/refraction-networking/utls'):
+                        out['utls_module']={'path':fields[1],'version':fields[2]}
+                        last_utls=True
+                    elif fields[0]=='=>' and last_utls and len(fields)>=2:
+                        out['utls_module']['replacement']={'path':fields[1],'version':fields[2] if len(fields)>2 else '(devel)'}
+                        last_utls=False
+                    else: last_utls=False
+    except (OSError,ValueError,IndexError): pass
+    return out
+
+def free_port():
+    with socket.socket() as s: s.bind(('127.0.0.1',0)); return s.getsockname()[1]
+def write_json(path,data):
+    with open(path,'w',encoding='utf8') as f: os.chmod(path,0o600); json.dump(data,f)
+def stop(p):
+    if p is None: return
+    if p.poll() is None:
+        try: os.killpg(p.pid,signal.SIGTERM)
+        except ProcessLookupError: pass
+        try: p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try: os.killpg(p.pid,signal.SIGKILL)
+            except ProcessLookupError: pass
+            p.wait(timeout=2)
+    if p in PROCESSES: PROCESSES.remove(p)
+def start(binary,cfg,path,ports):
+    write_json(path,cfg)
+    p=subprocess.Popen([binary,'run','-c',str(path)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+    PROCESSES.append(p)
+    for port in ports:
+        ready=False
+        for _ in range(40):
+            if p.poll() is not None: break
+            try:
+                with socket.create_connection(('127.0.0.1',port),timeout=.1): ready=True; break
+            except OSError: time.sleep(.05)
+        if not ready or p.poll() is not None:
+            stop(p); raise ProbeError('临时探针无法启动（配置、版本或端口问题）')
+    return p
+
+def exact(s,n):
+    b=b''
+    while len(b)<n:
+        x=s.recv(n-len(b))
+        if not x: raise ProbeError('探针连接提前结束')
+        b+=x
+    return b
+def socks_auth(s):
+    s.sendall(b'\x05\x01\x02')
+    if exact(s,2)!=b'\x05\x02': raise ProbeError('SOCKS 认证方式不匹配')
+    user=SOCKS_USER.encode(); password=SOCKS_PASS.encode()
+    s.sendall(b'\x01'+bytes([len(user)])+user+bytes([len(password)])+password)
+    if exact(s,2)!=b'\x01\x00': raise ProbeError('SOCKS 一次性认证失败')
+def socks_connect(port,dest,timeout):
+    s=socket.create_connection(('127.0.0.1',port),timeout=timeout); s.settimeout(timeout)
+    try:
+        socks_auth(s)
+        s.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01'+struct.pack('!H',dest))
+        h=exact(s,4)
+        if h[:2]!=b'\x05\x00': raise ProbeError('代理拒绝测试连接')
+        n={1:4,4:16}.get(h[3])
+        if h[3]==3: n=exact(s,1)[0]
+        if n is None: raise ProbeError('SOCKS 地址类型异常')
+        exact(s,n+2); return s
+    except BaseException: s.close(); raise
+
+class Tap:
+    def __init__(self,destination=None):
+        self.destination=destination; self.client=TLSRecords(); self.server=TLSRecords(True)
+        self.sock=socket.socket(); self.sock.bind(('127.0.0.1',0)); self.sock.listen(8); self.sock.settimeout(.2)
+        self.port=self.sock.getsockname()[1]; self.closed=threading.Event(); self.sockets=[]
+        self.thread=threading.Thread(target=self.accept,daemon=True); self.thread.start()
+    def accept(self):
+        while not self.closed.is_set():
+            try: c,_=self.sock.accept()
+            except socket.timeout: continue
+            except OSError: break
+            self.sockets.append(c); c.settimeout(.3)
+            if self.destination is None:
+                threading.Thread(target=self.copy,args=(c,None,self.client),daemon=True).start()
+            else:
+                try: u=socket.create_connection(('127.0.0.1',self.destination),timeout=2); u.settimeout(.3)
+                except OSError: c.close(); continue
+                self.sockets.append(u)
+                threading.Thread(target=self.copy,args=(c,u,self.client),daemon=True).start()
+                threading.Thread(target=self.copy,args=(u,c,self.server),daemon=True).start()
+    def copy(self,src,dst,parser):
+        try:
+            while not self.closed.is_set():
+                try: b=src.recv(16384)
+                except socket.timeout: continue
+                if not b: break
+                parser.feed(b)
+                if dst is None:
+                    if parser.hello is not None or parser.error: break
+                else: dst.sendall(b)
+        except OSError: pass
+        finally:
+            try: src.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+            if dst is not None:
+                try: dst.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+    def close(self):
+        self.closed.set(); self.sock.close()
+        for s in self.sockets:
+            try: s.close()
+            except OSError: pass
+        self.thread.join(timeout=1)
+
+def keypair(sb):
+    p=subprocess.run([sb,'generate','reality-keypair'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=5)
+    priv=re.search(r'PrivateKey:\s*(\S+)',p.stdout); pub=re.search(r'PublicKey:\s*(\S+)',p.stdout)
+    if p.returncode or not priv or not pub: raise ProbeError('无法生成一次性 REALITY 密钥')
+    return priv[1],pub[1]
+
+def client_capture(sb,fp,proto,tmp,kp,timeout):
+    tap=Tap(); p=None; cp=free_port()
+    try:
+        out={'type':proto,'tag':'test','server':'127.0.0.1','server_port':tap.port,
+             'tls':{'enabled':True,'server_name':'probe.invalid','utls':{'enabled':True,'fingerprint':fp},'reality':{'enabled':True,'public_key':kp[1],'short_id':secrets.token_hex(8)}}}
+        if proto=='anytls': out['password']=secrets.token_urlsafe(24)
+        else: out.update(uuid=str(uuid.uuid4()),flow='xtls-rprx-vision')
+        cfg={'log':{'disabled':True},'inbounds':[{'type':'socks','listen':'127.0.0.1','listen_port':cp,'users':[{'username':SOCKS_USER,'password':SOCKS_PASS}]}], 'outbounds':[out], 'route':{'final':'test'}}
+        p=start(sb,cfg,tmp/'capture.json',[cp])
+        # Capture mode intentionally stops at ClientHello, without authentication.
+        s=socket.create_connection(('127.0.0.1',cp),timeout=timeout); s.settimeout(timeout)
+        try:
+            socks_auth(s)
+            s.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x50')
+            deadline=time.monotonic()+timeout
+            while not tap.client.hello and not tap.client.error and time.monotonic()<deadline: time.sleep(.03)
+        finally: s.close()
+        if tap.client.error: raise ProbeError('ClientHello 解析失败: '+tap.client.error)
+        h=tap.client.hello
+        if not h: raise ProbeError('未捕获 ClientHello（超时或指纹不可用）')
+        shares=[s['group'] for s in h['key_shares']]
+        has=any(s['group']==MLKEM and s['bytes']==1216 for s in h['key_shares'])
+        return {'status':'observed','groups':[group_name(x) for x in h['groups']],
+                'key_shares':[{'group':group_name(x['group']),'bytes':x['bytes']} for x in h['key_shares']],
+                'mlkem_advertised':MLKEM in h['groups'],'mlkem_key_share':has,
+                'mlkem_before_x25519':has and (X25519 not in shares or shares.index(MLKEM)<shares.index(X25519))}
+    except (ProbeError,OSError,subprocess.TimeoutExpired) as e: return {'status':'unknown','reason':str(e)[:180]}
+    finally: stop(p); tap.close()
+
+def fetch_reference(tmp):
+    arch={'x86_64':'64','amd64':'64','aarch64':'arm64-v8a','arm64':'arm64-v8a'}.get(platform.machine().lower())
+    if not arch: raise ProbeError('自动参考探针仅支持 amd64 / arm64；请用 --xray 指定')
+    asset='Xray-linux-'+arch+'.zip'
+    # Direct verified HTTPS; no download proxies or unverified override.
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    def get(url,limit):
+        req=urllib.request.Request(url,headers={'User-Agent':'AnyTLS-Reality-capability-probe/1.3.0','Accept':'application/vnd.github+json'})
+        deadline=time.monotonic()+60; data=bytearray()
+        with opener.open(req,timeout=15) as r:
+            while True:
+                b=r.read(65536)
+                if not b: break
+                data.extend(b)
+                if len(data)>limit or time.monotonic()>deadline: raise ProbeError('参考探针下载超出大小或时间上限')
+        return bytes(data)
+    release=json.loads(get('https://api.github.com/repos/XTLS/Xray-core/releases/tags/'+REFERENCE_TAG,2097152))
+    if not isinstance(release,dict) or not isinstance(release.get('assets'),list): raise ProbeError('参考探针发布元数据不合法')
+    if release.get('draft') is not False or release.get('prerelease') is not False or release.get('tag_name')!=REFERENCE_TAG: raise ProbeError('无法核实参考探针的正式发布属性')
+    a=next((a for a in release['assets'] if isinstance(a,dict) and a.get('name')==asset),None)
+    digest=a.get('digest','') if a else ''
+    if not isinstance(digest,str) or not re.fullmatch(r'sha256:[0-9a-fA-F]{64}',digest): raise ProbeError('未取得参考探针官方 SHA256，拒绝执行下载物')
+    url='https://github.com/XTLS/Xray-core/releases/download/'+REFERENCE_TAG+'/'+asset
+    data=get(url,125829120)
+    if hashlib.sha256(data).hexdigest()!=digest[7:].lower(): raise ProbeError('参考探针 SHA256 不匹配')
+    archive=tmp/'reference.zip'; archive.write_bytes(data)
+    with zipfile.ZipFile(archive) as z:
+        entry=z.getinfo('xray')
+        if entry.file_size>125829120 or (entry.external_attr>>16)&0o170000==0o120000: raise ProbeError('参考探针 ZIP 内容不合法')
+        target=tmp/'reference-xray'; target.write_bytes(z.read(entry)); target.chmod(0o700)
+    return str(target),{'downloaded':True,'tag':REFERENCE_TAG,'archive_sha256':digest[7:].lower()}
+
+def xr_client(cp,server,sni,kp,sid,user):
+    return {'log':{'loglevel':'none'},'inbounds':[{'listen':'127.0.0.1','port':cp,'protocol':'socks','settings':{'udp':False,'auth':'password','accounts':[{'user':SOCKS_USER,'pass':SOCKS_PASS}]}}],
+       'outbounds':[{'protocol':'vless','settings':{'vnext':[{'address':'127.0.0.1','port':server,'users':[{'id':user,'encryption':'none','flow':'xtls-rprx-vision'}]}]},
+       'streamSettings':{'network':'tcp','security':'reality','realitySettings':{'serverName':sni,'fingerprint':'chrome','publicKey':kp[1],'shortId':sid}}}]}
+
+class Fixture:
+    def __init__(self):
+        self.token=secrets.token_hex(24); token=self.token
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path!='/'+token: self.send_error(404); return
+                body=('ATR_PROBE_'+token).encode(); self.send_response(200); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+            def log_message(self,*args): pass
+        self.server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        self.server.daemon_threads=True
+        self.thread=threading.Thread(target=self.server.serve_forever,daemon=True); self.thread.start()
+        self.port=self.server.server_address[1]
+    def close(self): self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=1)
+
+def tunnel_case(sb,xr,tmp,kp,fixture,sni,target_port,timeout,reference=False):
+    sp=free_port(); cp=free_port(); sid=secrets.token_hex(8); user=str(uuid.uuid4()); server=None; client=None; tap=None
+    target_host='127.0.0.1' if sni=='localhost' else sni
+    try:
+        if reference:
+            cfg={'log':{'loglevel':'none'},'inbounds':[{'listen':'127.0.0.1','port':sp,'protocol':'vless',
+                 'settings':{'clients':[{'id':user,'flow':'xtls-rprx-vision'}],'decryption':'none'},
+                 'streamSettings':{'network':'tcp','security':'reality','realitySettings':{'target':target_host+':'+str(target_port),'serverNames':[sni],'privateKey':kp[0],'shortIds':[sid]}}}],
+                 'outbounds':[{'protocol':'freedom','settings':{'finalRules':[{'action':'allow','network':'tcp','port':str(fixture.port),'ip':['127.0.0.1/32']}]}}]}
+            server=start(xr,cfg,tmp/'reference-server.json',[sp])
+        else:
+            cfg={'log':{'disabled':True},'inbounds':[{'type':'vless','tag':'test','listen':'127.0.0.1','listen_port':sp,
+                'users':[{'uuid':user,'flow':'xtls-rprx-vision'}], 'tls':{'enabled':True,'server_name':sni,'reality':{'enabled':True,'handshake':{'server':target_host,'server_port':target_port},'private_key':kp[0],'short_id':[sid]}}}],
+                'outbounds':[{'type':'direct'}]}
+            server=start(sb,cfg,tmp/'singbox-server.json',[sp])
+        tap=Tap(sp)
+        client=start(xr,xr_client(cp,tap.port,sni,kp,sid,user),tmp/'reference-client.json',[cp])
+        data=b''; failure=None
+        try:
+            with socks_connect(cp,fixture.port,timeout) as s:
+                s.sendall(('GET /'+fixture.token+' HTTP/1.1\r\nHost: probe.invalid\r\nConnection: close\r\n\r\n').encode())
+                deadline=time.monotonic()+timeout
+                while len(data)<65536 and time.monotonic()<deadline:
+                    b=s.recv(4096)
+                    if not b: break
+                    data+=b
+                    if ('ATR_PROBE_'+fixture.token).encode() in data: break
+        except (OSError,ProbeError) as e: failure=type(e).__name__
+        h=tap.server.hello; g=h.get('selected_group') if h else None
+        passed=('ATR_PROBE_'+fixture.token).encode() in data and server.poll() is None and client.poll() is None
+        ch=tap.client.hello
+        status='passed' if passed else ('unknown' if h is None or h.get('hello_retry_request') else 'failed')
+        return {'status':status,'authenticated_tunnel':passed,
+                'selected_group':group_name(g) if g is not None and not h.get('hello_retry_request') else None,
+                'requested_group':group_name(g) if h and h.get('hello_retry_request') and g is not None else None,
+                'hello_retry_request':h.get('hello_retry_request',False) if h else None,
+                'reference_mlkem_key_share':any(k['group']==MLKEM and k['bytes']==1216 for k in ch['key_shares']) if ch else None,
+                'reason':None if passed else (failure or '未完成 REALITY 认证后的测试数据转发')}
+    except (OSError,ProbeError,subprocess.TimeoutExpired) as e: return {'status':'unknown','reason':str(e)[:180],'authenticated_tunnel':False,'selected_group':None}
+    finally: stop(client); stop(server); tap.close() if tap else None
+
+def controlled_targets(xr,tmp):
+    if not shutil.which('openssl'): raise ProbeError('缺少 openssl，无法生成临时目标证书')
+    crt=tmp/'fixture.crt'; key=tmp/'fixture.key'
+    p=subprocess.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256','-nodes','-keyout',str(key),'-out',str(crt),'-days','1','-subj','/CN=localhost'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
+    if p.returncode: raise ProbeError('无法生成临时目标证书')
+    classic=free_port(); hybrid=free_port(); inbounds=[]
+    for port,group in [(classic,'X25519'),(hybrid,'X25519MLKEM768')]:
+        inbounds.append({'listen':'127.0.0.1','port':port,'protocol':'vless','settings':{'clients':[{'id':str(uuid.uuid4())}],'decryption':'none'},
+            'streamSettings':{'network':'tcp','security':'tls','tlsSettings':{'minVersion':'1.3','maxVersion':'1.3','alpn':['h2'],
+             'curvePreferences':[group],'certificates':[{'certificateFile':str(crt),'keyFile':str(key)}]}}})
+    # Target can complete TLS but cannot forward the nonce, even on accidental fallback.
+    p=start(xr,{'log':{'loglevel':'none'},'inbounds':inbounds,'outbounds':[{'protocol':'blackhole'}]},tmp/'targets.json',[classic,hybrid])
+    return p,classic,hybrid
+
+def configured_targets(statefile):
+    try:
+        st=json.loads(pathlib.Path(statefile).read_text()); out=[]
+        for ident,p in st.get('protocols',{}).items():
+            if p.get('core')!='sing-box' or ident not in ('anytls_reality','vless_reality_vision','vless_reality_grpc'): continue
+            r=p.get('reality',{}) if st.get('reality_mode','shared')=='independent' else st.get('reality',{})
+            host=r.get('sni',''); port=r.get('dest_port',443)
+            if valid_target(host,port) and (host,port) not in [(t['sni'],t['port']) for t in out]: out.append({'sni':host,'port':port,'source_protocol':ident})
+        return out[:4]
+    except (OSError,ValueError,TypeError,AttributeError): return []
+def valid_target(host,port): return isinstance(host,str) and re.fullmatch(r'(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9-]{2,63}',host) is not None and type(port) is int and 1<=port<=65535
+
+def server_probes(sb,xr,tmp,kp,targets,timeout):
+    fixture=Fixture(); target_process=None
+    result={'status':'unknown','scope':'临时 VLESS 入站测试共用 REALITY 层；不等同 AnyTLS 应用层或生产节点连通性测试','current_targets':[]}
+    try:
+        target_process,classic,hybrid=controlled_targets(xr,tmp)
+        # localhost fixture SNI is mapped to loopback by normal resolver.
+        c=tunnel_case(sb,xr,tmp,kp,fixture,'localhost',classic,timeout)
+        r=tunnel_case(sb,xr,tmp,kp,fixture,'localhost',hybrid,timeout,reference=True)
+        h=tunnel_case(sb,xr,tmp,kp,fixture,'localhost',hybrid,timeout)
+        result.update(classical_control=c,hybrid_reference_control=r,hybrid_test=h)
+        reference_ok=r.get('authenticated_tunnel') and r.get('selected_group')=='X25519MLKEM768' and r.get('reference_mlkem_key_share')
+        classic_ok=c.get('authenticated_tunnel') and c.get('selected_group')=='X25519'
+        if reference_ok and h.get('authenticated_tunnel') and h.get('selected_group')=='X25519MLKEM768':
+            result.update(status='supported_verified',reason='已完成混合交换、REALITY 认证及一次性数据转发；参考对照通过')
+        elif reference_ok and classic_ok and h.get('status')=='failed':
+            result.update(status='hybrid_test_failed',reason='混合测试失败，经典与混合参考对照通过；仅适用于本次版本/探针组合，不推断所有实现均不支持')
+        else: result['reason']='对照不完整或结果不一致，不能判定为不支持'
+        for target in targets:
+            test=tunnel_case(sb,xr,tmp,kp,fixture,target['sni'],target['port'],timeout)
+            result['current_targets'].append({**target,**test,'scope':'当前 SNI/目标配置的临时实例；使用参考客户端与一次性密钥，并非生产连接抓包'})
+    except (OSError,ProbeError,subprocess.TimeoutExpired) as e: result['reason']=str(e)[:180]
+    finally: stop(target_process); fixture.close()
+    return result
+
+def display(r):
+    print('REALITY 能力与协商检测（'+r['script_version']+'）')
+    print('sing-box: '+r['sing_box'].get('version_output',r['sing_box'].get('reason','未知')).split('\n')[0])
+    if r['sing_box'].get('sha256'): print('SHA256: '+r['sing_box']['sha256'])
+    module=r['sing_box'].get('utls_module'); print('uTLS 依赖: '+(module['path']+' '+module['version'] if module else '未能读取；不以此推断能力'))
+    if module and module.get('replacement'): print('  模块替换: '+module['replacement']['path']+' '+module['replacement']['version'])
+    for c in r['client_tests']:
+        samples=c['samples']; good=[s for s in samples if s['status']=='observed']; offered=sum(s['mlkem_key_share'] for s in good)
+        advertised=sum(s['mlkem_advertised'] for s in good)
+        print('客户端 '+c['protocol']+' / '+c['fingerprint']+': 声明 MLKEM '+str(advertised)+'/'+str(len(good))+'，发送混合 KeyShare '+str(offered)+'/'+str(len(good))+'，未确认 '+str(len(samples)-len(good)))
+        if good:
+            print('  首样本 groups: '+', '.join(good[0]['groups']))
+            print('  首样本 key_share: '+', '.join(k['group']+'('+str(k['bytes'])+')' for k in good[0]['key_shares']))
+        else: print('  '+samples[0].get('reason','未能确认'))
+    labels={'supported_verified':'已验证支持混合交换','hybrid_test_failed':'本次混合测试失败','unknown':'未能确认','not_run':'未执行','passed':'认证及转发成功','failed':'测试失败'}
+    s=r['server']; print('服务端: '+labels.get(s['status'],s['status'])+' — '+s.get('reason','未能确认'))
+    for name,label in [('classical_control','经典对照'),('hybrid_reference_control','混合参考对照'),('hybrid_test','sing-box 混合测试')]:
+        if name in s:
+            t=s[name]; print('  '+label+': '+labels.get(t['status'],t['status'])+'，协商 '+str(t.get('selected_group') or '未能确认'))
+    for t in s.get('current_targets',[]): print('目标 '+t['sni']+':'+str(t['port'])+': '+labels.get(t['status'],t['status'])+'，协商 '+str(t.get('selected_group') or '未能确认'))
+    print('认证: '+r['authentication']['conclusion'])
+    print('结论: '+r['conclusion'])
+    for note in r['limitations']: print('说明: '+note)
+
+def main(argv=None):
+    ap=argparse.ArgumentParser(description='REALITY 能力诊断；临时回环实例，不修改生产配置')
+    ap.add_argument('--sing-box',default=os.environ.get('ATR_PROBE_SB',''))
+    ap.add_argument('--xray',default=os.environ.get('ATR_PROBE_XRAY',''))
+    ap.add_argument('--state',default=os.environ.get('ATR_PROBE_STATE','/etc/anytls-reality/state.json'))
+    ap.add_argument('--fingerprints',default='chrome,firefox,safari,randomized')
+    ap.add_argument('--samples',type=int,default=3,help='randomized 样本数，1–20')
+    ap.add_argument('--protocol',choices=['anytls','vless','both'],default='both')
+    ap.add_argument('--target',action='append',default=[],help='额外目标 SNI[:端口]，最多 4 个')
+    ap.add_argument('--timeout',type=float,default=5,help='单次网络操作超时，1–15 秒')
+    ap.add_argument('--quick',action='store_true',help='只捕获客户端，不运行服务端/目标探针')
+    ap.add_argument('--no-fetch',action='store_true',help='缺少 Xray 参考探针时不临时下载')
+    ap.add_argument('--json',action='store_true',help='标准输出仅输出 JSON')
+    ap.add_argument('--output',help='将脱敏 JSON 报告另存为文件（原子替换）')
+    a=ap.parse_args(argv)
+    fps=list(dict.fromkeys(a.fingerprints.split(',')))
+    if not 1<=a.samples<=20 or not 1<=a.timeout<=15 or not fps or len(fps)>8 or any(f not in ('chrome','firefox','safari','edge','ios','randomized','360','qq','android') for f in fps): ap.error('指纹、样本数或超时参数不合法')
+    targets=configured_targets(a.state)
+    for t in a.target:
+        host,sep,port=t.partition(':')
+        if not valid_target(host,int(port) if sep and port.isdecimal() and len(port)<=5 else (443 if not sep else 0)): ap.error('目标必须是有效 SNI[:端口]')
+        targets.append({'sni':host,'port':int(port) if sep else 443,'source_protocol':'command-line'})
+    targets=list({(t['sni'],t['port']):t for t in targets}.values())
+    if len(targets)>4: ap.error('目标数量超过 4 个')
+    sb=a.sing_box or shutil.which('sing-box') or ''; xr=a.xray or shutil.which('xray') or ''
+    if a.output:
+        protected=[a.state,os.environ.get('ATR_PROBE_SCRIPT','')]
+        for core in (sb,xr):
+            if core:
+                binary=pathlib.Path(core).resolve()
+                protected.extend([str(binary),str(binary.parent/'conf/config.json'),str(binary.parent.parent/'state.json'),str(binary.parent.parent/'anytls-reality.sh')])
+        dest=pathlib.Path(a.output).resolve()
+        if any(p and dest==pathlib.Path(p).resolve() for p in protected): ap.error('报告路径不能覆盖状态文件、核心、核心配置或管理脚本')
+    r={'schema':1,'script_version':os.environ.get('ATR_PROBE_VERSION','1.3.0'),'time_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+       'sing_box':metadata(sb),'reference':{'available':False},'client_tests':[],
+       'server':{'status':'unknown','reason':'未执行'},
+       'authentication':{'status':'not_verified','conclusion':'本探针未验证 ML-DSA 等额外抗量子身份认证；混合密钥交换不等于完整抗量子认证'},
+       'limitations':['抓到声明或 KeyShare 不等于本次已协商该算法；仅凭指纹差异不判定必然可识别。',
+          '服务端测试使用共用 REALITY 层的临时 VLESS 入站，不能用 Xray 客户端直接证明 AnyTLS 应用层互通。',
+          '服务端能力成立不代表当前 sing-box 客户端会使用；生产节点状态、防火墙与长期安全不在本项证明范围内。']}
+    with tempfile.TemporaryDirectory(prefix='atr-reality-probe.') as temp:
+        tmp=pathlib.Path(temp); os.chmod(tmp,0o700)
+        if r['sing_box']['available']:
+            try:
+                kp=keypair(sb)
+                for proto in (['anytls','vless'] if a.protocol=='both' else [a.protocol]):
+                    for fp in fps:
+                        samples=[client_capture(sb,fp,proto,tmp,kp,a.timeout) for _ in range(a.samples if fp=='randomized' else 1)]
+                        r['client_tests'].append({'protocol':proto,'fingerprint':fp,'samples':samples})
+                if a.quick: r['server']={'status':'not_run','reason':'快速模式仅执行客户端捕获'}
+                else:
+                    try:
+                        provenance={'downloaded':False}
+                        if not xr and not a.no_fetch:
+                            if not a.json: print('临时取得校验后的 Xray 参考探针（不安装、不替换核心）…',file=sys.stderr)
+                            xr,provenance=fetch_reference(tmp)
+                        r['reference']={**metadata(xr),**provenance}
+                        if r['reference']['available']: r['server']=server_probes(sb,xr,tmp,kp,targets,a.timeout)
+                        else: r['server']={'status':'unknown','reason':'缺少可运行的 Xray 参考探针；可指定 --xray，或允许临时下载'}
+                    except (ProbeError,OSError,ValueError,KeyError,TypeError,zipfile.BadZipFile) as e: r['server']={'status':'unknown','reason':'参考探针准备失败: '+(str(e)[:180] if isinstance(e,ProbeError) else type(e).__name__)+'；未执行未经核验的下载物'}
+            except (ProbeError,OSError,subprocess.TimeoutExpired) as e: r['server']={'status':'unknown','reason':str(e)[:180]}
+        else: r['server']={'status':'unknown','reason':'未找到可运行的 sing-box；请先安装或用 --sing-box 指定'}
+        # Rehash local binaries; a concurrent core replacement invalidates attribution.
+        if r['sing_box'].get('available') and metadata(sb).get('sha256')!=r['sing_box']['sha256']:
+            r['server']={'status':'unknown','reason':'检测期间核心发生替换，本次结果不能归因于同一个二进制'}
+            r['client_tests']=[]
+        if r['reference'].get('available') and metadata(xr).get('sha256')!=r['reference']['sha256']:
+            r['server']={'status':'unknown','reason':'检测期间参考探针发生替换，无法确认结果'}
+        observed=[s for c in r['client_tests'] for s in c['samples'] if s['status']=='observed']
+        emitted=any(s['mlkem_key_share'] for s in observed)
+        r['conclusion']=('已在部分已测指纹观察到混合 KeyShare，需结合认证后协商结果判断。' if emitted else
+             '已捕获的客户端样本均未发送混合 KeyShare；结论仅限本次核心、协议及指纹。' if observed else '客户端能力未能确认。')
+        if r['server']['status']=='supported_verified':
+            r['conclusion']='服务端已验证支持混合交换；'+r['conclusion']+' 服务端成功使用参考客户端，不代表本机 sing-box 客户端已使用混合交换。'
+        r['complete']=r['sing_box'].get('available',False) and bool(r['client_tests']) and all(s['status']=='observed' for c in r['client_tests'] for s in c['samples']) and (a.quick or (r['server']['status'] in ('supported_verified','hybrid_test_failed') and all(t['status']!='unknown' for t in r['server'].get('current_targets',[]))))
+        if a.output:
+            dest=pathlib.Path(a.output).absolute(); fd,path=tempfile.mkstemp(prefix='.atr-report.',dir=dest.parent)
+            try:
+                with os.fdopen(fd,'w') as f: json.dump(r,f,ensure_ascii=False,indent=2); f.write('\n'); f.flush(); os.fsync(f.fileno())
+                os.replace(path,dest)
+            finally:
+                if os.path.exists(path): os.unlink(path)
+        if a.json: print(json.dumps(r,ensure_ascii=False,indent=2))
+        else: display(r)
+    return 0 if r['complete'] else 2
+
+def cleanup():
+    for p in list(reversed(PROCESSES)): stop(p)
+def interrupted(signum,frame): raise KeyboardInterrupt()
+if __name__=='__main__':
+    signal.signal(signal.SIGTERM,interrupted)
+    try: sys.exit(main())
+    except KeyboardInterrupt: print('检测已中止；临时探针正在清理',file=sys.stderr); sys.exit(130)
+    except (OSError,ValueError,ProbeError) as e: print('检测未能完成: '+type(e).__name__,file=sys.stderr); sys.exit(2)
+    finally: cleanup()
+
+ATR_REALITY_PROBE_PY
+}
+
 # ----------------------------- 5. REALITY 管理 --------------------------------
 realityShowParams() {
     echoContent skyBlue "\n---------------- 当前 Reality 参数 ----------------"
@@ -6380,6 +6914,7 @@ manageReality() {
     echoContent yellow "4.重置密钥对和 Short ID（独立模式只影响所选协议）"
     echoContent yellow "5.按各自核心自检"
     echoContent yellow "6.切换共享 / 独立配置"
+    echoContent yellow "7.REALITY 能力与协商检测（MLKEM / 指纹 / 服务端）"
     local c id="" profile port scope="全部 Reality 协议"
     ask c "请选择:" || return 1
     case "${c}" in
@@ -6416,6 +6951,7 @@ manageReality() {
         pickRealityMode || return 1
         if applyStaged "切换 Reality 配置方式"; then postChangeShow "" "Reality 配置方式已更新"; selfCheckAll; else stagedDiscard; return 1; fi
         ;;
+    7) realityCapabilities ;;
     *) echoContent red " ---> 选择错误"; return 1 ;;
     esac
 }
@@ -8297,6 +8833,7 @@ ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+R
   show [用户] [1]                  查看账号(第二个参数 1 同时显示二维码)
   sub [用户]                       查看订阅链接
   selfcheck                        按节点所属核心做真实回环握手测试
+  reality-capabilities [选项]      检测 REALITY 客户端 / 服务端 / 实际协商（--help 查看）
   reality-mode shared|independent [--from 协议ID]  切换 Reality 参数方式
   sni <host[:port]> [--protocol 协议ID] [--force]      修改 Reality 目标域名(SNI)
   passwd <用户> [新密码] [--keep-sub]  重置密码(不给则随机)；订阅已启用时默认同时更换订阅链接，--keep-sub 保留旧链接
@@ -8562,6 +9099,11 @@ main() {
     help | -h | --help)
         usage
         return 0
+        ;;
+    reality-capabilities)
+        shift
+        realityCapabilities "$@"
+        return $?
         ;;
     recover-tls)
         # 开机依赖单元：只恢复证书，不启动服务、不迁移订阅，避免服务依赖递归。

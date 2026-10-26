@@ -1,6 +1,6 @@
 # AnyTLS-Reality
 
-> 本目录是尚未发布到 GitHub 的 v1.2.9 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
+> 本目录是尚未发布到 GitHub 的 v1.3.0 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
 
 sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
@@ -160,6 +160,40 @@ atr reality-mode shared --from vless_reality_vision
 `atr selfcheck` 会按服务端核心选择探针：Xray 节点使用本机 Xray，sing-box 节点使用本机 sing-box；输出明确显示 `xray → xray` 或 `sing-box → sing-box`。Xray 的 Reality XHTTP 和 TLS XHTTP 现在也能自动检查。内核升级/回退验收复用同一检查逻辑，真实握手失败仍会回滚。
 
 自检通过证明当前同核心客户端能完成回环握手及访问测试站点，不能证明所有第三方或旧版客户端兼容，也不能证明公网防火墙已经正确放行。Xray 与 sing-box 的跨核心 Reality 兼容问题仍应按实际客户端组合确认；共享密钥不会消除该差异。Naive 仍需其专用客户端验证。Xray TLS 探针信任本机已配置证书，sing-box 非 Reality TLS 探针仍跳过证书链验证，均不等同于公众 CA 信任验证。
+
+## REALITY 能力与协商检测（v1.3.0）
+
+菜单 **5 → 7**，或执行 `atr reality-capabilities`。诊断与原来的 `atr selfcheck` 分开：自检检查节点能否使用，本项检查指定核心文件的客户端指纹、服务端混合密钥交换和受控协商，不给出笼统的“完全抗量子安全”评级。
+
+```bash
+atr reality-capabilities
+# 快速检查客户端，不下载参考核心、不运行服务端探针
+atr reality-capabilities --quick --no-fetch
+# 保存脱敏 JSON；也可用 --json 仅向标准输出写 JSON
+atr reality-capabilities --output /root/reality-capabilities.json
+# 仅使用指定本机二进制，禁止下载
+atr reality-capabilities --sing-box /path/to/sing-box --xray /path/to/xray --no-fetch
+atr reality-capabilities --fingerprints chrome,firefox,safari,randomized --samples 5
+```
+
+脚本内嵌 Python 标准库探针，只需上传单个 shell 脚本；需要本机有 Python 3，深度探测还需要 openssl 生成一次性证书。不会自动安装系统软件。若已有 Xray，则用它作参考；若没有，默认在私有临时目录取得 Xray **v26.10.21** 参考探针，核对 GitHub 正式发布属性和官方资产 SHA256 后才解压执行，结束后删除。参考版本固定用于复现，不替换、升级或回退生产核心。自动下载支持 amd64/arm64；其他架构可用 `--xray` 指定。`--no-fetch` 可禁止下载，缺少依赖时返回“未能确认”。
+
+| 项目 | 实际验证方法 |
+|---|---|
+| 核心身份 | 版本、SHA256、可读取的 Go 构建信息及 uTLS 模块版本；不能凭版本或字符串存在推断算法能力 |
+| 客户端发送行为 | 临时运行实际 sing-box 的 AnyTLS/VLESS REALITY 客户端，重组 TCP/TLS record 后解析 ClientHello；分别报告 supported_groups、key_share、长度和顺序 |
+| 指纹差异 | 默认 chrome、firefox、safari 各 1 次，randomized 每个协议 3 次；`--samples 1–20` 调整随机样本，`--protocol anytls|vless|both` 指定协议 |
+| 服务端能力 | 临时 VLESS 入站验证共用 REALITY 层，先做 X25519 经典对照，再做强制 MLKEM 的 Xray 参考对照及 sing-box 测试；须完成认证后的不可预测测试数据转发 |
+| 当前目标配置 | 从 state.json 读取 sing-box Reality 协议的 SNI 和目标端口，以一次性密钥构建临时实例，用参考客户端检查本次实际协商；独立配置分别处理并按目标去重 |
+| 额外抗量子认证 | 单列为未验证；本版本不主动验证 ML-DSA，不能将混合密钥交换等同于完整抗量子身份认证 |
+
+`--target 域名[:端口]` 可额外指定目标，最多 4 个；`--state 路径` 可指定状态文件；`--timeout 1–15` 设置单次网络操作超时。所有临时服务仅绑定回环，SOCKS 入口有一次性认证，配置、临时目录和报告均限制权限。不修改 state、服务、节点或防火墙。目标握手可能访问配置中的外部 SNI；受控核心能力测试本身只走回环。
+
+JSON 结果中 `supported_verified` 表示服务端在本次参考组合中完成混合交换、REALITY 认证及数据转发；`hybrid_test_failed` 表示混合测试失败、经典与混合参考对照通过，只能描述此版本/探针组合；`unknown` 表示缺少证据或对照不完整；快速模式服务端为 `not_run`。缺失初始 KeyShare 仅描述本指纹的发送行为，不据此断言整个核心不支持算法；HelloRetryRequest 与最终 ServerHello 区分处理。
+
+退出码 0 表示请求的检测范围已完成，**不表示客户端都发送了 MLKEM、所有能力均可用或具有完整抗量子安全**；2 表示参数错误或存在未能确认的必需项目。报告文件使用 600 权限、原子替换，不包含私钥、密码、Short ID 或原始握手报文。
+
+服务端测试使用 VLESS 作为共用 REALITY 层的数据载体，不能用 Xray 客户端直接证明 AnyTLS 应用层互通。当前目标是临时配置仿真，并非正在运行的生产连接抓包；诊断进程环境也可能与 systemd 服务不同。没有可读的 Reality 配置时，只测试核心受控能力。单次成功不证明所有第三方客户端、公网入口或长期安全。
 
 ## v1.2.9 状态与防火墙提示
 
