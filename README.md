@@ -1,5 +1,7 @@
 # AnyTLS-Reality
 
+> 本目录是尚未发布到 GitHub 的 v1.3.0 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
+
 sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
 界面、菜单编号和操作习惯参考并派生自 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent)（v2ray-agent 目前没有 AnyTLS + Reality 这个组合），安装后直接输入 `atr` 进入管理菜单。本项目是独立的派生作品，与 v2ray-agent 官方无关联。
