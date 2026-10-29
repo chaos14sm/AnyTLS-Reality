@@ -7,6 +7,61 @@ sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
 > **项目状态**：开发期间在隔离沙箱中，用真实的 sing-box / Xray / mihomo / nginx 二进制做过端到端验证（包括 AnyTLS + Reality 的回环握手）。2026-10-25 又在一台全新的 Debian 13 VPS（systemd 257、nginx 1.26）上做过一次完整的实机审计（v1.2.5）：真实 systemd 服务管理与沙箱、nginx 降权到 `atr-nginx`、真实 iptables 端口跳跃、各协议的真实数据转发（含 Windows 上的 sing-box 客户端经公网连接、官方 NaiveProxy 客户端、Xray 原生 XHTTP 客户端）、事务回滚与恢复、订阅撤销、DNS rebinding 对照实验，以及用 `strace` 核对凭据不出现在命令行上；v1.2.6 增加了相关修复；v1.2.7 进一步修复证书崩溃恢复和防火墙事务边界；v1.2.8 增加同核心自检与 Reality 共享/独立配置，并在原 Debian 13 VPS 上重新回归。详见 CHANGELOG.md 和随版本提供的测试报告。**仍未在真实服务器上验证**的：acme.sh 真实签发与 DNS API、WARP 注册、IPv6 专属流程与 NAT64、RHEL 系 + SELinux、arm64、BBR/DD、长时间压力测试。建议先在测试机上试用，遇到问题请到 Issues 反馈。
 
+## v1.4.0 — 按核心安装、v2rayN 导出与私有二维码（2026-10-29）
+
+本版整合实际部署反馈。保留旧节点端口、密钥、Short ID 和旧 Xray 回落结构；替换脚本不会自动把已有节点迁移到新端口。新增部署使用下列流程。
+
+升级前备份安装目录及本脚本所用的 acme.sh 证书记录；替换脚本后执行 `atr restart` 应用渲染并重新生成客户端文件。旧 HY2 不会自动开启 TCP 网站。旧脚本不理解独立 Xray 监听、签名二维码和新的续签钩子；回退须一起恢复旧版完整配置、服务及相关 ACME 记录，不能只替换脚本。
+
+### 安装入口
+
+主菜单 `1.sing-box 核心安装` 列出脚本实现的 12 种组合，顺序为 AnyTLS+Reality、VLESS+Reality+Vision、Hysteria2、Naive、Tuic、VLESS+TLS_Vision+TCP、VLESS+TLS+WS、VMess+TLS+WS、Trojan+TLS、VLESS+Reality+gRPC、VMess+TLS+HTTPUpgrade、AnyTLS+TLS。
+
+主菜单 `2.Xray-core 核心安装` 列出 7 种组合：VLESS+Reality+Vision、VLESS+TLS_Vision+TCP、VLESS+TLS+WS、VMess+TLS+WS、Trojan+TLS、VLESS+Reality+XHTTP、VLESS+XHTTP+TLS。
+
+两者均支持英文逗号多选，回车只选择第一项。首次没有重新安装选项；已有部署默认追加/更新，保留另一个核心的其他协议。选到同名协议时明确处理迁移。清空重装只在已有配置时作为明确选项出现。
+
+新装 Xray 的 WS/VMess+WS/Trojan 默认独立 TLS 监听，不默默增加 TLS Vision。多选时可明确选择共享 TLS Vision 前置，界面会说明需要加入该协议；旧回落结构继续沿用。选择 Xray 时先说明 Reality 兼容性风险，输入目标后再显示实际证书链/协商筛查结果。
+
+### 端口与标准网站
+
+新 Reality 节点默认随机空闲 TCP 端口；重配默认保留原端口。HY2 优先 UDP 443，无法使用时提供其他空闲端口。标准 HTTP/3 安装可启用 Nginx TCP 80/443 配套网站：80 强制跳转 HTTPS，443 与 UDP 入口展示同一套所选伪装内容。检查 TCP 与 UDP 各自的冲突，不停止或覆盖其他网站，不自动移动已有节点。
+
+Hysteria 官方服务端的 listenHTTP/listenHTTPS/forceHTTPS 不会写入 sing-box；TCP 部分由独立 Nginx 实例完成。网站 proxy 继续使用私有网关，file 使用用户的公开目录，string 为固定内容，默认 404 和高级 302 均保留。TCP string 内容限制 2 KiB，避免 Nginx 指令体积问题；HTTP/3 自身的 string 上限沿用原设置。Nginx 专用账号须能读取 file 的 index.html 与 robots.txt，不会擅自开放私人目录。
+
+开启 obfs 后 HTTP/3 伪装停用；若 TCP 网站已经启用，它可继续服务普通 HTTPS，但不发布 HTTP/3 Alt-Svc。已有 HY2 不因升级自动换端口或开启 TCP 网站，菜单 `4 → 9` 可单独设置。
+
+HTTP-01 自动续签会需要临时释放 TCP 80。本版为本脚本管理的 standalone 证书记录配置 pre/post 钩子：只停、恢复自己的 Nginx，恢复失败保留标记；钩子记录纳入配置备份/回滚。已有自定义钩子或未知记录格式不自动覆盖，启用配套网站时会报错停止。DNS API 与手工证书不做这项迁移；真实签发不属于本次测试覆盖。异常中断留下 `acme-http-stopped` 时，核对 ACME 已结束，再执行脚本的 `acme-post` 或手工恢复服务。
+
+### 默认输出 v2rayN 自定义配置
+
+每次部署完成，只展示本次选择节点的分享链接、二维码路径和逐节点配置。文件保存到 `clients/<用户>/v2rayN/`；每个 JSON 只包含一个节点，旁边说明 Core 类型与 SOCKS 端口。Xray 节点生成 Xray JSON，sing-box 节点生成 sing-box JSON，Naive 生成其专用 JSON。AnyTLS+Reality 导入 v2rayN 时仍选择 sing-box 核心；v2rayN 并没有跨核心通用的专属 JSON 格式。
+
+自定义配置仅监听 `127.0.0.1:10818`，在 v2rayN 中填写同样的 SOCKS 端口；分流由 v2rayN 前置处理。若本机该端口已占用，需要同时修改 JSON 及导入项。导出使用真实服务器地址和严格 TLS/Reality 验证，不带 VPS 上的证书绝对路径。私有 CA 需要在客户端另外建立信任，不能关闭验证代替。
+
+结束后可选择额外导出 sing-box 或 mihomo：从已部署且可表达的节点中单选、多选或全选。单选只有一个代理节点，多选生成一个合法聚合配置。保留服务端核心标识与跨核心风险提示；AnyTLS+Reality 不进入 mihomo 列表，Naive 使用专用配置。选择期间配置被另一个终端修改时拒绝发布旧快照。自动生成的全量文件仍用于内部订阅，不再全部打印；菜单 `7 → 9` 可重新按需选择。
+
+### 二维码只在本机生成
+
+使用 qrencode 离线生成 PNG，数据通过标准输入传入，不交给第三方二维码网站，不放进生成工具的命令行。默认保存 `qr/local/<用户>/`，目录/图片仅 root 可读，通过 SSH 查看或下载；没有通用分享 URI 的协议不生成通用二维码，超长内容明确改用链接/JSON。
+
+具备以下条件才输出自己的 HTTPS 图片网址：证书验证通过且覆盖域名、未来 5 分钟仍有效，域名当前 A/AAAA 均指向已知本机地址，存在正在运行的受管理 HTTPS 网站入口，而且 Nginx 支持 secure_link。没有这些条件时只提供终端二维码/本地 PNG，不创建明文 HTTP 二维码服务，也不为了二维码新增公网端口。
+
+网址使用独立随机图片 ID、Nginx secure_link 签名及 **300 秒有效期**，不包含节点 URI。请求时验证签名和期限，篡改/缺签名返回 403，过期返回 410；资源目录不列出，关闭该路径访问日志/错误日志、文件缓存，添加 no-store/no-referrer/noindex 等响应头，并限制下载请求。仅签名图片路径映射到私有 web 副本，原始本地图片、注册表和签名密钥不作为网站目录开放。
+
+配置提交前撤销旧二维码；重新生成会更换图片 ID，撤销直接删除本地与 web 图片，无需等待 Nginx 重启。失效操作不会因回滚恢复旧图片，必要时重新生成。拿到有效网址的人仍可取图，已下载/截图的二维码无法撤回；要让其节点凭据失效，需要重置对应节点凭据。该路径应保持直连，不另加 CDN/外部反向代理。
+
+```bash
+atr qr generate [用户]     # 重新生成 PNG，具备条件时显示新的 5 分钟链接
+atr qr links [用户]        # 查看图片路径，具备条件时签发新的短期链接
+atr qr regenerate [用户]  # 更换图片 ID，使原来的下载链接失效
+atr qr revoke [用户]      # 删除该用户全部二维码；不指定用户则处理全部
+```
+
+交互入口为 `7 → 8`。二维码文件本身包含完整客户端凭据，应像配置文件一样保管。依赖仍为 Python 3、qrencode 和现有 Nginx，不需要额外的常驻二维码程序。
+
+原生核心、HTTP/HTTPS/HTTP3、签名链接和完整事务的测试结果见 [测试报告](TEST-REPORT.md)。实现依据：[v2rayN 自定义配置](https://github.com/2dust/v2rayN/wiki/Description-of-some-ui#添加自定义配置配置文件)、[qrencode](https://github.com/fukuchi/libqrencode)、[Nginx secure_link](https://nginx.org/en/docs/http/ngx_http_secure_link_module.html)、[Hysteria 网站入口说明](https://v2.hysteria.network/docs/advanced/Full-Server-Config/#httphttps-masquerading)。
+
 ## v1.3.2 — HY2 伪装与 Reality 配置、验收（2026-10-29）
 
 新增功能需要 Python 3；安装流程会检查并安装。旧节点的带宽、密钥、Short ID、填充和时间策略不会因替换脚本而自动重置。
@@ -47,7 +102,7 @@ v1.3.1 的自适应带宽、官方多端口 URI、双栈端口跳跃和防火墙
 
 ## 特性
 
-- **5 个预设组合排在最前**：VLESS+Reality+Vision、AnyTLS+Reality、Tuic、Hysteria2、Naive；v2ray-agent 支持的其他协议在「任意组合安装」里列出
+- **按核心安装**：sing-box 12 种组合（AnyTLS+Reality 排第一），Xray 7 种组合；单选/多选，支持两个核心按协议共存。
 - **sing-box 排第一，Xray-core 排第二**
 - **AnyTLS + Reality 一键安装**：安装 sing-box → 询问端口与 Reality SNI（推荐列表 / 自定义输入 / TLS 1.3 可达性检测）→ 生成密钥对 → 配置 AnyTLS 入站使用 Reality → systemd 服务 → 防火墙放行 → 回环握手自检
 - **只用正式发布的稳定版内核**：候选版本依次来自 GitHub `releases/latest` API → 重定向探测 → 手动输入；不论来自哪一层，都要再向 GitHub API 核对这个 tag 是正式发布（不是 draft / prerelease）才会下载，核对不了就中止（需要能直连 `api.github.com`，见「安全模型」）。也可以用 `ATR_XRAY_VERSION` / `ATR_SINGBOX_VERSION` 固定版本（同样要核对）。下载后做 SHA256 校验；换内核后做回环握手的互通检查，握手失败自动恢复旧内核
@@ -113,8 +168,8 @@ atr
 
 | 编号 | 功能 | 说明 |
 | --- | --- | --- |
-| 1 | 安装 / 重新安装 | 先选内核（1.sing-box 2.Xray-core），再在 5 个预设组合里多选（回车默认 `1,2`）。Xray 只有 VLESS+Reality+Vision 属于预设 |
-| 2 | 任意组合安装 | 列出全部协议，前 5 个预设仍排在最前 |
+| 1 | sing-box 核心安装 | 全部 12 种已实现组合，单选/多选；默认第 1 项 AnyTLS+Reality |
+| 2 | Xray-core 核心安装 | 全部 7 种已实现组合，单选/多选；默认第 1 项 VLESS+Reality+Vision |
 | 3 | 一键无域名 AnyTLS+Reality | 只装 sing-box 与 AnyTLS+Reality，不需要域名和证书 |
 | 4 | Hysteria2 管理 | 重新配置、卸载、端口跳跃 |
 | 5 | REALITY 管理 | 查看各协议参数、修改 SNI/端口、按协议重置密钥与 Short ID、自检、切换共享/独立配置 |
@@ -159,10 +214,10 @@ atr
 
 交互安装：菜单 `3`，或菜单 `1` 选 sing-box 后选 `2`。
 
-非交互安装（`--port` 缺省为 443，被占用则随机；`--sni` 省略时沿用已有配置，新配置缺省为 `www.microsoft.com`；`--user` 缺省为随机名）：
+非交互安装（`--port` 新装缺省随机，已有节点保留原端口；`--sni` 省略时沿用已有配置，新配置缺省为 `www.microsoft.com`；`--user` 缺省为随机名）：
 
 ```bash
-atr install-anytls-reality --port 443 --sni dl.google.com --user alice
+atr install-anytls-reality --sni dl.google.com --user alice
 ```
 
 要点：
@@ -255,7 +310,7 @@ HTTP-01 申请前的 80/tcp 放行、卸载时的规则回收统一使用 `fwApp
 ```text
 atr                                打开交互式管理菜单
 atr install-anytls-reality [选项]  非交互一键安装 AnyTLS+Reality
-      --port N        监听端口(默认 443，被占用则随机)
+      --port N        监听端口(新装默认随机，已有节点保留原端口)
       --sni host[:p]  Reality SNI(省略沿用已有配置，新配置默认 www.microsoft.com)
       --dest host[:p] 独立指定 Reality dest（省略默认跟随 SNI）
       --user name     首个用户名(默认随机)

@@ -42,7 +42,7 @@ export LANG=en_US.UTF-8
 # - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
 # - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
 # - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
-ATR_VERSION="v1.3.2"
+ATR_VERSION="v1.4.0"
 # v1.3.2：HY2 目标评估与默认反代；Reality 每节点目标/密钥复用、原生兼容验收、时间差；AnyTLS 填充。
 # v1.2.9：补齐 ACME / 卸载防火墙提示；状态显示 Reality 与订阅配置。
 # v1.2.8：按节点所属核心自检；Reality 支持共享/按协议独立配置。
@@ -810,11 +810,11 @@ bootStartup() {
 # 顺序即菜单顺序: 前 5 项是预设组合；sing-box 排在 Xray 之前
 read -r -d '' PROTO_REGISTRY <<'EOF'
 [
- {"id":"vless_reality_vision","name":"VLESS+Reality+Vision","short":"VLESS_Reality_Vision","cores":["sing-box","xray"],"reality":true,"tls":false,"net":"tcp","note":"推荐","preset":true},
  {"id":"anytls_reality","name":"AnyTLS+Reality","short":"AnyTLS_Reality","cores":["sing-box"],"reality":true,"tls":false,"net":"tcp","note":"推荐","preset":true},
- {"id":"tuic","name":"Tuic","short":"Tuic","cores":["sing-box"],"reality":false,"tls":true,"net":"udp","preset":true},
+ {"id":"vless_reality_vision","name":"VLESS+Reality+Vision","short":"VLESS_Reality_Vision","cores":["sing-box","xray"],"reality":true,"tls":false,"net":"tcp","note":"推荐","preset":true},
  {"id":"hysteria2","name":"Hysteria2","short":"Hysteria2","cores":["sing-box"],"reality":false,"tls":true,"net":"udp","preset":true},
  {"id":"naive","name":"Naive","short":"Naive","cores":["sing-box"],"reality":false,"tls":true,"net":"tcp","preset":true,"selfcheck":false},
+ {"id":"tuic","name":"Tuic","short":"Tuic","cores":["sing-box"],"reality":false,"tls":true,"net":"udp","preset":true},
  {"id":"vless_vision_tls","name":"VLESS+TLS_Vision+TCP","short":"VLESS_TCP_TLS_Vision","cores":["sing-box","xray"],"reality":false,"tls":true,"net":"tcp","note":"推荐"},
  {"id":"vless_ws","name":"VLESS+TLS+WS","short":"VLESS_WS","cores":["sing-box","xray"],"reality":false,"tls":true,"net":"tcp","note":"仅CDN推荐","cdn":true},
  {"id":"vmess_ws","name":"VMess+TLS+WS","short":"VMess_WS","cores":["sing-box","xray"],"reality":false,"tls":true,"net":"tcp","note":"仅CDN推荐","cdn":true},
@@ -1241,7 +1241,7 @@ def validate_extras(s):
 
 def nginx_gateway(s,ca):
     h=s.get('protocols',{}).get('hysteria2',{});m=h.get('masquerade',{})
-    if h.get('obfs',{}).get('type') or m.get('mode')!='proxy' or not m.get('gateway_port'):return ''
+    if (h.get('obfs',{}).get('type') and not h.get('web',{}).get('enabled')) or m.get('mode')!='proxy' or not m.get('gateway_port'):return ''
     errors=validate_extras(s)
     if errors:raise ValueError('; '.join(errors))
     if not pathlib.Path(ca).is_file():raise ValueError('无法找到验证 HTTPS 上游所需的 CA 文件')
@@ -2968,27 +2968,33 @@ read -r -d '' JQ_XRAY <<'EOF'
   def sniffing: if $sniff == "1" then {sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}} else {} end;
   # Vision 前置的回落链: 默认回落到 nginx(或 Trojan -> nginx)，h2 回落到 31302，WS 按路径回落
   def fallbacks:
-    [ (if ($PR.trojan.core // "") == "xray" then {dest: $trojanPort, xver: 1} else {dest: $ngxPort, xver: 1} end),
+    [ (if ($PR.trojan.core // "") == "xray" and ($PR.trojan.listen_mode // "legacy")!="standalone" then {dest: $trojanPort, xver: 1} else {dest: $ngxPort, xver: 1} end),
       {alpn: "h2", dest: $ngxH2Port, xver: 1} ]
-    + (if ($PR.vless_ws.core // "") == "xray" then [{path: ("/" + $P + "ws"), dest: $wsPort, xver: 1}] else [] end)
-    + (if ($PR.vmess_ws.core // "") == "xray" then [{path: ("/" + $P + "vws"), dest: $vwsPort, xver: 1}] else [] end);
+    + (if ($PR.vless_ws.core // "") == "xray" and ($PR.vless_ws.listen_mode // "legacy")!="standalone" then [{path: ("/" + $P + "ws"), dest: $wsPort, xver: 1}] else [] end)
+    + (if ($PR.vmess_ws.core // "") == "xray" and ($PR.vmess_ws.listen_mode // "legacy")!="standalone" then [{path: ("/" + $P + "vws"), dest: $vwsPort, xver: 1}] else [] end);
   def inbound($id; $c):
     if $id == "vless_vision_tls" then
       {port: $c.port, protocol: "vless", tag: "VLESSTCP",
        settings: {clients: xusers($id), decryption: "none", fallbacks: fallbacks},
        streamSettings: {network: "tcp", security: "tls", tlsSettings: (tlsCert + {alpn: (if ($S.alpn // "h2") == "http/1.1" then ["http/1.1", "h2"] else ["h2", "http/1.1"] end)})}} + sniffing
     elif $id == "vless_ws" then
+      if ($c.listen_mode // "legacy")=="standalone" then {port:$c.port,protocol:"vless",tag:"VLESSWS",settings:{clients:xusers($id),decryption:"none"},streamSettings:{network:"ws",security:"tls",tlsSettings:tlsCert,wsSettings:{path:("/"+$P+"ws")}}}
+      else
       {listen: "127.0.0.1", port: $wsPort, protocol: "vless", tag: "VLESSWS",
        settings: {clients: xusers($id), decryption: "none"},
-       streamSettings: {network: "ws", security: "none", wsSettings: {acceptProxyProtocol: true, path: ("/" + $P + "ws")}}}
+       streamSettings: {network: "ws", security: "none", wsSettings: {acceptProxyProtocol: true, path: ("/" + $P + "ws")}}} end
     elif $id == "vmess_ws" then
+      if ($c.listen_mode // "legacy")=="standalone" then {port:$c.port,protocol:"vmess",tag:"VMessWS",settings:{clients:xusers($id)},streamSettings:{network:"ws",security:"tls",tlsSettings:tlsCert,wsSettings:{path:("/"+$P+"vws")}}}
+      else
       {listen: "127.0.0.1", port: $vwsPort, protocol: "vmess", tag: "VMessWS",
        settings: {clients: xusers($id)},
-       streamSettings: {network: "ws", security: "none", wsSettings: {acceptProxyProtocol: true, path: ("/" + $P + "vws")}}}
+       streamSettings: {network: "ws", security: "none", wsSettings: {acceptProxyProtocol: true, path: ("/" + $P + "vws")}}} end
     elif $id == "trojan" then
+      if ($c.listen_mode // "legacy")=="standalone" then {port:$c.port,protocol:"trojan",tag:"trojanTCP",settings:{clients:xusers($id)},streamSettings:{network:"tcp",security:"tls",tlsSettings:(tlsCert+{alpn:["http/1.1"]})}}
+      else
       {listen: "127.0.0.1", port: $trojanPort, protocol: "trojan", tag: "trojanTCP",
        settings: {clients: xusers($id), fallbacks: [{dest: ($ngxPort | tostring), xver: 1}]},
-       streamSettings: {network: "tcp", security: "none", tcpSettings: {acceptProxyProtocol: true}}}
+       streamSettings: {network: "tcp", security: "none", tcpSettings: {acceptProxyProtocol: true}}} end
     elif $id == "vless_reality_vision" then
       {port: $c.port, protocol: "vless", tag: "VLESSReality",
        settings: {clients: xusers($id), decryption: "none"},
@@ -3084,7 +3090,7 @@ stateNeedsCore() { # stateNeedsCore <state.json> <core>
 }
 # Xray 的 Vision/WS/Trojan 前置需要 nginx 回落站
 stateNeedsNginxFallback() {
-    jq -e '[.protocols|to_entries[]|select(.value.core=="xray" and (.key=="vless_vision_tls" or .key=="vless_ws" or .key=="vmess_ws" or .key=="trojan"))]|length>0' "$1" >/dev/null 2>&1
+    jq -e '[.protocols|to_entries[]|select(.value.core=="xray" and (.key=="vless_vision_tls" or ((.key=="vless_ws" or .key=="vmess_ws" or .key=="trojan") and (.value.listen_mode // "legacy")!="standalone")))]|length>0' "$1" >/dev/null 2>&1
 }
 stateNeedsHttpUpgradeNginx() {
     jq -e '.protocols.vmess_httpupgrade != null' "$1" >/dev/null 2>&1
@@ -3134,6 +3140,7 @@ http {
         font/woff2 woff2;
         text/plain txt;
     }
+    limit_req_zone \$binary_remote_addr zone=atr_qr_download:1m rate=3r/s;
     default_type application/octet-stream;
     server_tokens off;
     sendfile on;
@@ -3206,6 +3213,7 @@ server {
     real_ip_header proxy_protocol;
     client_header_timeout 1071906480m;
     keepalive_timeout 1071906480m;
+$(qrNginxLocations "${st}")
 $(_ngxRootLocation "${redirect}")
 }
 server {
@@ -3214,6 +3222,7 @@ server {
     root ${WEB_ROOT};
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
+$(qrNginxLocations "${st}")
 $(_ngxRootLocation "${redirect}")
 }
 EOF
@@ -3249,6 +3258,7 @@ $([[ -n "${ssl6}" ]] && echo "    listen [::]:${port} ssl so_keepalive=on;")
         proxy_redirect off;
         proxy_read_timeout 86400s;
     }
+$(qrNginxLocations "${st}")
 $(_ngxRootLocation "${redirect}")
 }
 EOF
@@ -3282,6 +3292,7 @@ $([[ -n "${ssl6}" ]] && echo "    listen [::]:${sub_port} ssl so_keepalive=on;")
     ssl_certificate ${TLS_DIR}/${domain}.crt;
     ssl_certificate_key ${TLS_DIR}/${domain}.key;
     ${NGX_SSL_COMMON}
+$(qrNginxLocations "${st}")
 EOF
             else
                 cat <<EOF
@@ -3310,6 +3321,7 @@ EOF
         } >"${out}/atr_subscribe.conf"
     fi
     renderHY2Gateway "${st}" "${out}" || return 1
+    renderHY2Web "${st}" "${out}" || return 1
     return 0
 }
 
@@ -3854,7 +3866,7 @@ backupLive() {
         fi
     done < <(_txnFiles)
     # nginx 站点配置在新事务里可能新增，同样需要记录"原先不存在"
-    for f in atr_alone.conf atr_httpupgrade.conf atr_subscribe.conf; do
+    for f in atr_alone.conf atr_httpupgrade.conf atr_subscribe.conf atr_hy2_masq.conf atr_hy2_web.conf; do
         grep -qF "${NGX_CONFD}/${f}" "${bdir}/manifest" || printf 'N\t%s\n' "${NGX_CONFD}/${f}" >>"${bdir}/manifest" || return 1
     done
     chmod 700 "${bdir}"
@@ -3900,6 +3912,8 @@ _removeLive() { # _removeLive <目标>
 # 把候选配置落到 live 位置（先配置，后 state）。每一步都检查，任何一步失败返回 1，由调用方回滚
 _commitLive() { # _commitLive <stage 目录> <候选 state 文件>
     local stage=$1 st=$2 nf base mode
+    if [[ -d "${ATR_HOME}/qr" ]] && ! cmp -s "${st}" "${ATR_STATE}"; then qrRevoke || return 1; fi
+    reconcileACMEHooks "${st}" || return 1
     mkdir -p "${SB_DIR}/conf" "${XRAY_DIR}/conf" "${NGX_CONFD}" || return 1
     if stateNeedsCore "${st}" sing-box; then _commitFile "${stage}/sing-box/config.json" "${SB_CONF}" 600 || return 1; else _removeLive "${SB_CONF}" || return 1; fi
     if stateNeedsCore "${st}" xray; then _commitFile "${stage}/xray/config.json" "${XRAY_CONF}" 600 || return 1; else _removeLive "${XRAY_CONF}" || return 1; fi
@@ -3909,8 +3923,7 @@ _commitLive() { # _commitLive <stage 目录> <候选 state 文件>
     for nf in "${stage}"/nginx/*.conf; do
         [[ -e "${nf}" ]] || continue
         base=$(basename "${nf}")
-        mode=644
-        [[ "${base}" == "atr_subscribe.conf" ]] && mode=600 # 里面有对等密钥
+        mode=600 # Nginx 配置可能包含订阅密钥或二维码签名密钥
         _commitFile "${nf}" "${NGX_CONFD}/${base}" "${mode}" || return 1
     done
     _commitFile "${st}" "${ATR_STATE}" 600
@@ -4554,7 +4567,9 @@ applyStaged() {
     printf '%s\n' "${NEW_STATE}" | jq . >"${st}"
 
     # 1) 状态校验（端口冲突/缺失字段/证书文件）
-    errs=$(validateState <"${st}")
+    local validation_rc=0
+    errs=$(validateState <"${st}") || validation_rc=$?
+    if ((validation_rc)) && [[ -z "${errs}" ]]; then errs="状态校验器失败，已停止配置提交"; fi
     if [[ -n "${errs}" ]]; then
         echoContent red " ---> 配置不合法，未做任何改动:"
         printf '%s\n' "${errs}" | sed 's/^/      - /'
@@ -4792,7 +4807,7 @@ read -r -d '' JQ_NODES <<'EOF'
   def cdnCapable($id): ($reg | map(select(.id == $id)) | .[0].cdn // false);
   def isReality($id): ($reg | map(select(.id == $id)) | .[0].reality // false);
   def vport: ($PR.vless_vision_tls.port // 443);
-  def portof($id; $c): if (($id == "vless_ws" or $id == "vmess_ws" or $id == "trojan") and $c.core == "xray") then vport else $c.port end;
+  def portof($id; $c): if (($id == "vless_ws" or $id == "vmess_ws" or $id == "trojan") and $c.core == "xray" and ($c.listen_mode // "legacy")!="standalone") then vport else $c.port end;
   # ---- 链接工具 ----
   def hostp($h): if ($h | contains(":")) then "[" + $h + "]" else $h end;
   def q($pairs): $pairs | map(.[0] + "=" + .[1]) | join("&");
@@ -5859,6 +5874,7 @@ postChangeShow() { # postChangeShow [用户名|空=全部] [提示语]；返回 
     local gr=0
     regenClients || gr=1
     showAccounts "${1:-}" 0
+    offerClientExports
     if ((gr)); then
         echoContent red "\n ! ${2:-配置已变更}，但客户端配置/订阅文件没有全部生成成功，上面显示的账号信息请以实际生效的服务端配置为准。"
     else
@@ -6138,6 +6154,8 @@ manageUsers() {
     echoContent yellow "5.删除用户"
     echoContent yellow "6.重置密码/UUID"
     echoContent yellow "7.重新生成全部客户端配置"
+    echoContent yellow "8.二维码图片与短期链接"
+    echoContent yellow "9.选择节点导出 sing-box / mihomo"
     echoContent red "=============================================================="
     local c
     ask c "请输入:" || return 1
@@ -6155,6 +6173,8 @@ manageUsers() {
     7)
         regenClients && echoContent green " ---> 已重新生成全部客户端配置: ${CLIENT_DIR}/"
         ;;
+    8) qrMenu ;;
+    9) clientExportMenu ;;
     *) echoContent red " ---> 选择错误" ;;
     esac
 }
@@ -6874,15 +6894,23 @@ configureProtocol() {
     case "${id}" in
     vless_ws | vmess_ws | trojan)
         if [[ "${core}" == "xray" ]]; then
-            echoContent green " ---> ${name} 通过 VLESS+Vision 前置的回落接入，无需单独端口"
-            stagedEdit --arg id "${id}" --arg c "${core}" '.protocols[$id]={core:$c}'
+            if [[ "${INSTALL_XRAY_SHARED:-0}" == 1 ]]; then
+                stagedEdit --arg id "${id}" '.protocols[$id]={core:"xray",listen_mode:"legacy"}'
+                return $?
+            fi
+            if protoInstalled "${id}" && [[ "$(S --arg id "${id}" '.protocols[$id].core')" == xray && "$(S --arg id "${id}" '.protocols[$id].listen_mode // "legacy"')" == legacy ]]; then
+                echoContent yellow "沿用旧版 Vision 前置回落，现有客户端端口不变。"
+                return 0
+            fi
+            askPort port "${id}" "${name} " tcp || return 1
+            stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]=((.protocols[$id] // {})+{core:$c,port:$p,listen_mode:"standalone"})'
             return $?
         fi
         askPort port "${id}" "${name} " tcp || return 1
         stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]=((.protocols[$id] // {}) + {core:$c,port:$p})'
         ;;
     vless_vision_tls)
-        askPort port "${id}" "${name} " tcp 443 || return 1
+        askPort port "${id}" "${name} " tcp "$([[ "${INSTALL_RESERVE_WEB:-0}" == 1 ]] && suggestPort tcp "${id}" || echo 443)" || return 1
         stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]=((.protocols[$id] // {}) + {core:$c,port:$p})'
         ;;
     tuic)
@@ -6940,21 +6968,22 @@ installProtocols() {
         echoContent green " ---> 出口访问模式沿用: $(egressModeLabel "${egress}")（可在 11.分流工具 → 6 修改）"
     fi
 
-    # Xray 的 WS/VMess-WS/Trojan 只能挂在 Vision 前置的回落上
-    if [[ "${core}" == "xray" ]]; then
-        local need0=0
-        for id in "${ids[@]}"; do [[ "${id}" == vless_ws || "${id}" == vmess_ws || "${id}" == trojan ]] && need0=1; done
-        if ((need0)) && [[ " ${ids[*]} " != *" vless_vision_tls "* ]]; then
-            echoContent yellow " ---> Xray 的 WS/VMess-WS/Trojan 依赖 VLESS+TLS_Vision 前置，已自动加入"
-            ids=(vless_vision_tls "${ids[@]}")
+    local INSTALL_RESERVE_WEB=0
+    local INSTALL_XRAY_SHARED=0 want_shared=0
+    if [[ "${core}" == xray && ${#ids[@]} -gt 1 ]]; then
+        for id in "${ids[@]}"; do [[ "${id}" == vless_ws || "${id}" == vmess_ws || "${id}" == trojan ]] && want_shared=1; done
+        if ((want_shared)) && confirm '使用共享 TLS Vision 前置？会明确加入 VLESS+TLS_Vision，所选 WS/Trojan 共用其端口；默认独立监听' n; then
+            INSTALL_XRAY_SHARED=1
+            [[ " ${ids[*]} " == *" vless_vision_tls "* ]] || ids=(vless_vision_tls "${ids[@]}")
         fi
     fi
+    [[ " ${ids[*]} " == *" hysteria2 "* ]] && INSTALL_RESERVE_WEB=1
     for id in "${ids[@]}"; do
         [[ "$(protoField "${id}" tls)" == "true" ]] && needTLS=1
         [[ "$(protoField "${id}" reality)" == "true" ]] && needReality=1
         case "${id}" in vless_ws | vmess_ws | vmess_httpupgrade | vless_reality_xhttp | vless_xhttp_tls) needPath=1 ;; esac
         [[ "${id}" == vmess_httpupgrade ]] && needNginx=1
-        [[ "${core}" == "xray" ]] && case "${id}" in vless_vision_tls | vless_ws | vmess_ws | trojan) needNginx=1 ;; esac
+        [[ "${core}" == "xray" ]] && case "${id}" in vless_vision_tls) needNginx=1 ;; esac
     done
     total=4
     ((needTLS)) && total=$((total + 1))
@@ -7044,6 +7073,8 @@ installProtocols() {
         }
     done
 
+    if [[ " ${ids[*]} " == *" hysteria2 "* ]]; then configureHY2Web || { stagedDiscard; return 1; }; fi
+
     for id in "${ids[@]}"; do
         if [[ "${id}" == anytls_reality || "${id}" == anytls_tls ]]; then configureAnyTLSPadding "${id}" || { stagedDiscard; return 1; }; fi
         if [[ "$(protoField "${id}" reality)" == true ]]; then configureRealityClientChecks "${id}" || { stagedDiscard; return 1; }; fi
@@ -7071,7 +7102,8 @@ installProtocols() {
     local gr=0
     regenClients || gr=1
     selfCheckAll || { echoContent red " ---> 配置已生效，但有协议自检失败；请按上面的提示检查日志、目标域名或内核版本"; gr=1; }
-    showAccounts "" 0
+    SHOW_PROTOCOLS="${ids[*]}" showAccounts "" 0
+    offerClientExports
     return "${gr}"
 }
 
@@ -7173,6 +7205,7 @@ cliInstallAnyTLSReality() {
     [[ -z "${egress}" ]] && egress=$(stagedGet '.egress.mode // ""')
     stagedEdit --arg m "${egress:-public}" '.egress.mode=$m' || return 1
     stagedRefreshEgressPublicIPs
+    [[ -z "${port}" ]] && port=$(stagedGet '.protocols.anytls_reality.port // empty')
     [[ -z "${port}" ]] && port=$(suggestPort tcp anytls_reality)
     if [[ -z "${sni}" ]]; then
         profile=$(stagedRealityProfile anytls_reality) || return 1
@@ -8167,6 +8200,7 @@ manageUDPProtocol() { # manageUDPProtocol <hysteria2|tuic>
             echoContent yellow "6.未认证 HTTP/3 伪装"
             echoContent yellow "7.导出配置实连（保留 DNS / TLS / 跳跃范围）"
             echoContent yellow "8.宿主流量采样与本机阈值告警"
+            echoContent yellow "9.TCP 80/443 配套网站"
         fi
     else
         echoContent yellow "依赖 sing-box 内核与域名证书\n"
@@ -8202,6 +8236,7 @@ manageUDPProtocol() { # manageUDPProtocol <hysteria2|tuic>
     6) [[ "${id}" == hysteria2 ]] && manageHY2Option masquerade ;;
     7) [[ "${id}" == hysteria2 ]] && selfCheckHY2Endpoint ;;
     8) [[ "${id}" == hysteria2 ]] && monitorMenu ;;
+    9) [[ "${id}" == hysteria2 ]] && manageHY2Web ;;
     *) echoContent red " ---> 选择错误" ;;
     esac
 }
@@ -9899,6 +9934,7 @@ uninstallAll() {
 # =============================================================================
 
 usage() {
+    echo "二维码: qr generate|regenerate|links|revoke [用户]；默认本机 PNG，可信 HTTPS 时提供 5 分钟链接"
     echo "诊断: site-check URL；selfcheck --protocol ID --client sing-box|mihomo|xray [--endpoint]；client-test --node FILE --client CORE --binary PATH [--external]"
     cat <<EOF
 ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+Reality)
@@ -10062,18 +10098,13 @@ securityUpgradeNotice() {
 printMenu() {
     cd "${HOME:-/root}" 2>/dev/null || true
     echoContent red "\n=============================================================="
-    echoContent green "脚本: ${ATR_PROJECT_NAME}（基于 mack-a/v2ray-agent 改造，AGPL-3.0）"
+    echoContent green "脚本: ${ATR_PROJECT_NAME}"
     echoContent green "当前版本：${ATR_VERSION}"
-    echoContent green "参考项目：https://github.com/mack-a/v2ray-agent"
     echoContent green "描述：sing-box / Xray 管理脚本 [AnyTLS + Reality]\c"
     showInstallStatus
     echoContent red "\n=============================================================="
-    if stateExists && [[ -n "$(installedProtocols)" ]]; then
-        echoContent yellow "1.重新安装"
-    else
-        echoContent yellow "1.安装"
-    fi
-    echoContent yellow "2.任意组合安装"
+    echoContent yellow "1.sing-box 核心安装"
+    echoContent yellow "2.Xray-core 核心安装"
     echoContent yellow "3.一键无域名 AnyTLS+Reality"
     echoContent yellow "4.Hysteria2管理"
     echoContent yellow "5.REALITY管理"
@@ -10139,6 +10170,613 @@ menuLoop() {
     done
 }
 
+atrReleaseTools() {
+    command -v python3 >/dev/null || { echoContent red "需要 Python3 执行本地配置导出" >&2; return 1; }
+    python3 /dev/fd/4 "$@" 4<<'ATR_RELEASE_PY'
+"""v1.4.0 local exports and private QR artifacts. Standard library only."""
+import base64,contextlib,hashlib,json,os,pathlib,re,secrets,shlex,subprocess,sys,tempfile,time
+
+def atomic(path,data,mode=0o600):
+    fd,name=tempfile.mkstemp(prefix='.new-',dir=path.parent)
+    try:
+        os.fchmod(fd,mode)
+        with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+        os.replace(name,path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):os.unlink(name)
+
+def private_dir(p,mode=0o700):
+    if p.is_symlink():raise ValueError('拒绝符号链接目录')
+    p.mkdir(exist_ok=True,parents=True,mode=mode);p.chmod(mode)
+    return p
+
+def root(home):
+    p=pathlib.Path(home)/'qr'
+    if p.is_symlink():raise ValueError('二维码根目录不能是符号链接')
+    p.mkdir(exist_ok=True,mode=0o700)
+    return p
+def registry(home):
+    p=root(home)/'registry.json'
+    if p.is_symlink():raise ValueError('二维码注册表不能是符号链接')
+    return json.loads(p.read_text()) if p.exists() else []
+def save(home,items):atomic(root(home)/'registry.json',(json.dumps(items)+'\n').encode())
+
+def revoke(home,user=''):
+    items=registry(home);keep=[]
+    for e in items:
+        if user and e['user']!=user:keep.append(e);continue
+        for p in [root(home)/'web'/(e['id']+'.png'),root(home)/'local'/e['user']/e['file']]:
+            if not p.is_relative_to(root(home)):raise ValueError('二维码路径越界')
+            p.unlink(missing_ok=True)
+    save(home,keep)
+
+def generate(home,payload):
+    user=payload['user']
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9._@-]{0,47}',user):raise ValueError('用户名不合法')
+    entries=registry(home);old=[e for e in entries if e['user']==user];keep=[e for e in entries if e['user']!=user]
+    local=private_dir(root(home)/'local'/user);web=private_dir(root(home)/'web')
+    new=[]
+    try:
+        for i,n in enumerate(payload['nodes']):
+            uri=n.get('uri')
+            if not uri:continue
+            if len(uri.encode())>2300:continue
+            proto=n['proto']
+            if not re.fullmatch(r'[a-z0-9_]+',proto):raise ValueError('协议标识不合法')
+            h=hashlib.sha256(uri.encode()).hexdigest();e=next((e for e in old if e['uri_hash']==h),None)
+            if e is None:
+                rid=secrets.token_hex(16)
+                e=dict(user=user,proto=proto,name=n['name'],uri_hash=h,id=rid,file=proto+'-'+rid+'.png')
+            q=subprocess.run(['qrencode','-8','-l','M','-m','4','-s','6','-t','PNG','-o','-'],input=uri.encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+            if q.returncode or not q.stdout.startswith(b'\x89PNG\r\n\x1a\n'):raise ValueError('二维码生成失败（长度或 PNG 支持）')
+            atomic(local/e['file'],q.stdout);atomic(web/(e['id']+'.png'),q.stdout);new.append(e)
+        active={e['id'] for e in new}
+        for e in old:
+            if e['id'] not in active:
+                (web/(e['id']+'.png')).unlink(missing_ok=True);(local/e['file']).unlink(missing_ok=True)
+        save(home,keep+new)
+    except Exception:
+        # Never leave a published partial generation after a failed operation.
+        for e in old+new:
+            (web/(e['id']+'.png')).unlink(missing_ok=True);(local/e['file']).unlink(missing_ok=True)
+        save(home,keep);raise
+    return new
+
+def sign(secret,rid,expires):
+    if not re.fullmatch(r'[a-f0-9]{64}',secret) or not re.fullmatch(r'[a-f0-9]{32}',rid):raise ValueError('签名参数不合法')
+    uri='/q/'+rid+'.png'
+    digest=hashlib.md5((str(expires)+uri+' '+secret).encode()).digest()
+    return uri+'?s='+base64.urlsafe_b64encode(digest).rstrip(b'=').decode()+'&e='+str(expires)
+
+def quote(v,dollar=True):
+    s=str(v).replace('\\','\\\\').replace('"','\\"').replace('\n','\\n').replace('\r','\\r')
+    if dollar:s=s.replace('$','\\$')
+    return '"'+s+'"'
+
+def qr_location(home,state):
+    secret=state.get('qr',{}).get('signing_key','')
+    if not re.fullmatch(r'[a-f0-9]{64}',secret):return ''
+    return '''
+location ~ "^/q/(?<qr_file>[a-f0-9]{32}\\.png)$" {
+    access_log off;
+    error_log /dev/null crit;
+    autoindex off;
+    open_file_cache off;
+    limit_req zone=atr_qr_download burst=6 nodelay;
+    limit_req_status 429;
+    limit_rate 64k;
+    disable_symlinks on;
+    default_type image/png;
+    add_header Cache-Control "private, no-store, max-age=0" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+    if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+    if ($arg_e !~ "^[0-9]{10}$") { return 403; }
+    secure_link $arg_s,$arg_e;
+    secure_link_md5 "$secure_link_expires$uri '''+secret+'''";
+    if ($secure_link = "") { return 403; }
+    if ($secure_link = "0") { return 410; }
+    alias '''+quote(str(pathlib.Path(home)/'qr/web')+'/')[:-1]+'''$qr_file";
+}
+location /q/ { access_log off; error_log /dev/null crit; return 404; }
+'''
+
+def client(n):
+    p=n['proto'];net='xhttp' if 'xhttp' in p else 'ws' if p in ('vless_ws','vmess_ws') else 'tcp'
+    protocol='vmess' if p=='vmess_ws' else 'trojan' if p=='trojan' else 'vless'
+    user={'id':n['uuid'],'encryption':'none'}
+    if protocol=='vmess':user={'id':n['uuid'],'alterId':0,'security':'auto'}
+    if 'vision' in p:user['flow']='xtls-rprx-vision'
+    settings=({'servers':[{'address':n['server'],'port':n['port'],'password':n['password']}]}
+              if protocol=='trojan' else {'vnext':[{'address':n['server'],'port':n['port'],'users':[user]}]})
+    reality='reality' in p
+    stream={'network':net,'security':'reality' if reality else 'tls'}
+    if reality:
+        t={'serverName':n['sni'],'fingerprint':'chrome','publicKey':n['pbk'],'shortId':n['sid']}
+        if n.get('pqv'):t['mldsa65Verify']=n['pqv']
+        stream['realitySettings']=t
+    else:stream['tlsSettings']={'serverName':n['sni'],'allowInsecure':False,'fingerprint':'chrome'}
+    if net=='ws':stream['wsSettings']={'path':n['path'],'headers':{'Host':n['host']}}
+    if net=='xhttp':stream['xhttpSettings']={'path':n['path'],'host':n['host'],'mode':'auto'}
+    return {'log':{'loglevel':'warning'},'inbounds':[{'tag':'local-socks','listen':'127.0.0.1','port':10818,'protocol':'socks','settings':{'auth':'noauth','udp':True}}],
+            'outbounds':[{'tag':'proxy','protocol':protocol,'settings':settings,'streamSettings':stream}]}
+
+def client_sb(n):
+    o=n['singbox']
+    return {'log':{'level':'warn'},'dns':{'servers':[{'type':'local','tag':'local'}]},
+            'inbounds':[{'type':'socks','tag':'local-socks','listen':'127.0.0.1','listen_port':10818}],
+            'outbounds':[o],'route':{'default_domain_resolver':'local','final':o['tag']}}
+
+def web_conf(state,tlsdir,qr):
+    h=state.get('protocols',{}).get('hysteria2',{});m=h.get('masquerade',{})
+    if not h.get('web',{}).get('enabled'):return ''
+    d=state['domain']
+    if not re.fullmatch(r'[A-Za-z0-9.-]+',d):raise ValueError('网站域名不合法')
+    mode=m.get('mode','off');prefix=''
+    if mode=='proxy':body='proxy_pass http://127.0.0.1:'+str(m['gateway_port'])+';\n proxy_set_header Host $host;'
+    elif mode=='file':body='root '+quote(m['directory'])+'; disable_symlinks on; index index.html;'
+    elif mode=='string':
+        if len(m['content'].encode())>2048:raise ValueError('TCP 网站固定内容最多 2 KiB')
+        # geo stores a literal string; unlike return/map values it does not
+        # interpret a user's HTML "$name" as an Nginx variable.
+        prefix='geo $atr_hy2_fixed { default '+quote(m['content'],False)+'; }\n'
+        body='default_type text/html; return 200 $atr_hy2_fixed;'
+    elif mode=='redirect':body='return 302 '+quote(m['url'])+';'
+    else:body='return 404;'
+    alt='' if h.get('obfs',{}).get('type') else 'add_header Alt-Svc '+quote('h3=":'+str(h['port'])+'"; ma=300')+' always;'
+    v6=os.environ.get('ATR_RELEASE_IPV6')=='1'
+    return prefix+'''server {
+ listen 80;
+'''+(' listen [::]:80;\n' if v6 else '')+'''
+ server_name '''+d+''';
+ location / { return 308 https://'''+d+'''$request_uri; }
+}
+server {
+ listen 443 ssl;
+'''+(' listen [::]:443 ssl;\n' if v6 else '')+'''
+ server_name '''+d+''';
+ ssl_certificate '''+quote(str(pathlib.Path(tlsdir)/(d+'.crt')))+''';
+ ssl_certificate_key '''+quote(str(pathlib.Path(tlsdir)/(d+'.key')))+''';
+ ssl_protocols TLSv1.2 TLSv1.3;
+ server_tokens off;
+'''+qr+'''
+ location / { '''+alt+'\n '+body+''' }
+}
+'''
+
+def acme_hooks(payload):
+    p=pathlib.Path(payload['conf'])
+    if p.is_symlink() or not p.is_file():raise ValueError('找不到可迁移的 HTTP-01 证书记录')
+    s=p.read_text()
+    for field,command in [('Le_PreHook','acme-pre'),('Le_PostHook','acme-post')]:
+        cmd=shlex.quote(payload['script'])+' '+command
+        encoded='__ACME_BASE64__START_'+base64.b64encode(cmd.encode()).decode()+'__ACME_BASE64__END_'
+        line=field+"='"+encoded+"'"
+        found=re.search(r'^'+field+r"='([^']*)'$",s,re.M)
+        if not found and re.search(r'^'+field+r'=',s,re.M):raise ValueError('ACME 钩子记录格式未知，不能自动覆盖')
+        if found and found[1] and found[1]!=encoded:
+            raise ValueError('已有自定义 ACME 钩子，不能自动覆盖')
+        if found:s=s[:found.start()]+line+s[found.end():]
+        else:s+='\n'+line+'\n'
+    atomic(p,s.encode())
+
+def main():
+    action=sys.argv[1];home=sys.argv[2]
+    if action=='qr-revoke':revoke(home,sys.argv[3] if len(sys.argv)>3 else '');return
+    data=json.load(sys.stdin)
+    if action=='qr-generate':print(json.dumps(generate(home,data),ensure_ascii=False))
+    elif action=='qr-list':print(json.dumps([e for e in registry(home) if not data.get('user') or e['user']==data['user']],ensure_ascii=False))
+    elif action=='qr-sign':print(sign(data['key'],data['id'],int(time.time())+300))
+    elif action=='qr-nginx':print(qr_location(home,data))
+    elif action=='client-xray':print(json.dumps(client(data),ensure_ascii=False,indent=2))
+    elif action=='client-sing-box':print(json.dumps(client_sb(data),ensure_ascii=False,indent=2))
+    elif action=='acme-hooks':acme_hooks(data)
+    elif action=='hy2-web':print(web_conf(data,sys.argv[3],''))
+    else:raise ValueError('未知操作')
+
+if __name__=='__main__':
+    try:main()
+    except (ValueError,OSError,subprocess.SubprocessError,KeyError) as e:
+        print('本地导出失败: '+(str(e) if isinstance(e,ValueError) else type(e).__name__),file=sys.stderr);sys.exit(1)
+ATR_RELEASE_PY
+}
+# v1.4.0: core menus, standalone Xray, private client exports and local QR.
+xrayCompatibilityNotice() {
+    echoContent yellow "Xray Reality 提示：部分版本与 sing-box/mihomo 客户端不兼容；某些长证书链与 MLKEM 目标组合存在握手风险。"
+    echoContent yellow "建议先用 Xray 客户端验收；输入 dest/SNI 后仍会进行针对目标的筛查，不能仅凭端口监听判断成功。"
+}
+
+installCoreFlow() {
+    local core=$1 sel
+    [[ "${core}" == xray ]] && xrayCompatibilityNotice
+    echoContent skyBlue "\n================ ${core} 协议安装（支持多选） ================"
+    protoMenu "${core}"
+    echoContent yellow "按编号选择，例如 1 或 1,3；回车默认第 1 项。追加安装会保留其他核心和未选择的协议。"
+    ask sel "请选择:" 1 || return 1
+    parseSelection "${sel}" || return 1
+    installProtocols "${core}" "${SELECTED_IDS[@]}"
+}
+installPresetFlow() { installCoreFlow sing-box; }
+installCustomFlow() { installCoreFlow xray; }
+
+suggestPort() {
+    local net=$1 id=$2 used
+    used=$(stagedUsedPorts | awk '{print $2}' | tr '\n' ' ')
+    if [[ "${id}" == hysteria2 ]] && ! stagedUsedPorts | grep -qx 'udp 443' && { ! portInUse 443 udp || portOwnedByUs 443 udp; }; then echo 443; return; fi
+    randomFreePort "${used} 80 443"
+}
+
+askPort() {
+    local __v=$1 id=$2 desc=$3 net=$4 def=${5:-} p current
+    current=$(stagedGet --arg id "${id}" '.protocols[$id].port // empty')
+    [[ -n "${current}" ]] && def=${current}
+    [[ -n "${def}" ]] || def=$(suggestPort "${net}" "${id}")
+    while :; do
+        ask p "请输入${desc}端口[回车默认: ${def}]:" "${def}" || return 1
+        isPort "${p}" || { echoContent red '端口不合法';continue; }
+        if stagedUsedPorts | grep -qx "${net} ${p}" && [[ "${p}" != "${current}" ]]; then echoContent red '端口已被候选配置占用';continue;fi
+        if [[ "${p}" == "${current}" ]] && jq -e --arg id "${id}" --arg net "${net}" --argjson p "${p}" '.protocols|to_entries|any(.key!=$id and .value.port==$p and (if .key=="hysteria2" or .key=="tuic" then "udp" else "tcp" end)==$net)' <<<"${NEW_STATE}" >/dev/null; then echoContent red '端口与其他协议冲突';continue;fi
+        if portInUse "${p}" "${net}" && ! portOwnedByUs "${p}" "${net}"; then echoContent red "${p}/${net} 已有其他程序监听，请换端口";continue;fi
+        break
+    done
+    printf -v "${__v}" '%s' "${p}"
+}
+
+configureHY2Web() {
+    local enabled current net p conflict=0
+    current=$(stagedGet '.protocols.hysteria2.web.enabled // false')
+    echoContent yellow "HY2 UDP 与网站 TCP 独立：标准入口为 UDP 443 + Nginx TCP 80/443，80 强制跳转到 HTTPS。"
+    echoContent yellow "网站沿用所选伪装内容；不开启混淆时发布 HTTP/3 提示。不会覆盖已有网站或迁移其他节点的端口。"
+    while read -r net p; do [[ "${net}" == tcp && ( "${p}" == 80 || "${p}" == 443 ) ]] && conflict=1; done < <(stagedUsedPorts)
+    for p in 80 443; do
+        if portInUse "${p}" tcp && ! { [[ "${current}" == true ]] && portOwnedByUs "${p}" tcp; }; then conflict=1; fi
+    done
+    if ((conflict)); then
+        echoContent yellow "TCP 80/443 被现有服务或候选协议占用；本次无法启用配套网站。可取消后调整端口，再重试。"
+        confirm "仅部署 UDP 节点、不启用 TCP 网站，继续？" y || return 1
+        stagedEdit '.protocols.hysteria2.web.enabled=false'; return
+    fi
+    enabled=y
+    [[ "$(stagedGet '.protocols.hysteria2.obfs.type // ""')" != "" ]] && enabled=n
+    [[ "${current}" == true ]] && enabled=y
+    if confirm "启用 TCP 80/443 配套网站？" "${enabled}"; then
+        if [[ "$(stagedGet '.protocols.hysteria2.masquerade.mode // "off"')" == proxy && "$(stagedGet '.protocols.hysteria2.masquerade.gateway_port // 0')" == 0 ]]; then
+            local gateway
+            gateway=$(randomFreePort "$(stagedUsedPorts | awk '{print $2}' | tr '\n' ' ') 80 443") || return 1
+            stagedEdit --argjson p "${gateway}" '.protocols.hysteria2.masquerade.gateway_port=$p' || return 1
+        fi
+        stagedEdit '.protocols.hysteria2.web.enabled=true'
+    else stagedEdit '.protocols.hysteria2.web.enabled=false'; fi
+}
+
+stateNeedsHY2Web() { jq -e '.protocols.hysteria2.web.enabled==true' "$1" >/dev/null; }
+stateNeedsHY2Gateway() {
+    jq -e '(.protocols.hysteria2 // {}) as $h | (($h.obfs.type // "")=="" or $h.web.enabled==true) and ($h.masquerade.mode // "")=="proxy" and ($h.masquerade.gateway_port // 0)>0' "$1" >/dev/null
+}
+
+# Wrappers retain legacy fallbacks without reinterpreting old states.
+eval "$(declare -f stateNeedsNginx | sed '1s/stateNeedsNginx/_legacyNeedsNginx/')"
+stateNeedsNginx() { _legacyNeedsNginx "$1" || stateNeedsHY2Web "$1"; }
+eval "$(declare -f desiredFirewallPorts | sed '1s/desiredFirewallPorts/_legacyFirewallPorts/')"
+desiredFirewallPorts() {
+    { _legacyFirewallPorts "$1"; if stateNeedsHY2Web "$1"; then printf 'tcp 80\ntcp 443\n'; fi; } | sort -u
+}
+eval "$(declare -f expectedListeners | sed '1s/expectedListeners/_legacyListeners/')"
+expectedListeners() {
+    local st=$1
+    _legacyListeners "${st}" | while read -r net p; do
+        local skip=0 id ip
+        for id in vless_ws vmess_ws trojan; do
+            case "${id}" in vless_ws) ip=${XRAY_VLESS_WS_PORT} ;; vmess_ws) ip=${XRAY_VMESS_WS_PORT} ;; trojan) ip=${XRAY_TROJAN_PORT} ;; esac
+            [[ "${p}" == "${ip}" && "$(jq -r --arg id "${id}" '.protocols[$id].listen_mode // "legacy"' "${st}")" == standalone ]] && skip=1
+        done
+        ((skip)) || printf '%s %s\n' "${net}" "${p}"
+    done
+    if stateNeedsHY2Web "${st}"; then printf 'tcp 80\ntcp 443\n'; fi
+    return 0
+}
+
+eval "$(declare -f validateState | sed '1s/validateState/_legacyValidateState/')"
+validateState() {
+    local st rc=0
+    st=$(cat)
+    _legacyValidateState <<<"${st}" || rc=$?
+    jq -r '
+      if (.qr.signing_key // "")!="" and ((.qr.signing_key|type)!="string" or (.qr.signing_key|test("^[a-f0-9]{64}$")|not)) then "二维码签名密钥格式不合法" else empty end,
+      if (.protocols.hysteria2.web.enabled // false) then
+        if (.protocols.hysteria2.web.enabled|type)!="boolean" then "HY2 网站开关必须是布尔值" else empty end,
+        if ([.protocols|to_entries[]|select(.key!="hysteria2" and .key!="tuic" and (.value.port==80 or .value.port==443))]|length)>0 then "HY2 TCP 网站与其他节点的 80/443 端口冲突" else empty end,
+        if .nginx.subscribe.enabled==true and (.nginx.subscribe.port==80 or .nginx.subscribe.port==443) then "HY2 网站与订阅端口冲突" else empty end,
+        if .protocols.hysteria2.masquerade.mode=="string" and (.protocols.hysteria2.masquerade.content|utf8bytelength)>2048 then "TCP 网站固定内容最多 2 KiB" else empty end
+      else empty end,
+      (.protocols|to_entries[]|select(.value.core=="xray" and .value.listen_mode=="standalone")|select(.value.port==null)|"独立 Xray 入站必须指定端口")' <<<"${st}" || rc=$?
+    return "${rc}"
+}
+
+qrHttpsPort() { # Only existing HTTPS-capable managed website entrances.
+    local st=$1
+    if stateNeedsHY2Web "${st}"; then echo 443
+    elif jq -e '.nginx.subscribe.enabled==true and .nginx.subscribe.ssl==true' "${st}" >/dev/null; then jq -r '.nginx.subscribe.port' "${st}"
+    elif jq -e '.protocols.vmess_httpupgrade!=null' "${st}" >/dev/null; then jq -r '.protocols.vmess_httpupgrade.port' "${st}"
+    elif jq -e '.protocols.vless_vision_tls.core=="xray"' "${st}" >/dev/null; then jq -r '.protocols.vless_vision_tls.port' "${st}"
+    else return 1; fi
+}
+qrTrustedHTTPS() {
+    local st=$1 d crt ips ip known
+    d=$(jq -r '.domain // ""' "${st}"); isDomainName "${d}" || return 1
+    qrHttpsPort "${st}" >/dev/null || return 1
+    findNginxBin || return 1
+    "${NGINX_BIN}" -V 2>&1 | grep -q -- '--with-http_secure_link_module' || return 1
+    crt="${TLS_DIR}/${d}.crt"
+    tlsValidate "${crt}" "${TLS_DIR}/${d}.key" "${d}" || return 1
+    openssl x509 -in "${crt}" -noout -checkend 300 >/dev/null 2>&1 || return 1
+    timeout 5 openssl verify -purpose sslserver -verify_hostname "${d}" -untrusted "${crt}" "${crt}" >/dev/null 2>&1 || return 1
+    # Direct origin DNS only. Unknown/mixed/CDN addresses fail closed.
+    known=$( { jq -r '.egress.public_ips[]?, .egress.extra_ips[]?' "${st}"; [[ -n "${ATR_PUBLIC_IP:-}" ]] && printf '%s\n' "${ATR_PUBLIC_IP}"; ip -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4);print $4}'; } | sort -u)
+    ips=$(timeout 5 python3 -c 'import socket,sys;print("\n".join(sorted(set(x[4][0] for x in socket.getaddrinfo(sys.argv[1],443,type=socket.SOCK_STREAM,flags=0)))))' "${d}" 2>/dev/null)
+    [[ -n "${ips}" ]] || return 1
+    while read -r ip; do grep -Fxq "${ip}" <<<"${known}" || return 1; done <<<"${ips}"
+}
+qrNginxLocations() {
+    qrTrustedHTTPS "$1" || return 0
+    atrReleaseTools qr-nginx "${ATR_HOME}" <"$1"
+}
+renderHY2Web() {
+    stateNeedsHY2Web "$1" || return 0
+    ATR_RELEASE_IPV6="$(hasIPv6 && echo 1 || echo 0)" atrReleaseTools hy2-web "${ATR_HOME}" "${TLS_DIR}" <"$1" >"$2/atr_hy2_web.conf" || return 1
+    # The renderer inserts private QR locations only in the HTTPS server.
+    local locations
+    locations=$(qrNginxLocations "$1") || return 1
+    if [[ -n "${locations}" ]]; then
+        local f="$2/atr_hy2_web.conf" tmp
+        tmp=$(mktemp "${ATR_TMP:-/tmp}/qr-locations.XXXXXX") || return 1
+        printf '%s\n' "${locations}" >"${tmp}" || return 1
+        python3 - "${f}" "${tmp}" <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1]);s=p.read_text();s=s.replace(' server_tokens off;',' server_tokens off;\n'+pathlib.Path(sys.argv[2]).read_text(),1);p.write_text(s)
+PY
+    fi
+}
+
+qrApplyPerms() {
+    [[ -d "${ATR_HOME}/qr" ]] || return 0
+    local group
+    group=$(ngxWorkerGroup)
+    [[ ! -L "${ATR_HOME}/qr/web" ]] || return 1
+    mkdir -p "${ATR_HOME}/qr/web" || return 1
+    if [[ -n "${group}" ]] && stateNeedsNginx "${ATR_STATE}"; then
+        chown root:"${group}" "${ATR_HOME}/qr" "${ATR_HOME}/qr/web" || return 1
+        chmod 710 "${ATR_HOME}/qr" || return 1
+        chown -R root:"${group}" "${ATR_HOME}/qr/web" || return 1
+        chmod -R u=rwX,g=rX,o= "${ATR_HOME}/qr/web" || return 1
+    else chmod 700 "${ATR_HOME}/qr"; fi
+}
+qrRevoke() { [[ -d "${ATR_HOME}/qr" ]] || return 0; atrReleaseTools qr-revoke "${ATR_HOME}" "${1:-}"; }
+eval "$(declare -f applyStaged | sed '1s/applyStaged/_legacyApplyStaged/')"
+applyStaged() {
+    if [[ "$(stagedGet '.qr.signing_key // ""')" == "" ]]; then
+        local key
+        key=$(openssl rand -hex 32) || return 1
+        stagedEdit --arg key "${key}" '.qr.signing_key=$key' || return 1
+    fi
+    _legacyApplyStaged "$@"
+}
+
+makeV2rayNFiles() {
+    local user=$1 views=$2 dir node core proto i file records='[]' name out
+    dir="${CLIENT_DIR}/${user}/v2rayN"; mkdir -p "${dir}" && chmod 700 "${dir}" || return 1
+    rm -f "${dir}"/*.json
+    for ((i=0;i<$(jq length <<<"${views}");i++)); do
+        node=$(jq -c ".[${i}]" <<<"${views}");proto=$(jq -r .proto <<<"${node}");name=$(jq -r .name <<<"${node}")
+        core=$(S --arg id "${proto}" '.protocols[$id].core');file="${proto}-${i}.json"
+        if [[ "${proto}" == naive ]]; then
+            core=naiveproxy
+            out=$(jq '.naive|.listen="socks://127.0.0.1:10818"' <<<"${node}") || return 1
+        elif [[ "${core}" == xray ]]; then
+            out=$(atrReleaseTools client-xray "${ATR_HOME}" <<<"${node}") || return 1
+        elif jq -e '.singbox!=null' <<<"${node}" >/dev/null; then
+            out=$(atrReleaseTools client-sing-box "${ATR_HOME}" <<<"${node}") || return 1
+        else echoContent red "无法导出 ${proto} 的本机核心客户端";return 1;fi
+        jq -e 'type=="object" and (has("proxy") or ((.inbounds|length)>0 and (.outbounds|length)>0))' <<<"${out}" >/dev/null || return 1
+        atomicWrite "${dir}/${file}" 600 <<<"${out}" || return 1
+        records=$(jq --arg n "${name}" --arg f "${file}" --arg c "${core}" '.+[{name:$n,file:$f,core:$c,socks:10818}]' <<<"${records}") || return 1
+    done
+    atomicWrite "${dir}/index.json" 600 <<<"${records}"
+}
+eval "$(declare -f _generateClientFilesLocked | sed '1s/_generateClientFilesLocked/_legacyClientFilesLocked/')"
+_generateClientFilesLocked() {
+    _legacyClientFilesLocked "$@" || return 1
+    local u views payload
+    while read -r u; do
+        [[ -n "${1:-}" && "$1" != "${u}" ]] && continue
+        views=$(nodeViews "${u}") || return 1
+        makeV2rayNFiles "${u}" "${views}" || return 1
+        rm -f "${CLIENT_DIR}/${u}"/selected-*.json "${CLIENT_DIR}/${u}"/selected-*.yaml
+        if command -v qrencode >/dev/null; then
+            payload=$(jq -n --arg u "${u}" --argjson n "${views}" '{user:$u,nodes:$n}')
+            atrReleaseTools qr-generate "${ATR_HOME}" <<<"${payload}" >/dev/null || return 1
+        else echoContent yellow "缺少 qrencode，尚未生成二维码 PNG；安装 qrencode 后执行 atr qr generate";fi
+    done < <(userNames)
+    qrApplyPerms
+}
+
+qrShowNode() { # user, node name, include terminal QR
+    local user=$1 name=$2 uri=$3 terminal=${4:-0} entry localfile rid path port
+    if ((${#uri}>2300)); then echoContent yellow '二维码内容超过长度预算，请使用分享链接或 JSON。';return 0;fi
+    entry=$(atrReleaseTools qr-list "${ATR_HOME}" <<<"$(jq -n --arg u "${user}" '{user:$u}')" | jq -ce --arg n "${name}" '.[]|select(.name==$n)') || return 0
+    localfile="${ATR_HOME}/qr/local/${user}/$(jq -r .file <<<"${entry}")"
+    echoContent yellow " ---> 二维码 PNG（SSH 查看或下载）: ${localfile}"
+    [[ "${terminal}" == 1 ]] && printQR "${uri}"
+    if qrTrustedHTTPS "${ATR_STATE}" && serviceActive "${NGX_UNIT}" && portInUse "$(qrHttpsPort "${ATR_STATE}")" tcp && [[ -f "${NGX_CONFD}/atr_subscribe.conf" || -f "${NGX_CONFD}/atr_hy2_web.conf" || -f "${NGX_CONFD}/atr_httpupgrade.conf" || -f "${NGX_CONFD}/atr_alone.conf" ]]; then
+        # Require the running configuration to actually contain the current signer.
+        grep -q 'secure_link_md5' "${NGX_CONFD}"/atr_*.conf 2>/dev/null || return 0
+        rid=$(jq -r .id <<<"${entry}")
+        path=$(jq -n --arg id "${rid}" --arg k "$(S '.qr.signing_key // ""')" '{id:$id,key:$k}' | atrReleaseTools qr-sign "${ATR_HOME}") || return 1
+        port=$(qrHttpsPort "${ATR_STATE}")
+        echoContent yellow " ---> 本机 HTTPS 二维码（5 分钟有效，勿转发；保存图片不受过期撤回）"
+        printRaw green "https://$(S '.domain'):${port}${path}"
+    fi
+}
+
+showAccounts() {
+    stateExists || { echoContent red " ---> 未安装";return 1; }
+    local only=${1:-} qr=${2:-0} user views n name proto uri record file i
+    while read -r user; do
+        [[ -n "${only}" && "${only}" != "${user}" ]] && continue
+        views=$(nodeViews "${user}") || return 1
+        if [[ -n "${SHOW_PROTOCOLS:-}" ]]; then views=$(jq --arg ids "${SHOW_PROTOCOLS}" 'map(select(.proto as $p|($ids|split(" ")|index($p))!=null))' <<<"${views}");fi
+        echoContent skyBlue "\n==================== 账号: ${user} ===================="
+        for ((i=0;i<$(jq length <<<"${views}");i++)); do
+            n=$(jq -c ".[${i}]" <<<"${views}");name=$(jq -r .name <<<"${n}");proto=$(jq -r .proto <<<"${n}");uri=$(jq -r '.uri // empty' <<<"${n}")
+            echoContent skyBlue "\n$(protoName "${proto}") (${name})"
+            if [[ -n "${uri}" ]]; then
+                echoContent yellow " ---> 分享链接";printRaw green "${uri}"
+                qrShowNode "${user}" "${name}" "${uri}" "${qr}" || return 1
+            else echoContent yellow " ---> 没有通用分享 URI，请使用以下 v2rayN 自定义配置。";fi
+            file="${CLIENT_DIR}/${user}/v2rayN/index.json"
+            if [[ -s "${file}" ]]; then
+                record=$(jq -ce --arg n "${name}" '.[]|select(.name==$n)' "${file}") || return 1
+                file="${CLIENT_DIR}/${user}/v2rayN/$(jq -r .file <<<"${record}")"
+                echoContent yellow " ---> v2rayN 自定义配置：${file}"
+                echoContent yellow "导入时 Core 类型选择 $(jq -r .core <<<"${record}")，SOCKS 端口填写 10818；仅监听本机。"
+                cat "${file}"
+            else echoContent yellow " ---> 客户端文件尚未生成，请先重新生成。";fi
+        done
+    done < <(userNames)
+}
+
+selectClientExport() { # user, sing-box|mihomo
+    local user=$1 client=$2 views eligible choice i node out selected='[]' file revision rc=0
+    revision=$(stateRevision)
+    views=$(nodeViews "${user}") || return 1
+    eligible=$(jq --arg c "${client}" 'map(select(if $c=="sing-box" then .singbox!=null else .mihomo!=null end))' <<<"${views}") || return 1
+    [[ "$(jq length <<<"${eligible}")" != 0 ]] || { echoContent yellow "该客户端没有可导出的节点";return 0; }
+    PROTO_MENU_IDS=()
+    for ((i=0;i<$(jq length <<<"${eligible}");i++)); do
+        node=$(jq -c ".[${i}]" <<<"${eligible}");PROTO_MENU_IDS+=("${i}")
+        echoContent yellow "$((i+1)).$(jq -r .name <<<"${node}") [服务端: $(S --arg id "$(jq -r .proto <<<"${node}")" '.protocols[$id].core')]"
+    done
+    echoContent yellow "可生成配置不代表跨核心已兼容。Xray Reality → sing-box/mihomo 请按实际客户端验收；AnyTLS+Reality 不导出到 mihomo。"
+    ask choice "选择编号（英文逗号多选；a 全选；回车取消）:" || return 1
+    [[ -n "${choice}" ]] || return 0
+    if [[ "${choice}" == a ]]; then selected=${eligible}
+    else
+        parseSelection "${choice}" || return 1
+        for i in "${SELECTED_IDS[@]}"; do selected=$(jq --argjson n "$(jq -c ".[${i}]" <<<"${eligible}")" '.+[$n]' <<<"${selected}") || return 1;done
+    fi
+    lockAcquire || return 1
+    if ! _requireCleanTransaction || [[ "$(stateRevision)" != "${revision}" ]]; then
+        echoContent red '选择期间服务端配置已改变或存在未完成事务，请重新选择导出。';lockRelease;return 1
+    fi
+    if [[ "${client}" == sing-box ]]; then
+        out=$(cfgSbMin "$(jq -c '[.[].singbox]' <<<"${selected}")") || rc=1
+        file="${CLIENT_DIR}/${user}/selected-sing-box.json"
+        if ((rc==0)); then atomicWrite "${file}" 600 <<<"${out}" && _checkClientFile "${file}" '所选 sing-box 配置' && jq . "${file}" || rc=1;fi
+    else
+        file="${CLIENT_DIR}/${user}/selected-mihomo.yaml"
+        out=$(jsonToMihomoYaml <<<"$(jq -c '[.[].mihomo]' <<<"${selected}")") || rc=1
+        if ((rc==0)); then atomicWrite "${file}" 600 <<<"${out}" && cat "${file}" || rc=1;fi
+    fi
+    lockRelease
+    ((rc==0)) || { rm -f "${file}";return 1; }
+    echoContent yellow " ---> 所选导出已保存: ${file}（仅修改导出文件，不改变服务端）"
+}
+offerClientExports() {
+    [[ -t 0 ]] || return 0
+    local user
+    user=$(userNames | head -n 1)
+    [[ "$(userNames | wc -l)" -gt 1 ]] && { pickUser '选择客户端导出用户' || return 1;user=${PICKED_USER}; }
+    confirm '额外输出 sing-box 客户端配置？' n && selectClientExport "${user}" sing-box
+    confirm '额外输出 mihomo / Clash.Meta 配置片段？' n && selectClientExport "${user}" mihomo
+    return 0
+}
+qrCLI() {
+    local action=${1:-generate} user=${2:-}
+    [[ -z "${user}" ]] || userExists "${user}" || { echoContent red '用户不存在';return 1; }
+    lockAcquire || return 1
+    _requireCleanTransaction || { lockRelease;return 1; }
+    local rc=0
+    if [[ "${action}" == generate || "${action}" == regenerate ]]; then
+        command -v qrencode >/dev/null || { echoContent red '需要安装 qrencode 才能生成 PNG';lockRelease;return 1; }
+    fi
+    case "${action}" in
+    revoke) if qrRevoke "${user}"; then echoContent yellow '二维码链接已撤销，本地图片已删除。';else echoContent red '撤销失败，不能确认旧链接已失效';rc=1;fi ;;
+    generate|regenerate) qrRevoke "${user}" || rc=1; ((rc)) || _generateClientFilesLocked "${user}" || rc=1; ((rc)) || showAccounts "${user}" 1 || rc=1 ;;
+    links) showAccounts "${user}" 0 || rc=1 ;;
+    *) echo '用法: atr qr generate|regenerate|links|revoke [用户]';rc=1 ;;
+    esac
+    lockRelease;return "${rc}"
+}
+
+qrMenu() {
+    local action
+    pickUserOrAll || return 1
+    echoContent yellow '1.重新生成本地 PNG / 新签名链接  2.查看现有图片和链接  3.撤销二维码链接并删除图片'
+    ask action '请选择:' 1 || return 1
+    case "${action}" in 1) qrCLI regenerate "${PICKED_USER}" ;; 2) qrCLI links "${PICKED_USER}" ;; 3) qrCLI revoke "${PICKED_USER}" ;; *) return 1 ;; esac
+}
+clientExportMenu() {
+    pickUser || return 1
+    local client
+    ask client '1.sing-box  2.mihomo / Clash.Meta:' 1 || return 1
+    case "${client}" in 1) selectClientExport "${PICKED_USER}" sing-box ;; 2) selectClientExport "${PICKED_USER}" mihomo ;; *) return 1 ;; esac
+}
+manageHY2Web() {
+    stagedBegin
+    configureHY2Web || { stagedDiscard;return 1; }
+    if applyStaged 'HY2 TCP 配套网站'; then postChangeShow '' 'TCP 网站配置已更新';else stagedDiscard;return 1;fi
+}
+
+acmeConfigFile() {
+    local d mode dns
+    if [[ -n "${NEW_STATE:-}" ]]; then
+        d=$(stagedGet '.domain // ""');mode=$(stagedGet '.tls.mode // ""');dns=$(stagedGet '.tls.dns_api // ""')
+    else d=$(S '.domain // ""');mode=$(S '.tls.mode // ""');dns=$(S '.tls.dns_api // ""');fi
+    [[ "${mode}" == acme && -z "${dns}" ]] && isDomainName "${d}" || return 1
+    printf '%s/%s_ecc/%s.conf\n' "${ACME_HOME}" "${d}" "${d}"
+}
+eval "$(declare -f _txnFiles | sed '1s/_txnFiles/_legacyTxnFiles/')"
+_txnFiles() { _legacyTxnFiles; acmeConfigFile || true; }
+reconcileACMEHooks() {
+    local st=$1 file
+    stateNeedsHY2Web "${st}" || return 0
+    [[ "$(jq -r '.tls.mode // ""' "${st}")" == acme && "$(jq -r '.tls.dns_api // ""' "${st}")" == "" ]] || return 0
+    [[ -x "${ATR_SCRIPT_PATH}" ]] || { echoContent red 'HTTP-01 配套网站需要已保存的本机管理脚本；请下载为文件运行后重试。';return 1; }
+    file=$(acmeConfigFile) || return 1
+    jq -n --arg c "${file}" --arg s "${ATR_SCRIPT_PATH}" '{conf:$c,script:$s}' | atrReleaseTools acme-hooks "${ATR_HOME}"
+}
+acmeHTTPHook() {
+    local action=$1 marker="${ATR_HOME}/acme-http-stopped" rc=0
+    [[ -d "${ATR_HOME}" ]] || return 1
+    if [[ "${action}" == pre ]]; then
+        _requireCleanTransaction || return 1
+        if serviceActive "${NGX_UNIT}" && portInUse 80 tcp; then
+            printf 'managed-nginx\n' | atomicWrite "${marker}" 600 || return 1
+        fi
+        _prepare80 || { acmeHTTPHook post;return 1; }
+    elif [[ -f "${marker}" && ! -L "${marker}" ]]; then
+        systemctl start "${NGX_UNIT}" >/dev/null 2>&1 || rc=1
+        ((rc)) || waitServiceActive "${NGX_UNIT}" 10 || rc=1
+        ((rc)) || rm -f "${marker}" || rc=1
+    fi
+    return "${rc}"
+}
+
+eval "$(declare -f verifyRuntime | sed '1s/verifyRuntime/_legacyVerifyRuntime/')"
+verifyRuntime() {
+    _legacyVerifyRuntime "$1" || return 1
+    if stateNeedsHY2Web "$1" && [[ "$(jq -r '.protocols.hysteria2.masquerade.mode' "$1")" == file ]]; then
+        local dir
+        dir=$(jq -r '.protocols.hysteria2.masquerade.directory' "$1")
+        if ! runuser -u "$(ngxWorkerUser)" -- test -r "${dir}/index.html" || ! runuser -u "$(ngxWorkerUser)" -- test -r "${dir}/robots.txt"; then
+            echoContent red 'Nginx 专用账号无法读取公开静态目录的 index.html / robots.txt，请调整公开目录权限。'
+            return 1
+        fi
+    fi
+}
+
+
 # ----------------------------- main ------------------------------------------
 main() {
     local cmd=${1:-menu}
@@ -10151,6 +10789,7 @@ main() {
         usage
         return 0
         ;;
+    acme-pre|acme-post) checkRoot; acmeHTTPHook "${cmd#acme-}"; return $? ;;
     client-test) shift; clientTestCLI "$@"; return $? ;;
     site-check) shift; atrTools site-check "$@"; return $? ;;
     monitor-sample) stateExists || return 1; [[ "$(S '.monitor.enabled // false')" == true ]] || return 0; monitorSample; return $? ;;
@@ -10168,7 +10807,7 @@ main() {
     esac
     # 先校验命令是否合法: 输错命令不应该产生任何副作用（装 atr、建目录、装依赖）
     case "${cmd}" in
-    menu | install-anytls-reality | reload-core | restart | renew-tls | update-geo | apply-hop | status | show | sub | selfcheck | sni | reality-mode | passwd | adduser | deluser | log | uninstall | recover) ;;
+    menu | install-anytls-reality | reload-core | restart | renew-tls | update-geo | apply-hop | status | show | sub | qr | selfcheck | sni | reality-mode | passwd | adduser | deluser | log | uninstall | recover) ;;
     *)
         usage
         exit 1
@@ -10230,6 +10869,7 @@ main() {
         ;;
     show) showAccounts "${1:-}" "${2:-0}" ;;
     sub) showSubscriptionLinks "${1:-}" ;;
+    qr) qrCLI "$@" ;;
     selfcheck) selfCheckCLI "$@" ;;
     sni) cliSetSNI "$@" ;;
     reality-mode) cliRealityMode "$@" ;;
