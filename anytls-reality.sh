@@ -42,7 +42,7 @@ export LANG=en_US.UTF-8
 # - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
 # - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
 # - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
-ATR_VERSION="v1.4.0"
+ATR_VERSION="v1.4.1"
 # v1.3.2：HY2 目标评估与默认反代；Reality 每节点目标/密钥复用、原生兼容验收、时间差；AnyTLS 填充。
 # v1.2.9：补齐 ACME / 卸载防火墙提示；状态显示 Reality 与订阅配置。
 # v1.2.8：按节点所属核心自检；Reality 支持共享/按协议独立配置。
@@ -9934,7 +9934,7 @@ uninstallAll() {
 # =============================================================================
 
 usage() {
-    echo "二维码: qr generate|regenerate|links|revoke [用户]；默认本机 PNG，可信 HTTPS 时提供 5 分钟链接"
+    echo "二维码: qr generate|regenerate|links|revoke [用户]；AnyTLS+Reality 支持 Exclave/Shadowrocket，本机 PNG / 可信 HTTPS 5 分钟链接"
     echo "诊断: site-check URL；selfcheck --protocol ID --client sing-box|mihomo|xray [--endpoint]；client-test --node FILE --client CORE --binary PATH [--external]"
     cat <<EOF
 ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+Reality)
@@ -10173,8 +10173,8 @@ menuLoop() {
 atrReleaseTools() {
     command -v python3 >/dev/null || { echoContent red "需要 Python3 执行本地配置导出" >&2; return 1; }
     python3 /dev/fd/4 "$@" 4<<'ATR_RELEASE_PY'
-"""v1.4.0 local exports and private QR artifacts. Standard library only."""
-import base64,contextlib,hashlib,json,os,pathlib,re,secrets,shlex,subprocess,sys,tempfile,time
+"""v1.4.1 local exports and private QR artifacts. Standard library only."""
+import base64,contextlib,hashlib,json,os,pathlib,re,secrets,shlex,subprocess,sys,tempfile,time,urllib.parse
 
 def atomic(path,data,mode=0o600):
     fd,name=tempfile.mkstemp(prefix='.new-',dir=path.parent)
@@ -10210,6 +10210,34 @@ def revoke(home,user=''):
             p.unlink(missing_ok=True)
     save(home,keep)
 
+def qr_payloads(node):
+    """Client-specific AnyTLS+Reality formats; never advertise them as generic."""
+    if node.get('proto')!='anytls_reality':
+        uri=node.get('uri')
+        return [dict(client='generic',label='通用',payload=uri)] if uri else []
+    outbound=node.get('singbox') or {}
+    tls=outbound.get('tls') or {};reality=tls.get('reality') or {}
+    if (outbound.get('type')!='anytls' or not tls.get('enabled') or
+        not reality.get('enabled') or tls.get('insecure') or
+        not reality.get('public_key') or not tls.get('server_name') or
+        not outbound.get('server') or not outbound.get('password') or
+        not isinstance(outbound.get('server_port'),int) or
+        not 1<=outbound['server_port']<=65535):
+        raise ValueError('AnyTLS+Reality 二维码参数不完整或关闭了身份验证')
+    # A single outbound (not a full VPN config) enters Exclave's JSON importer.
+    exclave=json.dumps(outbound,ensure_ascii=True,separators=(',',':'))
+    host=outbound['server']
+    if ':' in host:host='['+host+']'
+    query=dict(peer=tls['server_name'],sni=tls['server_name'],security='reality',
+               pbk=reality['public_key'],sid=reality.get('short_id',''),
+               fp=(tls.get('utls') or {}).get('fingerprint') or 'chrome',
+               tls='1',insecure='0',udp='1')
+    uri=('anytls://'+urllib.parse.quote(outbound['password'],safe='')+'@'+host+':'+
+         str(outbound['server_port'])+'/?'+urllib.parse.urlencode(query)+'#'+
+         urllib.parse.quote(node['name'],safe=''))
+    return [dict(client='exclave',label='Exclave',payload=exclave),
+            dict(client='shadowrocket',label='Shadowrocket',payload=uri)]
+
 def generate(home,payload):
     user=payload['user']
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9._@-]{0,47}',user):raise ValueError('用户名不合法')
@@ -10217,19 +10245,23 @@ def generate(home,payload):
     local=private_dir(root(home)/'local'/user);web=private_dir(root(home)/'web')
     new=[]
     try:
-        for i,n in enumerate(payload['nodes']):
-            uri=n.get('uri')
-            if not uri:continue
-            if len(uri.encode())>2300:continue
+        for n in payload['nodes']:
             proto=n['proto']
             if not re.fullmatch(r'[a-z0-9_]+',proto):raise ValueError('协议标识不合法')
-            h=hashlib.sha256(uri.encode()).hexdigest();e=next((e for e in old if e['uri_hash']==h),None)
-            if e is None:
-                rid=secrets.token_hex(16)
-                e=dict(user=user,proto=proto,name=n['name'],uri_hash=h,id=rid,file=proto+'-'+rid+'.png')
-            q=subprocess.run(['qrencode','-8','-l','M','-m','4','-s','6','-t','PNG','-o','-'],input=uri.encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
-            if q.returncode or not q.stdout.startswith(b'\x89PNG\r\n\x1a\n'):raise ValueError('二维码生成失败（长度或 PNG 支持）')
-            atomic(local/e['file'],q.stdout);atomic(web/(e['id']+'.png'),q.stdout);new.append(e)
+            for variant in qr_payloads(n):
+                data=variant['payload'];client=variant['client']
+                if len(data.encode())>2300:continue
+                h=hashlib.sha256(data.encode()).hexdigest()
+                e=next((e for e in old if e['uri_hash']==h and e.get('client','generic')==client
+                        and e['proto']==proto and e['name']==n['name']),None)
+                if e is None:
+                    rid=secrets.token_hex(16)
+                    suffix='' if client=='generic' else '-'+client
+                    e=dict(user=user,proto=proto,name=n['name'],client=client,uri_hash=h,
+                           id=rid,file=proto+suffix+'-'+rid+'.png')
+                q=subprocess.run(['qrencode','-8','-l','M','-m','4','-s','6','-t','PNG','-o','-'],input=data.encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+                if q.returncode or not q.stdout.startswith(b'\x89PNG\r\n\x1a\n'):raise ValueError('二维码生成失败（长度或 PNG 支持）')
+                atomic(local/e['file'],q.stdout);atomic(web/(e['id']+'.png'),q.stdout);new.append(e)
         active={e['id'] for e in new}
         for e in old:
             if e['id'] not in active:
@@ -10366,6 +10398,7 @@ def main():
     if action=='qr-revoke':revoke(home,sys.argv[3] if len(sys.argv)>3 else '');return
     data=json.load(sys.stdin)
     if action=='qr-generate':print(json.dumps(generate(home,data),ensure_ascii=False))
+    elif action=='qr-payloads':print(json.dumps(qr_payloads(data),ensure_ascii=False))
     elif action=='qr-list':print(json.dumps([e for e in registry(home) if not data.get('user') or e['user']==data['user']],ensure_ascii=False))
     elif action=='qr-sign':print(sign(data['key'],data['id'],int(time.time())+300))
     elif action=='qr-nginx':print(qr_location(home,data))
@@ -10379,6 +10412,7 @@ if __name__=='__main__':
     try:main()
     except (ValueError,OSError,subprocess.SubprocessError,KeyError) as e:
         print('本地导出失败: '+(str(e) if isinstance(e,ValueError) else type(e).__name__),file=sys.stderr);sys.exit(1)
+
 ATR_RELEASE_PY
 }
 # v1.4.0: core menus, standalone Xray, private client exports and local QR.
@@ -10601,12 +10635,12 @@ _generateClientFilesLocked() {
     qrApplyPerms
 }
 
-qrShowNode() { # user, node name, include terminal QR
-    local user=$1 name=$2 uri=$3 terminal=${4:-0} entry localfile rid path port
+qrShowNode() { # user, node name, payload, terminal QR, target client, label
+    local user=$1 name=$2 uri=$3 terminal=${4:-0} client=${5:-generic} label=${6:-通用} entry localfile rid path port
     if ((${#uri}>2300)); then echoContent yellow '二维码内容超过长度预算，请使用分享链接或 JSON。';return 0;fi
-    entry=$(atrReleaseTools qr-list "${ATR_HOME}" <<<"$(jq -n --arg u "${user}" '{user:$u}')" | jq -ce --arg n "${name}" '.[]|select(.name==$n)') || return 0
+    entry=$(atrReleaseTools qr-list "${ATR_HOME}" <<<"$(jq -n --arg u "${user}" '{user:$u}')" | jq -ce --arg n "${name}" --arg c "${client}" '.[]|select(.name==$n and (.client // "generic")==$c)') || return 0
     localfile="${ATR_HOME}/qr/local/${user}/$(jq -r .file <<<"${entry}")"
-    echoContent yellow " ---> 二维码 PNG（SSH 查看或下载）: ${localfile}"
+    echoContent yellow " ---> ${label} 二维码 PNG（SSH 查看或下载）: ${localfile}"
     [[ "${terminal}" == 1 ]] && printQR "${uri}"
     if qrTrustedHTTPS "${ATR_STATE}" && serviceActive "${NGX_UNIT}" && portInUse "$(qrHttpsPort "${ATR_STATE}")" tcp && [[ -f "${NGX_CONFD}/atr_subscribe.conf" || -f "${NGX_CONFD}/atr_hy2_web.conf" || -f "${NGX_CONFD}/atr_httpupgrade.conf" || -f "${NGX_CONFD}/atr_alone.conf" ]]; then
         # Require the running configuration to actually contain the current signer.
@@ -10614,9 +10648,18 @@ qrShowNode() { # user, node name, include terminal QR
         rid=$(jq -r .id <<<"${entry}")
         path=$(jq -n --arg id "${rid}" --arg k "$(S '.qr.signing_key // ""')" '{id:$id,key:$k}' | atrReleaseTools qr-sign "${ATR_HOME}") || return 1
         port=$(qrHttpsPort "${ATR_STATE}")
-        echoContent yellow " ---> 本机 HTTPS 二维码（5 分钟有效，勿转发；保存图片不受过期撤回）"
+        echoContent yellow " ---> ${label} 本机 HTTPS 二维码（5 分钟有效，勿转发；保存图片不受过期撤回）"
         printRaw green "https://$(S '.domain'):${port}${path}"
     fi
+}
+
+qrShowViews() { # user, complete node view, include terminal QR
+    local user=$1 node=$2 terminal=${3:-0} variants i variant
+    variants=$(atrReleaseTools qr-payloads "${ATR_HOME}" <<<"${node}") || return 1
+    for ((i=0;i<$(jq length <<<"${variants}");i++)); do
+        variant=$(jq -c ".[${i}]" <<<"${variants}") || return 1
+        qrShowNode "${user}" "$(jq -r .name <<<"${node}")" "$(jq -r .payload <<<"${variant}")" "${terminal}" "$(jq -r .client <<<"${variant}")" "$(jq -r .label <<<"${variant}")" || return 1
+    done
 }
 
 showAccounts() {
@@ -10632,8 +10675,10 @@ showAccounts() {
             echoContent skyBlue "\n$(protoName "${proto}") (${name})"
             if [[ -n "${uri}" ]]; then
                 echoContent yellow " ---> 分享链接";printRaw green "${uri}"
-                qrShowNode "${user}" "${name}" "${uri}" "${qr}" || return 1
+            elif [[ "${proto}" == anytls_reality ]]; then
+                echoContent yellow " ---> 专用扫码格式：Exclave / Shadowrocket（在对应应用内扫描，非通用分享链接）"
             else echoContent yellow " ---> 没有通用分享 URI，请使用以下 v2rayN 自定义配置。";fi
+            qrShowViews "${user}" "${n}" "${qr}" || return 1
             file="${CLIENT_DIR}/${user}/v2rayN/index.json"
             if [[ -s "${file}" ]]; then
                 record=$(jq -ce --arg n "${name}" '.[]|select(.name==$n)' "${file}") || return 1

@@ -7,6 +7,18 @@ sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
 > **项目状态**：开发期间在隔离沙箱中，用真实的 sing-box / Xray / mihomo / nginx 二进制做过端到端验证（包括 AnyTLS + Reality 的回环握手）。2026-10-25 又在一台全新的 Debian 13 VPS（systemd 257、nginx 1.26）上做过一次完整的实机审计（v1.2.5）：真实 systemd 服务管理与沙箱、nginx 降权到 `atr-nginx`、真实 iptables 端口跳跃、各协议的真实数据转发（含 Windows 上的 sing-box 客户端经公网连接、官方 NaiveProxy 客户端、Xray 原生 XHTTP 客户端）、事务回滚与恢复、订阅撤销、DNS rebinding 对照实验，以及用 `strace` 核对凭据不出现在命令行上；v1.2.6 增加了相关修复；v1.2.7 进一步修复证书崩溃恢复和防火墙事务边界；v1.2.8 增加同核心自检与 Reality 共享/独立配置，并在原 Debian 13 VPS 上重新回归。详见 CHANGELOG.md 和随版本提供的测试报告。**仍未在真实服务器上验证**的：acme.sh 真实签发与 DNS API、WARP 注册、IPv6 专属流程与 NAT64、RHEL 系 + SELinux、arm64、BBR/DD、长时间压力测试。建议先在测试机上试用，遇到问题请到 Issues 反馈。
 
+## v1.4.1 — AnyTLS+Reality 客户端专用二维码（2026-10-29）
+
+AnyTLS+Reality 现在自动生成 **Exclave** 和 **Shadowrocket** 两张专用二维码，采用用户已实机验证的导入格式：Exclave 使用单节点精简 JSON，Shadowrocket 使用带 SNI、Reality 公钥、Short ID 和指纹的 AnyTLS 链接。在对应应用内扫码；Shadowrocket 格式不是通用 AnyTLS URI，不表示其他客户端也能使用。Stash 未完成实机验证，本版不加入；v2rayNG 不支持此协议组合。
+
+安装、重新生成客户端文件及 `atr qr regenerate [用户]` 会同时生成两张本地 PNG。`atr qr links [用户]` 显示图片路径；只有满足下文可信 HTTPS 条件时，才分别提供 **5 分钟有效的签名图片下载链接**。二维码本身包含节点配置，扫码无需下载远程订阅，不使用外部二维码服务、不新增明文 HTTP 入口。
+
+两种客户端图片分别标记并使用独立随机图片 ID，沿用原有私有目录、权限、签名、过期、撤销及配置变更清理机制。重新生成/撤销处理同一用户的所有客户端图片，已下载或已导入的凭据不会随下载网址过期而失效。其他协议的通用二维码保持原样。
+
+从 v1.4.0 升级前保留备份，替换脚本后执行 `atr qr regenerate` 即可生成新增图片；不要求重装节点、重启代理服务或更换端口/密钥。`atr qr links` 只查看现有图片，不自动生成缺失图片。旧版没有二维码签名入口时仍需按下文说明完成受管理 HTTPS 配置。
+
+本版验证范围及用户实机反馈见 [测试报告](TEST-REPORT.md)。
+
 ## v1.4.0 — 按核心安装、v2rayN 导出与私有二维码（2026-10-29）
 
 本版整合实际部署反馈。保留旧节点端口、密钥、Short ID 和旧 Xray 回落结构；替换脚本不会自动把已有节点迁移到新端口。新增部署使用下列流程。
