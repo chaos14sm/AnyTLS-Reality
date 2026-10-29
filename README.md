@@ -1,6 +1,5 @@
 # AnyTLS-Reality
 
-> 本目录是尚未发布到 GitHub 的 v1.3.1 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
 
 sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
@@ -8,51 +7,43 @@ sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
 > **项目状态**：开发期间在隔离沙箱中，用真实的 sing-box / Xray / mihomo / nginx 二进制做过端到端验证（包括 AnyTLS + Reality 的回环握手）。2026-10-25 又在一台全新的 Debian 13 VPS（systemd 257、nginx 1.26）上做过一次完整的实机审计（v1.2.5）：真实 systemd 服务管理与沙箱、nginx 降权到 `atr-nginx`、真实 iptables 端口跳跃、各协议的真实数据转发（含 Windows 上的 sing-box 客户端经公网连接、官方 NaiveProxy 客户端、Xray 原生 XHTTP 客户端）、事务回滚与恢复、订阅撤销、DNS rebinding 对照实验，以及用 `strace` 核对凭据不出现在命令行上；v1.2.6 增加了相关修复；v1.2.7 进一步修复证书崩溃恢复和防火墙事务边界；v1.2.8 增加同核心自检与 Reality 共享/独立配置，并在原 Debian 13 VPS 上重新回归。详见 CHANGELOG.md 和随版本提供的测试报告。**仍未在真实服务器上验证**的：acme.sh 真实签发与 DNS API、WARP 注册、IPv6 专属流程与 NAT64、RHEL 系 + SELinux、arm64、BBR/DD、长时间压力测试。建议先在测试机上试用，遇到问题请到 Issues 反馈。
 
-## v1.3.1 — HY2 配置与验收修复（2026-10-29）
+## v1.3.2 — HY2 伪装与 Reality 配置、验收（2026-10-29）
 
-在 `atr` 主菜单 → `4. Hysteria2` 中：
+新增功能需要 Python 3；安装流程会检查并安装。旧节点的带宽、密钥、Short ID、填充和时间策略不会因替换脚本而自动重置。
 
-| 入口 | 功能 |
-|---|---|
-| 1 | 安装或重新配置端口、带宽模式 |
-| 3 | 端口跳跃管理 |
-| 4 | 切换固定带宽 / BBR 自适应 |
-| 5 | 关闭 / 开启 Salamander obfs，设置或随机生成混淆密码 |
-| 6 | 未认证 HTTP/3 伪装：关闭 / 302 跳转 / 反向代理 |
-| 7 | 使用导出配置实连，保留域名、证书校验和跳跃范围 |
+### HY2 安装与伪装
 
-### 带宽与升级
+新装 HY2 默认选择**标准 HTTP/3，关闭 obfs**，再由用户选择 SQLite、Lua、OpenBSD 或自行输入反代 URL。三项推荐也必须在当前 VPS 重新检测并确认。没有静默选站；本地静态页的默认推荐待后续版本提供。
 
-新装 HY2 默认 BBR 自适应，服务端、sing-box 和 mihomo 客户端不再写入默认 100/50 Mbps；服务端设置 `ignore_client_bandwidth: true`。已有明确上/下行数值的旧状态按固定模式解释，升级不会偷偷改变现有策略。需要解除原来的默认限制，请在菜单 4 选择自适应并重新导入客户端配置。固定模式中的数值始终按客户端视角；输入 0 会切换到自适应，错误输入会重新询问。
+安装菜单会解释：Salamander 混淆适用于专门阻断 QUIC/HTTP/3、仍放行其他 UDP 的网络。启用后标准 HTTP/3 无法解码，HTTP/3 伪装不生效。切换时明确确认；关闭混淆后可恢复此前保存的伪装配置。混淆密码与用户认证密码分开。
 
-### 链接与端口跳跃
+伪装管理可选默认 404、proxy、file、string；302 跳转保留为高级 string 响应形式。file 要求已有公开静态目录及 index.html、robots.txt，不会自动生成或推荐页面。string 从 UTF-8 文件读取，限制体积。反代会重写目标 Host。
 
-分享链接改为官方格式 `hysteria2://密码@主机:主端口,30000-31000/?sni=...&insecure=0`，不再依赖 `mport` 扩展。sing-box `server_ports` 使用冒号范围（包括 `主端口:主端口`），不同时输出 `server_port`；mihomo 使用 `ports`。URI 标准没有携带固定带宽的字段，需要准确保留该设置时请导入 JSON/YAML。
+### 反代站点评估与保护
 
-用户目录额外生成 `hy2-single-port.txt`（默认 `/etc/anytls-reality/clients/<用户名>/`）。它明确放弃端口跳跃，用于无法导入标准多端口 URI 的客户端；不会把同一节点重复塞进订阅。移动客户端对多端口 URI 的支持仍需各自确认，不能据此承诺全部客户端兼容。
+检测器在 VPS 使用 GET、校验 HTTPS 证书、限制时间和下载量，不跟随跳转；显示状态码、首页体积、CDN 响应头、Cookie、CSP 和资源评估。Cloudflare/Netlify/Vercel 等特征、Fastly 组合头、Set-Cookie、重定向、不合格状态、过大页面均给出风险；CSP 按内容解释，无法判断不算通过。首页不超过 10 KB 为优选，10–50 KB 可接受，超过 50 KB 不推荐。
 
-跳跃规则增量应用、失败返回非零；先添加新范围，再移除旧范围。firewalld 分别处理运行时与永久规则，IPv4 使用 forward-port，IPv6 使用 rich rule，不全局 reload、不额外开启全局 masquerade。记录规则所属 zone；保留管理员预先创建的相同规则和无关规则。旧 `hop_firewalld.list` 可自动迁移，旧版本曾开启的全局 masquerade 不会擅自关闭。
+输入前会明文提醒：避免 CDN 目标；目标应稳定、无需登录、不重定向、不屏蔽机房 IP；内容应符合自己的域名语义；应选滥用价值低的网站。这些条件有些只能人工判断，一次 200 不能证明长期可用或没有 CDN。每次检测后须确认；拒绝可重新输入，q 可取消。
 
-修改前将撤销操作写入 `hop.pending` 并同步磁盘；失败时撤销，进程崩溃后下次应用或清理跳跃规则时重放。回滚失败保留记录并报错，卸载无法清理跳跃规则时保留安装目录。请排除防火墙故障后执行 `atr apply-hop`（或重试原操作），不要直接删掉恢复记录。
+新建 proxy 使用只监听 127.0.0.1 的独立 Nginx 网关：固定上游与路径、有限静态资源白名单、全局请求/连接限制、每响应限速、小容量缓存、上游异常时的小型本地兜底页，以及禁止收录的 robots.txt。请求参数不会变成任意上游 URL，用户 Cookie、Authorization、X-Forwarded-For 不转发。限流 429 保留，不被兜底页改成成功。
 
-### obfs 与伪装
+当前测试的 sing-box 1.14.4 没有 Hysteria 官方服务端的 xForwarded 配置字段；此网关使用**全局限流**，不伪称能够按真实访客 IP 限流。HTTP 层限流不防御 QUIC 握手洪泛；首页大小也不等于整站或整月的流量上限。robots.txt 是索引提示，不是访问控制。旧版已配置的直接反代保留，重新配置 proxy 才启用网关。
 
-两项默认均关闭。Salamander 密码由该 HY2 入站的所有用户共用，独立于各用户的认证密码；修改后会更新分享链接、sing-box 和 mihomo 配置。
+HY2 菜单新增流量监控：区分主机网卡收发总量、伪装访问日志与经过认证的代理业务。可选择网卡、设置 Mbps 阈值、手动采样或启用每分钟本地 systemd 定时采样；首个样本只建立基线。阈值告警记录在本机，不发外部消息、不自动停节点。sing-box 没有这里可用的 Hysteria trafficStats API，脚本不会编造按用户统计。
 
-伪装可选默认 404、固定 302 Location 跳转、固定目标反向代理（重写 Host）。URL 仅接受 HTTP/HTTPS，不接受用户密码、空格和控制字符。302 会使访问者离开 VPS；反代由 VPS 获取目标内容，不能保证目标站的资源、登录、Cookie 或 CSP 都适合镜像。
+v1.3.1 的自适应带宽、官方多端口 URI、双栈端口跳跃和防火墙事务修复继续保留。旧固定带宽保留；新节点可选自适应或固定值。官方 URI 将端口范围放在地址端口段，具体第三方客户端仍须验收。
 
-这只处理未认证的 **HTTP/3** 请求，不会额外部署 TCP 网站或修改 nginx。开启 obfs 后，普通 HTTP/3 浏览器无法解码，通常看不到伪装页面；保留两个独立开关供用户选择。
+### Reality 与客户端验收
 
-### 自检与回退
+详细参数流程见下文。`atr status` 显示每个配置标签、dest、SNI、时间策略，以及出口、订阅状态。管理菜单提供原生回环自检、额外客户端探针、外部探针文件、时间策略、AnyTLS 填充和 JSON 导出。
 
-`atr selfcheck` 仍是同核心回环认证/转发测试，并明确显示绕过 DNS、证书验证、跳跃范围的覆盖边界。菜单 7 使用导出节点实连，保留 DNS、TLS 验证和范围；从服务端发起只代表回连采样，不能证明外部 UDP 入口可达或全部跳跃端口可达。公网验收仍需另一网络上的客户端。
+目标检测严格检查命令退出码、完成标志、TLS 版本、证书链长度等；超时、空输出、格式变化均为“无法判断”。筛查通过只证明筛查条件，不代替实际认证。自检区分同核心回环、选定客户端、服务端回连和外部执行声明；未验证、不适用与失败分别显示。
 
-替换脚本后执行 `atr restart` 以应用渲染和跳跃规则，再确认客户端文件生成成功。旧固定带宽保留；新增开关默认关闭。回退旧脚本前，应先用本版关闭混淆、伪装和端口跳跃，并选择旧版理解的固定带宽；或者恢复完整备份。旧脚本不理解本版 firewalld 规则账本与自适应模式。
+当前实测 sing-box 1.14.4 / mihomo 1.19.33 → Xray 26.10.21 的所测 VLESS+Reality+Vision 组合未通过认证；脚本如实报告，不保证跨核心兼容。额外客户端由用户提供已安装的二进制，不会为此自动替换核心。
 
-本包尚未发布到 GitHub。测试结果见 `TEST-REPORT.md`；本轮没有在测试 VPS 安装生产服务。
+升级前保留完整备份。回退不理解本版字段的脚本前，应先关闭新增网关、监控、自定义填充与时间策略，处理独立 Reality 参数并核对旧版支持范围，或恢复旧版完整备份。仅替换旧脚本不能保证理解新状态。完整测试环境、覆盖范围与限制见 TEST-REPORT.md。
 
-参考：[sing-box 服务端配置](https://sing-box.sagernet.org/configuration/inbound/hysteria2/)、[客户端配置](https://sing-box.sagernet.org/configuration/outbound/hysteria2/)、[Hysteria URI 规范](https://v2.hysteria.network/docs/developers/URI-Scheme/)、[firewalld 手册](https://firewalld.org/documentation/man-pages/firewall-cmd.html)。
-
+参考：[sing-box HY2](https://sing-box.sagernet.org/configuration/inbound/hysteria2/)、[Hysteria 服务端说明](https://v2.hysteria.network/docs/advanced/Full-Server-Config/)、[AnyTLS 填充](https://sing-box.sagernet.org/configuration/inbound/anytls/)、[TLS/Reality 字段](https://sing-box.sagernet.org/configuration/shared/tls/)。
 
 ## 特性
 
@@ -180,32 +171,44 @@ atr install-anytls-reality --port 443 --sni dl.google.com --user alice
 - 公钥、Short ID、SNI 必须与服务端一致；公钥填错时客户端会报 `reality verification failed`。`atr selfcheck`（菜单 5 → 5）会用 sing-box 客户端对本机做一次回环握手来检测这类问题。
 - **mihomo / Clash.Meta 官方不支持 AnyTLS + Reality**，所以这个协议只输出 sing-box JSON 和参数说明，没有分享链接，也没有 mihomo YAML。
 - Reality 目标域名（SNI）：推荐列表前 5 个（`dl.google.com`、`www.apple.com`、`download-installer.cdn.mozilla.net`、`www.python.org`、`www.amd.com`）证书链较短，sing-box 与 Xray 作服务端都能完成握手。其余域名（如 `www.microsoft.com`、`addons.mozilla.org`）在 **Xray 作服务端**时可能握手失败，脚本会在检测时给出提示；sing-box 作服务端不受影响。
-- 修改 SNI：菜单 `5` → `2`；独立模式先选协议。命令行见下方，只改 SNI 会保留该配置的密钥和 Short ID，相关客户端需同步。
+- 修改 SNI：菜单 `5` → `2`；按协议配置时先选协议。命令行见下方，只改 SNI 会保留该配置的密钥和 Short ID，相关客户端需同步。
 
-## 双核心与 Reality 配置方式（v1.2.8）
+## 双核心与每协议 Reality 参数（v1.3.2）
 
-先在安装菜单选择 Xray，安装 VLESS+Reality+Vision；再选择 sing-box，追加 AnyTLS+Reality。两种协议必须使用不同监听端口。每次安装 Reality 协议会询问配置方式，回车沿用当前方式，新安装默认为共享：
+同机可以同时运行 Xray 的 VLESS+Reality+Vision 与 sing-box 的 AnyTLS+Reality，使用不同监听端口。每个协议可指定自己的 **dest 主机和端口、SNI、密钥对、Short ID**。dest 可以与 SNI 不同，但目标必须能够正确服务该 SNI。分开目标可以减少配置耦合，不能据此推断密码学强度提高，也不能隐藏同一 VPS IP 的关联。
 
-- **共享**：所有 Reality 协议使用同一套 SNI、X25519 密钥对与 Short ID。SNI 检测会同时考虑已安装的 Xray Reality 协议。
-- **独立**：每个 Reality 协议单独保存配置，可以使用不同 SNI、密钥对和 Short ID，也允许部分值恰好相同。新加入的协议单独选择 SNI并生成密钥；已存在的协议可保留当前参数。菜单 `5 → 2` 单独改 SNI，`5 → 4` 单独重新生成密钥对与 Short ID。
+首次只装一个 Reality 协议时直接配置。首次同时装多个时先配置第一个，后续逐个询问；已有 Reality 再追加协议时也逐个询问。每个新增协议提供三个明确选项：
 
-菜单 `5 → 6` 随时切换。共享转独立时复制当前参数，切换本身不会使原客户端失效；之后可分别修改。独立转共享时必须选择一个协议作为参数来源，确认后其他 Reality 节点的客户端需同步该套参数。
+1. **完整复制已有配置**：dest、SNI、密钥对、Short ID 与该配置的时间策略均复制。
+2. **仅复用 dest/SNI**：生成自己的密钥对和 Short ID，新配置时间窗口为 60 秒。
+3. **全新独立配置**：独立选择 dest、SNI，生成密钥对和 Short ID，默认 60 秒。
+
+参数配置用 A、B、C…Z、AA… 标识；删除后旧编号不重新分配，展示来源和公钥摘要，不打印私钥。复制是当时的快照：以后修改 A 不会暗中修改由它复制出来的 B。若要同步修改，应明确选择并更新对应协议。
+
+旧版共享状态在首次需要按协议编辑时迁移为等值的每协议参数，不更换密钥或 Short ID；重新配置已有协议默认沿用当前参数。旧 `reality-mode shared|independent` 命令保留为显式管理入口；它可能同步多个协议，执行前应阅读确认和客户端更新提示。
 
 ```bash
-atr reality-mode independent
-atr sni www.python.org --protocol anytls_reality
-atr sni www.apple.com --protocol vless_reality_vision
-# 将所有 Reality 协议统一为 VLESS 节点当前的一套配置
-atr reality-mode shared --from vless_reality_vision
+atr sni www.example.org:443 --protocol anytls_reality --dest 203.0.113.20:443
+atr selfcheck --protocol vless_reality_vision --client xray
+atr selfcheck --protocol vless_reality_vision --client sing-box --binary /path/to/sing-box
+atr selfcheck --protocol vless_reality_vision --client mihomo --binary /path/to/mihomo
 ```
 
-独立模式的 `sni` 命令必须指定已安装的 Reality 协议，避免误改全部节点；共享模式请省略 `--protocol`。非交互安装可用 `--reality-mode independent`，省略时沿用当前方式；不能用安装命令隐式覆盖已有的独立配置，应先用 `reality-mode shared --from ...` 选择来源。
+示例地址须换成真实可用目标。CLI 修改 SNI 会保留密钥与 Short ID；`--dest` 单独控制目标。独立配置需指定协议。状态字段保存在 `protocols.<协议ID>.reality`，渲染和导出始终取对应协议参数。
 
-状态缺少 `reality_mode` 时按旧版共享配置处理。独立配置保存在 `protocols.<协议ID>.reality`，客户端链接、sing-box JSON、mihomo YAML和订阅均读取对应协议的参数。需要回退旧脚本时，先切回共享或恢复旧版完整备份，旧版无法识别独立配置。
+新生成配置默认限制 60 秒时间差：sing-box 写 duration，Xray 写毫秒。旧配置未设置时保留旧语义（通常不限制，旧 ML-DSA Xray 默认 70 秒也保留），完整复制旧配置不会暗中启用限制。菜单 5 → 9 可明确调整。窗口与 ML-DSA 开关分离；时间异常先检查 NTP，脚本的检测不会擅自修改系统时钟。时间窗口减少重放机会，不取代密钥、认证和时间同步。
 
-`atr selfcheck` 会按服务端核心选择探针：Xray 节点使用本机 Xray，sing-box 节点使用本机 sing-box；输出明确显示 `xray → xray` 或 `sing-box → sing-box`。Xray 的 Reality XHTTP 和 TLS XHTTP 现在也能自动检查。内核升级/回退验收复用同一检查逻辑，真实握手失败仍会回滚。
+AnyTLS 的 `padding_scheme` 默认省略，代表使用核心默认填充，**不是关闭填充**。菜单 5 → 10 可查看、从 UTF-8 文件导入、多行编辑或恢复核心默认；检查格式、重复项、索引和长度预算后交给核心原生校验。自定义策略不保证更安全，可能增加流量或降低兼容性。AnyTLS+Reality 使用专用 sing-box JSON / 订阅导入，没有宣称可跨客户端通用的分享 URI。
 
-自检通过证明当前同核心客户端能完成回环握手及访问测试站点，不能证明所有第三方或旧版客户端兼容，也不能证明公网防火墙已经正确放行。Xray 与 sing-box 的跨核心 Reality 兼容问题仍应按实际客户端组合确认；共享密钥不会消除该差异。Naive 仍需其专用客户端验证。Xray TLS 探针信任本机已配置证书，sing-box 非 Reality TLS 探针仍跳过证书链验证，均不等同于公众 CA 信任验证。
+同核心自检保留 Reality 公钥验证并实际认证、访问测试站点；普通 TLS 节点的回环自检仍有证书/DNS覆盖限制。Xray 节点由 Xray、AnyTLS 节点由 sing-box 验证。额外客户端测试按用户选择执行；缺少核心标记未验证，选定验收失败不会算通过。
+
+公网入口需要在另一台机器执行。菜单 5 → 12 导出权限受限的 `probe-协议ID.json`，复制至外部主机后执行：
+
+```bash
+bash anytls-reality.sh client-test --node probe-anytls_reality.json --client sing-box --binary /path/to/sing-box --external
+```
+
+探针使用临时认证 SOCKS、保留公钥与真实目标参数；输出核心版本、二进制哈希和认证转发结果。`--external` 是操作者对执行位置的声明，JSON 明确不自行证明外部位置；从 VPS 自己执行不能证明外部公网入口。临时文件和进程在退出、超时、可处理的中断后清理。
 
 ## REALITY 能力与协商检测（v1.3.0）
 
@@ -230,7 +233,7 @@ atr reality-capabilities --fingerprints chrome,firefox,safari,randomized --sampl
 | 客户端发送行为 | 临时运行实际 sing-box 的 AnyTLS/VLESS REALITY 客户端，重组 TCP/TLS record 后解析 ClientHello；分别报告 supported_groups、key_share、长度和顺序 |
 | 指纹差异 | 默认 chrome、firefox、safari 各 1 次，randomized 每个协议 3 次；`--samples 1–20` 调整随机样本，`--protocol anytls|vless|both` 指定协议 |
 | 服务端能力 | 临时 VLESS 入站验证共用 REALITY 层，先做 X25519 经典对照，再做强制 MLKEM 的 Xray 参考对照及 sing-box 测试；须完成认证后的不可预测测试数据转发 |
-| 当前目标配置 | 从 state.json 读取 sing-box Reality 协议的 SNI 和目标端口，以一次性密钥构建临时实例，用参考客户端检查本次实际协商；独立配置分别处理并按目标去重 |
+| 当前目标配置 | 从 state.json 读取 sing-box Reality 协议的 dest、SNI 和目标端口，以一次性密钥构建临时实例，用参考客户端检查本次实际协商；独立配置分别处理并按目标去重 |
 | 额外抗量子认证 | 单列为未验证；本版本不主动验证 ML-DSA，不能将混合密钥交换等同于完整抗量子身份认证 |
 
 `--target 域名[:端口]` 可额外指定目标，最多 4 个；`--state 路径` 可指定状态文件；`--timeout 1–15` 设置单次网络操作超时。所有临时服务仅绑定回环，SOCKS 入口有一次性认证，配置、临时目录和报告均限制权限。不修改 state、服务、节点或防火墙。目标握手可能访问配置中的外部 SNI；受控核心能力测试本身只走回环。
@@ -253,7 +256,8 @@ HTTP-01 申请前的 80/tcp 放行、卸载时的规则回收统一使用 `fwApp
 atr                                打开交互式管理菜单
 atr install-anytls-reality [选项]  非交互一键安装 AnyTLS+Reality
       --port N        监听端口(默认 443，被占用则随机)
-      --sni host[:p]  Reality 目标域名(省略沿用已有配置，新配置默认 www.microsoft.com)
+      --sni host[:p]  Reality SNI(省略沿用已有配置，新配置默认 www.microsoft.com)
+      --dest host[:p] 独立指定 Reality dest（省略默认跟随 SNI）
       --user name     首个用户名(默认随机)
       --reality-mode shared|independent  共享/按协议独立（省略沿用当前方式）
       --egress MODE   出口访问模式: public 公网出口(默认，禁止客户端访问本机与内网) | full 允许内网访问
@@ -261,7 +265,7 @@ atr status                         查看服务与端口状态
 atr show [用户] [1]                查看账号(第二个参数 1 同时显示二维码)
 atr sub [用户]                     查看订阅链接
 atr selfcheck                      按节点所属核心做真实回环握手测试（Naive 需专用客户端）
-atr sni <host[:port]> [--protocol ID] [--force]  修改对应 Reality SNI
+atr sni <host[:port]> [--protocol ID] [--dest host[:port]] [--force]  修改对应 Reality SNI
 atr reality-mode shared|independent [--from ID]  切换参数方式
 atr passwd <用户> [新密码] [--keep-sub]  重置密码(不给则随机)；订阅已启用时默认同时更换订阅链接，--keep-sub 保留旧链接
 atr adduser <用户> [uuid] [密码]   添加用户
@@ -284,6 +288,7 @@ atr version | atr help
 | --- | --- |
 | `links.txt` | 分享链接（Reality + AnyTLS 没有标准链接，不在其中） |
 | `sing-box.json` | 最小可运行的 sing-box 客户端配置 |
+| `anytls-reality.json` | AnyTLS+Reality 专用 sing-box 配置，无通用 URI 承诺 |
 | `sing-box-full.json` | 带分流规则的 sing-box 完整配置（本地控制接口 `127.0.0.1:9090`，带每用户独立的随机 `secret`） |
 | `mihomo-proxies.yaml` | mihomo / Clash.Meta 的 `proxies` 片段 |
 | `mihomo-full.yaml` | mihomo / Clash.Meta 完整配置（控制接口同样带随机 `secret`） |

@@ -42,8 +42,8 @@ export LANG=en_US.UTF-8
 # - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
 # - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
 # - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
-ATR_VERSION="v1.3.1"
-# v1.3.1：HY2 自适应带宽、标准多端口链接、跳跃规则事务、混淆与 HTTP/3 伪装。
+ATR_VERSION="v1.3.2"
+# v1.3.2：HY2 目标评估与默认反代；Reality 每节点目标/密钥复用、原生兼容验收、时间差；AnyTLS 填充。
 # v1.2.9：补齐 ACME / 卸载防火墙提示；状态显示 Reality 与订阅配置。
 # v1.2.8：按节点所属核心自检；Reality 支持共享/按协议独立配置。
 # v1.2.7：证书导入增加持久撤销日志与开机预恢复；防火墙撤销按后端/地址族记录，
@@ -736,6 +736,7 @@ installTools() { # installTools <min|full>
         ensureTool "${t}" || true
     done
     ensureJq || return 1
+    ensureTool python3 || return 1
     ensureTool qrencode optional || true
     ensureTool crontab optional || true
     # RHEL 系装完 cronie 不会自动启动，acme.sh 的续签定时任务依赖它
@@ -1062,6 +1063,361 @@ userExists() { jq -e --arg n "$1" '.users[]|select(.name==$n)' "${ATR_STATE}" >/
 subscriptionToken() { S --arg n "$1" '.users[]|select(.name==$n)|.sub_token // empty'; }
 userApiSecret() { S --arg n "$1" '.users[]|select(.name==$n)|.api_secret // empty'; }
 
+atrTools() {
+    command -v python3 >/dev/null 2>&1 || { echoContent yellow " ---> 此功能需要 Python3，未能验证" >&2; return 2; }
+    # Python source uses fd 3 so stdin remains available for JSON/secret input.
+    python3 /dev/fd/3 "$@" 3<<'ATR_TOOLS_PY'
+"""AnyTLS-Reality v1.3.2 standard-library diagnostics. No automatic core downloads."""
+import argparse, contextlib, hashlib, http.client, ipaddress, json, os, pathlib, re
+import signal, socket, ssl, subprocess, sys, tempfile, time, urllib.parse
+
+def clean(s):
+    return ''.join(c if c.isprintable() else '?' for c in str(s))[:1000]
+
+def url_parts(url):
+    if not isinstance(url,str) or len(url)>2048 or re.search(r'[\s\x00-\x1f\x7f\\"\'{};$]',url):
+        raise ValueError('网址过长或含空格、控制字符、配置元字符')
+    u=urllib.parse.urlsplit(url)
+    if u.scheme not in ('http','https') or not u.hostname or u.username or u.password or u.fragment:
+        raise ValueError('需要不含用户名密码和片段的 HTTP/HTTPS 网址')
+    if u.port is not None and not 1<=u.port<=65535:raise ValueError('端口不合法')
+    return u
+
+def site_check(url,allow_private=False):
+    report={'url':clean(url),'status':'unknown','risks':[],'warnings':[],
+            'limitations':['只代表本 VPS 当前访问结果；长期稳定、域名语义和滥用价值需人工判断'],
+            'http_status':None,'bytes':0,'truncated':False,'headers':{},'assets':[]}
+    conn=None
+    try:
+        deadline=time.monotonic()+10
+        u=url_parts(url);port=u.port or (443 if u.scheme=='https' else 80)
+        # getaddrinfo has no Python timeout. A bounded child prevents a stuck
+        # resolver from keeping the interactive assessment alive indefinitely.
+        lookup='import socket,sys,json;print(json.dumps(list(dict.fromkeys(x[4][0] for x in socket.getaddrinfo(sys.argv[1],int(sys.argv[2]),type=socket.SOCK_STREAM)))))'
+        dns=subprocess.run([sys.executable,'-c',lookup,u.hostname,str(port)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,check=True)
+        addresses=json.loads(dns.stdout)
+        if not addresses:raise ValueError('DNS 没有返回地址')
+        if not allow_private and any(not ipaddress.ip_address(a).is_global for a in addresses):
+            raise ValueError('远端网址解析到非公网地址；本地文件请使用专用选项')
+        # Pin this connection to the checked DNS result, preserving the original TLS SNI.
+        remaining=max(.1,deadline-time.monotonic())
+        conn=(http.client.HTTPSConnection(u.hostname,port,timeout=remaining,context=ssl.create_default_context())
+              if u.scheme=='https' else http.client.HTTPConnection(u.hostname,port,timeout=remaining))
+        conn._create_connection=lambda addr,timeout,source_address=None:socket.create_connection((addresses[0],port),timeout,source_address)
+        path=urllib.parse.urlunsplit(('', '',u.path or '/',u.query,''))
+        conn.request('GET',path,headers={'User-Agent':'Mozilla/5.0','Accept-Encoding':'identity','Connection':'close'})
+        response=conn.getresponse();report['http_status']=response.status
+        headers={}
+        for k,v in response.getheaders():headers.setdefault(k.lower(),[]).append(clean(v))
+        selected=['server','via','x-cache','x-served-by','cf-ray','x-nf-request-id','set-cookie','content-security-policy','content-security-policy-report-only','location','content-type','content-length']
+        selected += [k for k in headers if k.startswith('x-vercel')]
+        report['headers']={k:headers[k] for k in dict.fromkeys(selected) if k in headers}
+        body=bytearray()
+        while len(body)<=51200:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise TimeoutError('响应超过 10 秒')
+            if conn.sock:conn.sock.settimeout(remaining)
+            b=response.read1(min(4096,51201-len(body)))
+            if not b:break
+            body.extend(b)
+        report['bytes']=len(body);report['truncated']=len(body)>51200
+        if response.status!=200:report['risks'].append('首页不是 HTTP 200')
+        if 300<=response.status<400 or 'location' in headers:report['risks'].append('入口存在跳转，建议直接输入最终网址重新检测')
+        if ('cloudflare' in ' '.join(headers.get('server',[])).lower() or 'cf-ray' in headers
+            or 'x-nf-request-id' in headers or any(k.startswith('x-vercel') for k in headers)
+            or ('varnish' in ' '.join(headers.get('via',[])).lower() and 'x-served-by' in headers)):
+            report['risks'].append('检测到明显 CDN/托管平台标识')
+        elif any(k in headers for k in ('via','x-cache','x-served-by')):report['warnings'].append('存在缓存/代理头，不能仅据此确认 CDN 类型')
+        if 'set-cookie' in headers:report['risks'].append('设置 Cookie，不适合作为无会话静态伪装页')
+        csp=' '.join(headers.get('content-security-policy',[]))
+        if csp:
+            if re.search(r'https?://|nonce-|sha(256|384|512)-',csp):report['warnings'].append('CSP 含绝对来源或动态校验，需检查资源加载')
+            else:report['warnings'].append('存在 CSP；self/none 等指令不自动判定不合格')
+        if report['truncated']:report['risks'].append('首页超过 50 KiB（已截断检测下载）')
+        elif len(body)>10240:report['warnings'].append('首页超过优先推荐的 10 KiB')
+        html=body.decode('utf-8','replace')
+        if re.search(r'cf-chl-|checking your browser|verify you are human|<[^>]*captcha',html,re.I):report['risks'].append('页面可能是人机验证或访问挑战')
+        if u.scheme!='https':report['warnings'].append('使用明文 HTTP 上游，优先选择 HTTPS')
+        # Only same-origin static assets, no arbitrary download or application paths.
+        for item in re.findall(r'(?:src|href)\s*=\s*["\']([^"\']+)',html,re.I):
+            absolute=urllib.parse.urljoin(url,item);a=urllib.parse.urlsplit(absolute)
+            if (a.scheme,a.netloc)==(u.scheme,u.netloc) and re.search(r'\.(css|js|svg|ico|png|jpe?g|gif|webp|woff2?)$',a.path,re.I):
+                if re.fullmatch(r'/[A-Za-z0-9_./%~-]+',a.path) and '..' not in a.path and len(a.path)<200:
+                    entry={'path':a.path,'url':urllib.parse.urlunsplit((a.scheme,a.netloc,a.path,a.query,''))}
+                    if entry not in report['assets']:report['assets'].append(entry)
+            if len(report['assets'])>=16:break
+        report['status']='not_recommended' if report['risks'] else 'acceptable_sample'
+    except Exception as e:report['error']=clean(type(e).__name__+': '+str(e))
+    finally:
+        if conn:conn.close()
+    return report
+
+def padding_validate(lines):
+    if not isinstance(lines,list) or not lines or len(lines)>65:raise ValueError('需要 1-65 行策略数组')
+    entries={}
+    for line in lines:
+        if not isinstance(line,str) or len(line)>2048 or not re.fullmatch(r'(stop|0|[1-9][0-9]*)=[0-9,c-]+',line):raise ValueError('策略行格式不合法')
+        key,value=line.split('=',1)
+        if key in entries:raise ValueError('策略项重复: '+key)
+        entries[key]=value
+    if not re.fullmatch(r'[1-9][0-9]*',entries.get('stop','')) or not 1<=int(entries['stop'])<=64:raise ValueError('stop 必须在 1-64')
+    stop=int(entries['stop']);total=0
+    for key,value in entries.items():
+        if key=='stop':continue
+        if int(key)>=stop:raise ValueError('包编号必须小于 stop')
+        tokens=value.split(',')
+        if len(tokens)>32 or tokens[0]=='c' or tokens[-1]=='c':raise ValueError('分包列表不合法')
+        subtotal=0
+        for i,t in enumerate(tokens):
+            if t=='c':
+                if key=='0' or (i and tokens[i-1]=='c'):raise ValueError('检查符位置不合法')
+                continue
+            m=re.fullmatch(r'([0-9]+)-([0-9]+)',t)
+            if not m:raise ValueError('需要 min-max 包长范围')
+            lo,hi=map(int,m.groups())
+            if not 1<=lo<=hi<=16384:raise ValueError('单段包长需满足 1 <= min <= max <= 16384')
+            subtotal+=hi
+        if key=='0' and (len(tokens)!=1 or subtotal>16384):raise ValueError('认证填充不支持分包')
+        if subtotal>65536:raise ValueError('单次策略开销过大')
+        total+=subtotal
+    if total>262144:raise ValueError('策略总填充上限过大')
+    return {'valid':True,'stop':stop,'upper_bytes':total,'sha256':hashlib.sha256('\n'.join(lines).encode()).hexdigest()}
+
+def label(n):
+    n=int(n);out=''
+    if not 1<=n<=1000000:raise ValueError('标签计数超出范围')
+    while n:n,r=divmod(n-1,26);out=chr(65+r)+out
+    return out
+
+def endpoint(value):
+    if not isinstance(value,str):raise ValueError('目标地址必须是字符串')
+    u=urllib.parse.urlsplit('//'+value)
+    if not u.hostname or u.username or u.password or u.path or u.query or u.fragment:raise ValueError('目标格式应为 host:port 或 [IPv6]:port')
+    host=u.hostname;port=u.port or 443
+    try:ipaddress.ip_address(host)
+    except ValueError:
+        if len(host)>253 or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?',host):raise ValueError('目标主机名不合法')
+    if not 1<=port<=65535:raise ValueError('目标端口不合法')
+    return {'host':host,'port':port}
+
+def validate_extras(s):
+    if not isinstance(s,dict) or not isinstance(s.get('protocols',{}),dict):raise ValueError('状态结构不合法')
+    errors=[];p=s.get('protocols',{})
+    for ident,c in p.items():
+        if not isinstance(c,dict):raise ValueError('协议参数必须是对象')
+        clients=c.get('test_clients',[])
+        if not isinstance(clients,list) or any(x not in ('sing-box','xray','mihomo') for x in clients):raise ValueError('客户端验收列表不合法')
+        r=c.get('reality') if s.get('reality_mode','shared')=='independent' else s.get('reality',{})
+        if ident in ('anytls_reality','vless_reality_vision','vless_reality_grpc','vless_reality_xhttp') and r:
+            try:
+                endpoint((('['+r.get('dest_host',r['sni'])+']') if ':' in r.get('dest_host',r['sni']) else r.get('dest_host',r['sni']))+':'+str(r.get('dest_port',443)))
+                t=r.get('max_time_diff_seconds',70 if r.get('mldsa_seed') and c.get('core')=='xray' else 0)
+                if type(t)!=int or not 0<=t<=86400:raise ValueError('时间差需为 0-86400 整数秒')
+                tag=r.get('label')
+                if tag is not None and not re.fullmatch('[A-Z]{1,5}',str(tag)):raise ValueError('Reality 标签格式不合法')
+            except (KeyError,ValueError,TypeError) as e:errors.append(ident+': '+str(e))
+        if 'padding_scheme' in c:
+            try:padding_validate(c['padding_scheme'])
+            except ValueError as e:errors.append(ident+': '+str(e))
+    h=p.get('hysteria2',{});m=h.get('masquerade') or {};mode=m.get('mode','off')
+    settings=s.get('monitor',{})
+    if settings and (not isinstance(settings,dict) or type(settings.get('enabled',False))!=bool or type(settings.get('threshold_mbps',100))!=int or not 1<=settings.get('threshold_mbps',100)<=1000000):errors.append('流量阈值参数不合法')
+    try:
+        if mode in ('proxy','redirect'):url_parts(m.get('url',''))
+        if mode=='file':
+            d=pathlib.Path(m.get('directory',''))
+            if not d.is_absolute() or not d.is_dir() or not(d/'index.html').is_file():raise ValueError('本地公开目录需要绝对路径与 index.html')
+            if not(d/'robots.txt').is_file():raise ValueError('本地公开目录需要 robots.txt（User-agent: * / Disallow: /）')
+            if d.resolve() in map(pathlib.Path,('/','/etc','/root','/proc','/sys','/home','/var')):raise ValueError('拒绝公开敏感根目录')
+        if mode=='string' and (not isinstance(m.get('content'),str) or len(m['content'].encode())>51200):raise ValueError('固定内容必须为不超过 50 KiB 的字符串')
+        if 'gateway_port' in m and (type(m['gateway_port'])!=int or not 1<=m['gateway_port']<=65535 or mode!='proxy'):raise ValueError('伪装网关端口不合法')
+        paths=m.get('assets',[])
+        if not isinstance(paths,list) or len(paths)>16:raise ValueError('静态资源白名单超限')
+        for a in paths:
+            u=url_parts(a['url']);base=url_parts(m['url'])
+            if (u.scheme,u.netloc)!=(base.scheme,base.netloc) or not re.fullmatch(r'/[A-Za-z0-9_./%~-]+',a['path']) or '..' in a['path']:raise ValueError('资源必须为同源安全静态路径')
+    except (ValueError,KeyError,TypeError) as e:errors.append('HY2: '+str(e))
+    return errors
+
+def nginx_gateway(s,ca):
+    h=s.get('protocols',{}).get('hysteria2',{});m=h.get('masquerade',{})
+    if h.get('obfs',{}).get('type') or m.get('mode')!='proxy' or not m.get('gateway_port'):return ''
+    errors=validate_extras(s)
+    if errors:raise ValueError('; '.join(errors))
+    if not pathlib.Path(ca).is_file():raise ValueError('无法找到验证 HTTPS 上游所需的 CA 文件')
+    u=url_parts(m['url']);fallback='<html><head><title>Welcome</title></head><body><p>This page is temporarily unavailable.</p></body></html>'
+    cache=pathlib.Path(os.environ.get('ATR_TOOLS_NGX_HOME',str(pathlib.Path(os.environ.get('ATR_TOOLS_NGX_LOG','/var/log/nginx/atr-hy2-access.log')).parent)))/'tmp/hy2-cache'
+    text='proxy_cache_path '+json.dumps(str(cache))+' levels=1:2 keys_zone=atr_hy2_cache:1m max_size=8m inactive=30m use_temp_path=off;\n'
+    text+='''# Global HTTP request limits; current sing-box does NOT forward trusted client IP.
+limit_req_zone $server_name zone=atr_hy2_global:1m rate=5r/s;
+limit_conn_zone $server_name zone=atr_hy2_connections:1m;
+server {
+ listen 127.0.0.1:%d;
+ server_name _;
+ server_tokens off;
+ limit_req zone=atr_hy2_global burst=10 nodelay;
+ limit_req_status 429;
+ limit_conn atr_hy2_connections 8;
+ limit_conn_status 429;
+ limit_rate 64k;
+ client_max_body_size 1k;
+ access_log %s;
+ add_header X-Robots-Tag "noindex, nofollow" always;
+ location = /robots.txt { default_type text/plain; return 200 "User-agent: *\\nDisallow: /\\n"; }
+ location @atr_hy2_fallback { default_type text/html; return 200 '%s'; }
+'''%(m['gateway_port'],json.dumps(os.environ.get('ATR_TOOLS_NGX_LOG','/var/log/nginx/atr-hy2-access.log')),fallback)
+    for path,url in [('/',m['url'])]+[(a['path'],a['url']) for a in m.get('assets',[])]:
+        host=url_parts(url).hostname
+        text+=''' location = %s {
+  if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+  proxy_pass %s;
+  proxy_set_header Host %s;
+  proxy_set_header Cookie "";
+  proxy_set_header Authorization "";
+  proxy_set_header X-Forwarded-For "";
+  proxy_ssl_server_name on;
+  proxy_ssl_name %s;
+  proxy_ssl_verify on;
+  proxy_ssl_verify_depth 5;
+  proxy_ssl_trusted_certificate %s;
+  proxy_cache atr_hy2_cache;
+  proxy_cache_key %s;
+  proxy_cache_valid 200 1m;
+  proxy_cache_lock on;
+  proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+  proxy_connect_timeout 5s;
+  proxy_read_timeout 10s;
+  proxy_intercept_errors on;
+  error_page 301 302 303 307 308 403 500 502 503 504 = @atr_hy2_fallback;
+ }
+'''%(path,json.dumps(url if url_parts(url).query else url+'?'),json.dumps(url_parts(url).netloc),json.dumps(host),json.dumps(ca),json.dumps(url))
+    return text+' location / { return 404; }\n}\n'
+
+def node_probe(node,core,binary,scope,address=None,timeout=12):
+    result={'status':'unknown','core':core,'scope':scope,'authenticated_transfer':False,
+            'external_ingress_verified':False,'reason':''}
+    if not binary or not os.path.isfile(binary) or not os.access(binary,os.X_OK):result.update(status='unverified',reason='缺少指定客户端核心');return result
+    endpoint_address=address or ('127.0.0.1' if scope=='loopback' else node['server'])
+    if core=='sing-box' and node.get('singbox') is None or core=='mihomo' and node.get('mihomo') is None:
+        result.update(status='not_applicable',reason='客户端不支持该协议/传输');return result
+    if core=='xray' and node.get('proto') not in ('vless_reality_vision','vless_reality_grpc','vless_reality_xhttp'):
+        result.update(status='not_applicable',reason='Xray 探针不支持此协议');return result
+    result['binary_sha256']=hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest()
+    v=subprocess.run([binary,'-v'] if core=='mihomo' else [binary,'version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=5)
+    result['version']=clean(v.stdout.decode(errors='replace').splitlines()[0] if v.stdout else '')
+    processes=[]
+    with tempfile.TemporaryDirectory(prefix='atr-client-probe.') as td:
+        os.chmod(td,0o700);root=pathlib.Path(td);sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1];sock.close()
+        # All probe SOCKS listeners require ephemeral authentication.
+        import secrets
+        user='probe';password=secrets.token_hex(16);n=dict(node)
+        if core=='sing-box':
+            outbound=dict(n['singbox']);outbound['server']=endpoint_address
+            cfg={'log':{'level':'warn'},'inbounds':[{'type':'socks','listen':'127.0.0.1','listen_port':port,'users':[{'username':user,'password':password}]}], 'outbounds':[outbound],'route':{'final':outbound['tag']}}
+            check=[binary,'check','-c'];start=[binary,'run','-c']
+        elif core=='mihomo':
+            proxy=dict(n['mihomo']);proxy['server']=endpoint_address
+            cfg={'mixed-port':port,'bind-address':'127.0.0.1','allow-lan':False,'authentication':[user+':'+password], 'mode':'rule','log-level':'warning','proxies':[proxy],'rules':['MATCH,'+proxy['name']]}
+            check=[binary,'-t','-f'];start=[binary,'-d',td,'-f']
+        else:
+            network={'vless_reality_vision':'tcp','vless_reality_grpc':'grpc','vless_reality_xhttp':'xhttp'}[n['proto']]
+            reality={'serverName':n['sni'],'publicKey':n['pbk'],'shortId':n['sid'],'fingerprint':'chrome'}
+            if n.get('pqv'):reality['mldsa65Verify']=n['pqv']
+            stream={'network':network,'security':'reality','realitySettings':reality}
+            if network=='grpc':stream['grpcSettings']={'serviceName':'grpc'}
+            if network=='xhttp':stream['xhttpSettings']={'host':n['host'],'path':n['path'],'mode':'auto'}
+            account={'id':n['uuid'],'encryption':'none'}
+            if network=='tcp':account['flow']='xtls-rprx-vision'
+            cfg={'log':{'loglevel':'warning'},'inbounds':[{'listen':'127.0.0.1','port':port,'protocol':'socks','settings':{'auth':'password','accounts':[{'user':user,'pass':password}]}}],
+                 'outbounds':[{'protocol':'vless','settings':{'vnext':[{'address':endpoint_address,'port':n['port'],'users':[account]}]},'streamSettings':stream}]}
+            check=[binary,'run','-test','-c'];start=[binary,'run','-c']
+        config=root/'client.json';config.write_text(json.dumps(cfg));config.chmod(0o600)
+        try:
+            q=subprocess.run(check+[str(config)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=8)
+            if q.returncode:result.update(status='failed',reason='客户端配置未通过原生校验');return result
+            with (root/'client.log').open('wb') as log:
+                p=subprocess.Popen(start+[str(config)],stdout=log,stderr=log,**({'start_new_session':True} if os.name!='nt' else {'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP}));processes.append(p)
+                time.sleep(.8)
+                # curl credentials stay in a private config, never process arguments.
+                curl=root/'curl.conf'
+                url=os.environ.get('ATR_TOOLS_TEST_URL','https://www.cloudflare.com/cdn-cgi/trace')
+                curl.write_text('proxy = "socks5h://127.0.0.1:%d"\nproxy-user = "%s:%s"\nurl = %s\nmax-time = %d\nsilent\nshow-error\n'%(port,user,password,json.dumps(url),timeout));curl.chmod(0o600)
+                q=subprocess.run(['curl','-q','--config',str(curl),'--noproxy','','--output',str(root/'body'),'--write-out','%{http_code}'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout+2)
+                body=(root/'body').read_bytes() if(root/'body').exists() else b''
+                expected=os.environ.get('ATR_TOOLS_TEST_NONCE')
+                good=q.returncode==0 and q.stdout.decode()=='200' and (expected.encode() in body if expected else b'ip=' in body)
+                result.update(status='passed' if good else 'failed',authenticated_transfer=good,reason='认证转发通过' if good else '未取得预期测试响应')
+                # --scope external is an explicit assertion by the operator running on another host.
+                result['external_ingress_verified']=False
+                result['external_execution_claimed']=bool(good and scope=='external' and endpoint_address not in ('127.0.0.1','::1'))
+                if scope=='external':result['external_scope']='调用者声明从外部主机执行；报告不自动证明执行位置'
+        except subprocess.TimeoutExpired:result.update(status='failed',reason='探针超时')
+        finally:
+            for p in processes:
+                with contextlib.suppress(ProcessLookupError):
+                    if os.name=='nt':p.terminate()
+                    else:os.killpg(p.pid,signal.SIGTERM)
+                try:p.wait(3)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        if os.name=='nt':p.kill()
+                        else:os.killpg(p.pid,signal.SIGKILL)
+                    p.wait()
+    return result
+
+def monitor(state,home):
+    settings=state.get('monitor',{});now=time.time();sample={'time':now,'rx':0,'tx':0}
+    for path in pathlib.Path('/sys/class/net').glob('*/statistics/rx_bytes'):
+        if path.parents[1].name=='lo':continue
+        sample['rx']+=int(path.read_text());sample['tx']+=int(path.with_name('tx_bytes').read_text())
+    f=pathlib.Path(home)/'monitor.sample.json';previous=json.loads(f.read_text()) if f.exists() else None
+    result={'scope':'宿主网卡总流量（包括其他服务），非 HY2 用户流量','sample':sample,'alert':False}
+    if previous and now>previous['time']:
+        delta=now-previous['time'];rate=max(0,sample['rx']-previous['rx'],sample['tx']-previous['tx'])*8/delta/1e6
+        result.update(peak_direction_mbps=round(rate,3),threshold_mbps=settings.get('threshold_mbps',100),alert=rate>=settings.get('threshold_mbps',100))
+    tmp=f.with_name(f.name+'.new');fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    with os.fdopen(fd,'w') as out:json.dump(sample,out)
+    os.replace(tmp,f)
+    return result
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=['site-check','endpoint-url','site-show','padding','label','endpoint','validate','nginx','probe','monitor'])
+    parser.add_argument('value',nargs='?');parser.add_argument('--allow-private',action='store_true',help='仅隔离测试使用，不由交互安装启用')
+    parser.add_argument('--core',choices=['sing-box','xray','mihomo']);parser.add_argument('--binary');parser.add_argument('--scope',choices=['loopback','server-return','external'],default='loopback');parser.add_argument('--address');parser.add_argument('--ca',default='/etc/ssl/certs/ca-certificates.crt');parser.add_argument('--home')
+    a=parser.parse_args();cmd=a.command
+    try:
+        if cmd=='endpoint-url':url_parts(a.value);return 0
+        elif cmd=='site-check':r=site_check(a.value,a.allow_private)
+        elif cmd=='site-show':
+            r=json.load(sys.stdin);print('检测结果: '+r['status']);print('HTTP: %s，已读正文: %s 字节%s'%(r['http_status'],r['bytes'],'（截断）' if r['truncated'] else ''))
+            for k,values in r['headers'].items():
+                for v in values:print(clean(k+': '+v))
+            for k in ('risks','warnings','limitations'):
+                for v in r[k]:print(clean(k+': '+v))
+            if r.get('error'):print(clean(r['error']))
+            return 0
+        elif cmd=='padding':r=padding_validate(json.load(sys.stdin))
+        elif cmd=='label':print(label(a.value));return 0
+        elif cmd=='endpoint':r=endpoint(a.value)
+        elif cmd=='validate':
+            errors=validate_extras(json.load(sys.stdin));print('\n'.join(errors));return 1 if errors else 0
+        elif cmd=='nginx':print(nginx_gateway(json.load(sys.stdin),a.ca));return 0
+        elif cmd=='probe':r=node_probe(json.load(sys.stdin),a.core,a.binary,a.scope,a.address)
+        elif cmd=='monitor':r=monitor(json.load(sys.stdin),a.home)
+        print(json.dumps(r,ensure_ascii=False))
+        if cmd=='probe':return 0 if r['status']=='passed' else (2 if r['status'] in ('unverified','not_applicable','unknown') else 1)
+        return 0
+    except Exception as e:
+        print(json.dumps({'error':clean(str(e))},ensure_ascii=False));return 2
+
+if __name__=='__main__':
+    def stop(*args):raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM,stop)
+    try:raise SystemExit(main())
+    except KeyboardInterrupt:raise SystemExit(130)
+ATR_TOOLS_PY
+}
+
 # ----------------------------- 状态校验 --------------------------------------
 # 返回错误列表(每行一个)，空表示通过。校验的是"候选状态"（stdin）
 read -r -d '' JQ_VALIDATE <<'EOF'
@@ -1075,6 +1431,7 @@ def netof($id): if (udp_ids | index($id)) != null then "udp" else "tcp" end;
    + (if ((.nginx.subscribe.enabled // false) and ((.nginx.subscribe.port // 0) > 0)) then [{who:"subscribe", port:.nginx.subscribe.port, net:"tcp"}] else [] end)
    + [ (.extra_ports // [])[] | {who:"extra_port", port:., net:"tcp"} ]) as $ports
 | [
+    (if ($P.hysteria2.masquerade.gateway_port // 0)>0 and ($ports|any(.net=="tcp" and .port==$P.hysteria2.masquerade.gateway_port)) then "HY2 网关端口与 TCP 入站冲突" else empty end),
     # 端口范围
     ($ports[] | select((.port | type) != "number" or .port < 1 or .port > 65535) | "端口不合法: \(.who)=\(.port)"),
     # 端口冲突（同协议类型下端口不得重复）
@@ -1084,7 +1441,7 @@ def netof($id): if (udp_ids | index($id)) != null then "udp" else "tcp" end;
       | (if (["auto","fixed"]|index($h.bandwidth_mode // "auto"))==null then "HY2 带宽模式不合法" else empty end),
         ([.up_mbps,.down_mbps][] | select(.!=null) | select(type!="number" or .<1 or .>1000000 or floor!=.) | "HY2 固定带宽需为 1-1000000 的整数"),
         (if (.obfs // null)!=null and ((.obfs.type!="salamander") or (.obfs.password|type)!="string" or (.obfs.password|length)<8 or (.obfs.password|length)>256 or (.obfs.password|test("[[:cntrl:]]"))) then "HY2 混淆参数不合法" else empty end),
-        (if (["off","redirect","proxy"]|index($h.masquerade.mode // "off"))==null then "HY2 伪装模式不合法" else empty end)),
+        (if (["off","redirect","proxy","file","string"]|index($h.masquerade.mode // "off"))==null then "HY2 伪装模式不合法" else empty end)),
     # 跳跃范围必须互不重叠，不能覆盖任何 UDP 主端口（包括自身）
     ($P|to_entries[]|select((.value.hop // "")!="")|. as $x
       | if (["tuic","hysteria2"]|index($x.key))==null or (.value.hop|type)!="string" or (.value.hop|test("^[0-9]{5}-[0-9]{5}$")|not)
@@ -1153,6 +1510,14 @@ validateState() { # stdin: 候选状态 JSON
         elif [[ -n "${d}" && ( ! -s "${TLS_DIR}/${d}.crt" || ! -s "${TLS_DIR}/${d}.key" ) ]]; then
             echo "证书文件不存在: ${TLS_DIR}/${d}.crt|.key"
         fi
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        local extra_errors extra_rc=0
+        extra_errors=$(atrTools validate <<<"${st}") || extra_rc=$?
+        [[ -z "${extra_errors}" ]] || printf '%s\n' "${extra_errors}"
+        if ((extra_rc)) && [[ -z "${extra_errors}" ]]; then echo "附加校验器异常，未通过校验"; fi
+    elif jq -e '[.protocols[]?|select(.padding_scheme!=null or .reality.dest_host!=null or .masquerade.gateway_port!=null)]|length>0' <<<"${st}" >/dev/null; then
+        echo "无法校验新参数：缺少 Python3"
     fi
     local hy2 mode url
     hy2=$(jq -c '.protocols.hysteria2 // {}' <<<"${st}")
@@ -1542,6 +1907,7 @@ _checkCoreInterop() {
     if ((${#unverified[@]})); then
         echoContent yellow " ---> 未自动验证（只确认了服务启动与端口监听，请用实际客户端确认）: ${unverified[*]}"
     fi
+    selfCheckSelectedClients "${core}" || return 1
     return 0
 }
 # 该核心承载、但无法用本机 sing-box 自动验证的协议名（判断条件与 selfCheckProtocol 的跳过条件相同）
@@ -2241,19 +2607,6 @@ parseSniInput() {
 # 实测: 目标同时满足 "支持 X25519MLKEM768" 且 "证书链 > 3500 字节" 时，Xray 服务端无法完成握手
 #      （日志 "handshake did not complete successfully"；ML-DSA-65 也无法解决），而 sing-box 作服务端没有此问题。
 # 返回 0=兼容 1=不兼容(已打印原因) 2=无法判断(本机没有 xray)
-realityXrayCompat() { # realityXrayCompat <host> <port>
-    local ping len
-    [[ -x "${XRAY_BIN}" ]] || return 2
-    ping=$(timeout 15 "${XRAY_BIN}" tls ping "$1:$2" 2>/dev/null)
-    len=$(awk '/Certificate chain.s total length:/{print $5; exit}' <<<"${ping}")
-    if grep -q "X25519MLKEM768" <<<"${ping}" && isInt "${len}" && ((len > 3500)); then
-        echoContent red "      ✗ 该目标证书链较长(${len} 字节)且启用了 X25519MLKEM768 —— Xray-core 作服务端无法与它完成 Reality 握手"
-        echoContent yellow "        (sing-box 作服务端不受影响)。请选推荐列表前几项，如 dl.google.com / www.apple.com / www.python.org"
-        return 1
-    fi
-    echoContent green "      ✓ Xray 兼容性检查通过（证书链 ${len:-?} 字节）"
-    return 0
-}
 
 # 共享配置考虑所有 Xray Reality 协议；独立配置只考虑指定协议。
 realityCoreHint() {
@@ -2274,105 +2627,10 @@ realityCoreHint() {
 
 # 检测 Reality 目标是否可用；返回 0=通过(可有警告) 1=不通过
 # 检查项: TLS1.3 握手 + X25519 + h2(ALPN) + 握手耗时 + 是否为 Cloudflare 代理域名
-checkRealityTarget() { # checkRealityTarget <host> [port] [xray]
-    local host=$1 port=${2:-443} forCore=${3:-${REALITY_CORE_HINT}} out proto alpn t0 t1 ms cf failed=0
-    echoContent skyBlue "\n ---> 检测 Reality 目标 ${host}:${port}"
-    if ! command -v openssl >/dev/null 2>&1; then
-        echoContent yellow "      未找到 openssl，跳过 TLS1.3 可达性检测"
-        return 0
-    fi
-    t0=$(date +%s%N)
-    out=$(timeout 12 openssl s_client -connect "${host}:${port}" -servername "${host}" -tls1_3 -alpn h2 -curves X25519 </dev/null 2>&1)
-    if grep -qiE 'unknown option|unrecognized option' <<<"${out}"; then
-        out=$(timeout 12 openssl s_client -connect "${host}:${port}" -servername "${host}" -tls1_3 -alpn h2 </dev/null 2>&1)
-    fi
-    t1=$(date +%s%N)
-    ms=$(((t1 - t0) / 1000000))
-
-    proto=$(grep -m1 -oE 'TLSv1\.3' <<<"${out}")
-    alpn=$(sed -n 's/^ALPN protocol: *//p' <<<"${out}" | head -n 1)
-
-    if [[ -z "${proto}" ]]; then
-        echoContent red "      ✗ 不支持 TLSv1.3（或无法连接）—— Reality 要求目标必须支持 TLS1.3"
-        local why
-        why=$(grep -m1 -iE 'errno|refused|timed out|unreachable|no route|resolve|handshake failure|alert' <<<"${out}")
-        [[ -n "${why}" ]] && echoContent yellow "        原因: ${why}"
-        failed=1
-    else
-        echoContent green "      ✓ TLSv1.3 握手成功（X25519），耗时约 ${ms}ms"
-        if ((ms > 800)); then
-            echoContent yellow "      ! 握手耗时偏高(${ms}ms)，目标离本机较远时会增加首包延迟，建议换一个更近的域名"
-        fi
-    fi
-    if ((failed == 0)); then
-        if [[ "${alpn}" == "h2" ]]; then
-            echoContent green "      ✓ 支持 HTTP/2 (ALPN h2)"
-        else
-            echoContent yellow "      ! 目标未协商 h2（ALPN: ${alpn:-无}），建议选择支持 h2 的域名，流量特征更像正常浏览器"
-        fi
-    fi
-
-    # 不允许使用被 Cloudflare 代理的域名: 否则回源探测流量会被他人滥用
-    cf=$(curl -s -m 6 "https://${host}:${port}/cdn-cgi/trace" 2>/dev/null | grep -c 'visit_scheme=https')
-    if [[ "${cf}" != "0" ]]; then
-        echoContent red "      ✗ 该域名已启用 Cloudflare 代理，禁止作为 Reality 目标（会导致 VPS 流量被他人滥用）"
-        failed=1
-    fi
-    if ((failed == 0)) && [[ "${forCore}" == "xray" ]]; then
-        realityXrayCompat "${host}" "${port}" || failed=1
-    fi
-    ((failed == 0))
-}
 
 # 交互选择 Reality 目标。成功时设置 PICK_SNI / PICK_PORT 并返回 0
 PICK_SNI=""
 PICK_PORT=443
-realityPickSNI() { # realityPickSNI [当前值 host:port]
-    local current=${1:-} choice i=0 line total count
-    local -a list=()
-    while IFS= read -r line; do
-        [[ -n "${line}" ]] && list+=("${line}")
-    done <<<"${REALITY_SNI_LIST}"
-    total=${#list[@]}
-
-    echoContent skyBlue "\n================ 配置 Reality 目标域名(SNI) ==============="
-    echoContent yellow "# 注意事项"
-    echoContent yellow "选择一个 TLS1.3 + h2 的真实站点；客户端的 SNI 与回源目标都使用它。"
-    echoContent yellow "建议选离本机网络近、非 Cloudflare 代理、非自己的域名。\n"
-    count=12
-    ((count > total)) && count=${total}
-    for ((i = 0; i < count; i++)); do
-        echoContent yellow "$((i + 1)).${list[i]}"
-    done
-    echoContent yellow "r.随机推荐域名"
-    echoContent yellow "直接输入域名(可带端口，例如 example.com:443) 即为自定义"
-    [[ -n "${current}" ]] && echoContent green "当前: ${current}"
-
-    while true; do
-        ask choice "请选择[回车=随机]:" || return 1
-        [[ -z "${choice}" || "${choice}" == "r" || "${choice}" == "R" ]] && choice=$((RANDOM % total + 1))
-        if isInt "${choice}" && ((10#${choice} >= 1 && 10#${choice} <= total)); then
-            choice=${list[$((10#${choice} - 1))]}
-        fi
-        if ! parseSniInput "${choice}"; then
-            echoContent red " ---> 域名或端口不合法: ${choice}"
-            continue
-        fi
-        if checkRealityTarget "${SNI_HOST}" "${SNI_PORT}"; then
-            PICK_SNI=${SNI_HOST}
-            PICK_PORT=${SNI_PORT}
-            echoContent yellow "\n ---> 客户端可用域名: ${PICK_SNI}:${PICK_PORT}"
-            return 0
-        fi
-        if confirm "该目标未通过检测，仍要强制使用吗？(不推荐)" n; then
-            PICK_SNI=${SNI_HOST}
-            PICK_PORT=${SNI_PORT}
-            echoContent yellow "\n ---> 已强制使用: ${PICK_SNI}:${PICK_PORT}"
-            return 0
-        fi
-        echoContent yellow " ---> 请重新选择"
-    done
-}
 
 # ----------------------------- 密钥生成（只返回，不落盘） ---------------------
 # genRealityKeypair  -> 打印 "私钥 公钥"（空格分隔）
@@ -2487,57 +2745,7 @@ pickRealityMode() {
 }
 
 # independent 时目标 id 必须明确；shared 时空 id 表示修改共享配置。
-stagedSetReality() { # <sni> <dest_port> [regen yes|no] [id]
-    local sni=$1 port=$2 regen=${3:-no} id=${4:-} kp priv pub sid profile mode
-    mode=$(stagedGet '.reality_mode // "shared"')
-    isDomainName "${sni}" && isPort "${port}" || return 1
-    if [[ "${mode}" == independent ]]; then
-        [[ -n "${id}" && "$(protoField "${id}" reality)" == true ]] || return 1
-    fi
-    profile=$(stagedRealityProfile "${id}") || return 1
-    priv=$(jq -r '.private_key // ""' <<<"${profile}")
-    if [[ -z "${priv}" || "${regen}" == yes ]]; then
-        kp=$(genRealityKeypair) || return 1
-        priv=${kp%% *}; pub=${kp##* }
-        profile=$(jq --arg p "${priv}" --arg u "${pub}" '.private_key=$p | .public_key=$u' <<<"${profile}") || return 1
-    fi
-    sid=$(jq -r '.short_id // ""' <<<"${profile}")
-    if [[ -z "${sid}" || "${regen}" == yes ]]; then
-        profile=$(jq --arg s "$(genShortId)" '.short_id=$s' <<<"${profile}") || return 1
-    fi
-    profile=$(jq --arg s "${sni}" --argjson p "${port}" '.sni=$s | .dest_port=$p' <<<"${profile}") || return 1
-    if [[ "${mode}" == independent ]]; then
-        stagedEdit --arg id "${id}" --argjson p "${profile}" '.protocols[$id].reality=$p'
-    else
-        stagedEdit --argjson p "${profile}" '.reality=$p'
-    fi
-}
 
-configureRealityForInstall() { # <core> <所选协议 id...>
-    local core=$1 id profile cur keep mode rc
-    shift
-    pickRealityMode || return 1
-    mode=$(stagedGet '.reality_mode // "shared"')
-    for id in "$@"; do
-        [[ "$(protoField "${id}" reality)" == true ]] || continue
-        profile=$(stagedRealityProfile "${id}") || return 1
-        cur=$(jq -r 'if (.sni // "") != "" then "\(.sni):\(.dest_port // 443)" else "" end' <<<"${profile}")
-        REALITY_CORE_HINT=$(realityCoreHint "${core}" "${id}")
-        keep=n; rc=0
-        echoContent skyBlue "\n配置 $(protoName "${id}") 的 Reality（${mode}）"
-        if [[ -n "${cur}" ]]; then
-            echoContent green " ---> 现有目标 ${cur}，公钥 $(jq -r '.public_key' <<<"${profile}")"
-            [[ "${REALITY_CORE_HINT}" == xray ]] && { realityXrayCompat "${cur%%:*}" "${cur##*:}" || rc=$?; }
-            if ((rc != 1)); then confirm "是否沿用该目标和密钥？" y && keep=y; fi
-        fi
-        if [[ "${keep}" != y ]]; then
-            realityPickSNI "${cur}" || return 1
-            stagedSetReality "${PICK_SNI}" "${PICK_PORT}" no "${id}" || return 1
-        fi
-        [[ "${mode}" == shared ]] && break
-    done
-    return 0
-}
 
 
 # =============================================================================
@@ -2568,10 +2776,9 @@ read -r -d '' JQ_SINGBOX <<'EOF'
 | def cert: {certificate_path: ($tlsdir + "/" + $D + ".crt"), key_path: ($tlsdir + "/" + $D + ".key")};
   @@EGRESS_DEF@@
   def tlsCert: ({enabled: true, server_name: $D} + cert);
-  def tlsReality($id): (if ($S.reality_mode // "shared") == "independent" then $S.protocols[$id].reality else $S.reality end) as $RE | {enabled: true, server_name: $RE.sni,
-      reality: {enabled: true,
-                handshake: {server: $RE.sni, server_port: ($RE.dest_port // 443)},
-                private_key: $RE.private_key, short_id: [$RE.short_id]}};
+  def tlsReality($id): (if ($S.reality_mode // "shared") == "independent" then $S.protocols[$id].reality else $S.reality end) as $RE |
+    {enabled:true,server_name:$RE.sni,reality:({enabled:true,handshake:{server:($RE.dest_host // $RE.sni),server_port:($RE.dest_port // 443)},private_key:$RE.private_key,short_id:[$RE.short_id]}
+    + (if ($RE.max_time_diff_seconds // 0)>0 then {max_time_difference:(($RE.max_time_diff_seconds|tostring)+"s")} else {} end))};
   def users($p):
     $S.users | map(
       if ($p == "vless_reality_vision" or $p == "vless_vision_tls") then {name: .name, uuid: .uuid, flow: "xtls-rprx-vision"}
@@ -2582,14 +2789,18 @@ read -r -d '' JQ_SINGBOX <<'EOF'
       else {name: .name, password: .password} end);
   def inbound($id; $c):
     if $id == "vless_reality_vision" then {type: "vless", tag: "vless-reality-vision", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality($id)}
-    elif $id == "anytls_reality" then {type: "anytls", tag: "anytls-reality", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality($id)}
+    elif $id == "anytls_reality" then {type: "anytls", tag: "anytls-reality", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality($id)} + (if $c.padding_scheme!=null then {padding_scheme:$c.padding_scheme} else {} end)
     elif $id == "tuic" then {type: "tuic", tag: "tuic", listen: $listen, listen_port: $c.port, users: users($id), congestion_control: ($c.congestion // "bbr"), tls: (tlsCert + {alpn: ["h3"]})}
     elif $id == "hysteria2" then {type: "hysteria2", tag: "hysteria2", listen: $listen, listen_port: $c.port, users: users($id),
         tls: (tlsCert + {alpn: ["h3"]})}
         + (if ($c.bandwidth_mode // (if ($c.up_mbps // 0)>0 or ($c.down_mbps // 0)>0 then "fixed" else "auto" end)) == "fixed"
            then {up_mbps: ($c.down_mbps // 100), down_mbps: ($c.up_mbps // 50)} else {ignore_client_bandwidth:true} end)
         + (if ($c.obfs.type // "") != "" then {obfs:$c.obfs} else {} end)
-        + (if ($c.masquerade.mode // "off") == "redirect" then {masquerade:{type:"string",status_code:302,headers:{Location:[$c.masquerade.url],"Content-Type":["text/plain; charset=utf-8"]},content:"Redirecting."}}
+        + (if ($c.obfs.type // "")!="" then {}
+           elif ($c.masquerade.gateway_port // 0)>0 then {masquerade:{type:"proxy",url:("http://127.0.0.1:"+($c.masquerade.gateway_port|tostring)),rewrite_host:true}}
+           elif ($c.masquerade.mode // "off")=="file" then {masquerade:{type:"file",directory:$c.masquerade.directory}}
+           elif ($c.masquerade.mode // "off")=="string" then {masquerade:{type:"string",status_code:200,content:$c.masquerade.content,headers:{"Content-Type":["text/html; charset=utf-8"]}}}
+           elif ($c.masquerade.mode // "off") == "redirect" then {masquerade:{type:"string",status_code:302,headers:{Location:[$c.masquerade.url],"Content-Type":["text/plain; charset=utf-8"]},content:"Redirecting."}}
            elif ($c.masquerade.mode // "off") == "proxy" then {masquerade:{type:"proxy",url:$c.masquerade.url,rewrite_host:true}} else {} end)
     elif $id == "naive" then {type: "naive", tag: "naive", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert}
     elif $id == "vless_vision_tls" then {type: "vless", tag: "vless-vision-tls", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert}
@@ -2602,7 +2813,7 @@ read -r -d '' JQ_SINGBOX <<'EOF'
         transport: {type: "grpc", service_name: "grpc"}}
     elif $id == "vmess_httpupgrade" then {type: "vmess", tag: "vmess-httpupgrade", listen: "127.0.0.1", listen_port: $hup, users: users($id),
         transport: {type: "httpupgrade", path: ("/" + $P + "hu")}}
-    elif $id == "anytls_tls" then {type: "anytls", tag: "anytls-tls", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert}
+    elif $id == "anytls_tls" then {type: "anytls", tag: "anytls-tls", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert} + (if $c.padding_scheme!=null then {padding_scheme:$c.padding_scheme} else {} end)
     else empty end;
   # ---- 路由 token 工具 ----
   def dom($t): [$t[] | select(startswith("domain:")) | .[7:]];
@@ -2750,9 +2961,10 @@ read -r -d '' JQ_XRAY <<'EOF'
       elif ($p == "trojan") then {password: .password, email: (.name + "@" + $p)}
       else {id: .uuid, email: (.name + "@" + $p)} end);
   def realityS($id): realityOf($id) as $RE |
-    {show: false, target: ($RE.sni + ":" + (($RE.dest_port // 443) | tostring)), xver: 0,
+    {show: false, target: ((if (($RE.dest_host // $RE.sni)|contains(":")) then "["+($RE.dest_host // $RE.sni)+"]" else ($RE.dest_host // $RE.sni) end) + ":" + (($RE.dest_port // 443) | tostring)), xver: 0,
      serverNames: [$RE.sni], privateKey: $RE.private_key, shortIds: [$RE.short_id]}
-    + (if ($RE.mldsa_seed // "") != "" then {mldsa65Seed: $RE.mldsa_seed, minClientVer: "1.8.2", maxTimeDiff: 70000} else {} end);
+    + (if ($RE.mldsa_seed // "") != "" then {mldsa65Seed: $RE.mldsa_seed, minClientVer: "1.8.2"} else {} end)
+    + {maxTimeDiff:(1000*($RE.max_time_diff_seconds // (if ($RE.mldsa_seed // "")!="" then 70 else 0 end)))};
   def sniffing: if $sniff == "1" then {sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}} else {} end;
   # Vision 前置的回落链: 默认回落到 nginx(或 Trojan -> nginx)，h2 回落到 31302，WS 按路径回落
   def fallbacks:
@@ -2881,7 +3093,7 @@ stateNeedsSubscribe() {
     jq -e '.nginx.subscribe.enabled == true' "$1" >/dev/null 2>&1
 }
 stateNeedsNginx() {
-    stateNeedsNginxFallback "$1" || stateNeedsHttpUpgradeNginx "$1" || stateNeedsSubscribe "$1"
+    stateNeedsNginxFallback "$1" || stateNeedsHttpUpgradeNginx "$1" || stateNeedsSubscribe "$1" || stateNeedsHY2Gateway "$1"
 }
 
 # =============================================================================
@@ -3097,6 +3309,7 @@ ${peer_loc}
 EOF
         } >"${out}/atr_subscribe.conf"
     fi
+    renderHY2Gateway "${st}" "${out}" || return 1
     return 0
 }
 
@@ -3335,6 +3548,7 @@ desiredFirewallPorts() { # <state.json>
 # 需要验证"正在监听"的 "proto port" 列表（含回环内部端口）
 expectedListeners() { # <state.json>
     local st=$1
+    if stateNeedsHY2Gateway "${st}"; then jq -r '"tcp \(.protocols.hysteria2.masquerade.gateway_port)"' "${st}"; fi
     jq -r '
       def udp: ["tuic","hysteria2"];
       def netof($id): if (udp | index($id)) != null then "udp" else "tcp" end;
@@ -3609,6 +3823,8 @@ fwApplyList() { # <open|close>，失败返回非零；只有已核实的结果�
 # 受事务管理的文件
 _txnFiles() {
     echo "${ATR_STATE}"
+    echo "${ATR_SYSTEMD_DIR}/atr-monitor.service"
+    echo "${ATR_SYSTEMD_DIR}/atr-monitor.timer"
     echo "${SB_CONF}"
     echo "${XRAY_CONF}"
     echo "${ATR_SYSTEMD_DIR}/${SB_UNIT}.service"
@@ -3975,6 +4191,7 @@ applyServices() { # applyServices <state.json> [force]
         _stopManagedService "${XRAY_UNIT}" || return 1
     fi
     if declare -F reconcileHopRules >/dev/null; then reconcileHopRules "${st}" || return 1; fi
+    reconcileMonitor "${st}" || return 1
     return 0
 }
 
@@ -4365,7 +4582,7 @@ applyStaged() {
             fi
         fi
     done
-    renderNginxConfs "${st}" "${stage}/nginx"
+    renderNginxConfs "${st}" "${stage}/nginx" || { rm -rf "${stage}"; lockRelease; return 1; }
 
     # 4) 用真实内核/nginx 校验
     if ! checkRendered "${stage}" "${st}"; then
@@ -5020,7 +5237,7 @@ _generateClientFilesLocked() { # _generateClientFilesLocked [用户名]
             problems+=("${u}: 无法创建目录")
             continue
         fi
-        rm -f "${dir}"/links.txt "${dir}"/hy2-single-port.txt "${dir}"/sing-box*.json "${dir}"/mihomo*.yaml "${dir}"/naive-client.json
+        rm -f "${dir}"/links.txt "${dir}"/hy2-single-port.txt "${dir}"/anytls-reality.json "${dir}"/probe-*.json "${dir}"/sing-box*.json "${dir}"/mihomo*.yaml "${dir}"/naive-client.json
         views=$(nodeViews "${u}") || {
             problems+=("${u}: 无法生成节点信息")
             continue
@@ -5028,6 +5245,9 @@ _generateClientFilesLocked() { # _generateClientFilesLocked [用户名]
         jq -r '.[]|select(.uri!=null)|.uri' <<<"${views}" >"${dir}/links.txt" || problems+=("${u}: links.txt 写入失败")
         if [[ "$(jq '[.[]|select(.uri_single!=null)]|length' <<<"${views}")" != 0 ]]; then
             jq -r '.[]|select(.uri_single!=null)|.uri_single' <<<"${views}" >"${dir}/hy2-single-port.txt" || problems+=("${u}: 单端口备用链接生成失败")
+        fi
+        if [[ "$(jq '[.[]|select(.proto=="anytls_reality")]|length' <<<"${views}")" != 0 ]]; then
+            out=$(cfgSbMin "$(jq -c '[.[]|select(.proto=="anytls_reality")|.singbox]' <<<"${views}")") && printf '%s\n' "${out}" >"${dir}/anytls-reality.json" || problems+=("${u}: AnyTLS JSON 生成失败")
         fi
         sbouts=$(jq -c '[.[]|select(.singbox!=null)|.singbox]' <<<"${views}")
         mhprox=$(jq -c '[.[]|select(.mihomo!=null)|.mihomo]' <<<"${views}")
@@ -5625,6 +5845,7 @@ selfCheckAll() { # 返回 1 = 至少一个协议握手失败；无法自动验�
     echoContent yellow " ---> 自检结果: 通过 ${pass}，失败 ${fail}，未自动验证 ${skip}"
     ((skip == 0)) || echoContent yellow "      未自动验证的协议只确认了服务启动与端口监听，请用对应客户端确认"
     echoContent yellow "      回环通过不等于部署验收；DNS、可信证书、公网入口及跳跃范围仍需外部客户端验证。"
+    selfCheckSelectedClients || fail=$((fail+1))
     ((fail == 0))
 }
 
@@ -6061,47 +6282,8 @@ configureHY2Bandwidth() { # 只编辑候选状态，调用方负责事务
     esac
 }
 
-configureHY2Obfs() {
-    local c secret
-    echoContent yellow "1.关闭（默认）  2.Salamander 混淆"
-    echoContent yellow "混淆密码由全部 HY2 用户共用；修改后需要更新客户端。混淆开启时普通 HTTP/3 浏览器无法显示伪装页面。"
-    ask c "请选择:" || return 1
-    case "${c}" in
-    1) stagedEdit 'del(.protocols.hysteria2.obfs)' ;;
-    2)
-        # 不回显密码；通过已有 jq 包装器从文件传递秘密，避免出现在进程参数中。
-        IFS= read -r -s -p "混淆密码（回车生成随机密码）:" secret || return 1
-        echo
-        [[ -n "${secret}" ]] || secret=$(openssl rand -hex 24) || return 1
-        if ! jq -ne --arg p "${secret}" '$p|length>=8 and length<=256 and (test("[[:cntrl:]]")|not)' >/dev/null; then
-            echoContent red " ---> 混淆密码需 8-256 字符且不含控制字符"; return 1
-        fi
-        stagedEdit --arg p "${secret}" '.protocols.hysteria2.obfs={type:"salamander",password:$p}'
-        ;;
-    *) return 1 ;;
-    esac
-}
 
-configureHY2Masquerade() {
-    local c mode url
-    echoContent yellow "1.关闭（默认 404）  2.302 跳转  3.反向代理展示目标站"
-    echoContent yellow "仅响应未认证 HTTP/3 请求，不会另开 TCP 网站。302 使浏览器离开 VPS；反代由 VPS 访问目标，资源和登录页面未必完整可用。"
-    echoContent yellow "开启 obfs 后，普通 HTTP/3 浏览器无法解码，通常看不到伪装页面。"
-    ask c "请选择:" || return 1
-    case "${c}" in
-    1) stagedEdit 'del(.protocols.hysteria2.masquerade)'; return $? ;;
-    2) mode=redirect ;;
-    3) mode=proxy ;;
-    *) return 1 ;;
-    esac
-    ask url "目标网址（http:// 或 https://）:" || return 1
-    hy2URLValid "${url}" || { echoContent red " ---> 网址不合法（需要主机名或 IP，不允许用户名密码、空格、控制字符）"; return 1; }
-    stagedEdit --arg m "${mode}" --arg u "${url}" '.protocols.hysteria2.masquerade={mode:$m,url:$u}'
-}
 
-hy2URLValid() {
-    jq -ne --arg u "$1" '$u | test("^https?://(\\[[0-9A-Fa-f:]+\\]|[A-Za-z0-9][A-Za-z0-9.-]*)(:[0-9]{1,5})?([/?#][^[:space:][:cntrl:]\\\\]*)?$") and (test("[[:space:][:cntrl:]]")|not)' >/dev/null 2>&1
-}
 
 manageHY2Option() {
     stagedBegin || return 1
@@ -6139,6 +6321,550 @@ selfCheckHY2Endpoint() {
 }
 
 
+# v1.3.2: 每入站配置；复制参数不建立隐式联动。旧 shared 数据仅在显式配置时迁移。
+realityPerProtocol() {
+    stagedRealityMode independent || return 1
+    local id n tag used
+    n=$(stagedGet '.reality_label_next // 1')
+    [[ "${n}" =~ ^[1-9][0-9]*$ ]] || return 1
+    while read -r id; do
+        [[ -n "${id}" ]] || continue
+        [[ -n "$(stagedGet --arg id "${id}" '.protocols[$id].reality.label // ""')" ]] && continue
+        while :; do
+            tag=$(atrTools label "${n}") || return 1
+            used=$(stagedGet --arg t "${tag}" '[.protocols[]?.reality.label // empty|select(.==$t)]|length')
+            n=$((n+1)); [[ "${used}" == 0 ]] && break
+        done
+        stagedEdit --arg id "${id}" --arg t "${tag}" '.protocols[$id].reality.label=$t' || return 1
+    done < <(stagedGet --argjson ids "$(_realityIDsJson)" '.protocols|keys[]|select(. as $i|$ids|index($i))')
+    stagedEdit --argjson n "${n}" '.reality_label_next=$n'
+}
+
+realityNewLabel() { # <id>，不复用其他节点标签
+    local id=$1 n tag
+    n=$(stagedGet '.reality_label_next // 1')
+    while :; do
+        tag=$(atrTools label "${n}") || return 1
+        n=$((n+1))
+        [[ "$(stagedGet --arg t "${tag}" '[.protocols[]?.reality.label // empty|select(.==$t)]|length')" == 0 ]] && break
+    done
+    stagedEdit --arg id "${id}" --arg t "${tag}" --argjson n "${n}" '.protocols[$id].reality.label=$t | .reality_label_next=$n'
+}
+
+stagedSetReality() { # <sni> <dest_port> [regen yes|no] [id] [dest_host]
+    local sni=$1 port=$2 regen=${3:-no} id=${4:-} dest=${5:-} kp priv pub sid profile mode old_sni
+    mode=$(stagedGet '.reality_mode // "shared"')
+    isDomainName "${sni}" && isPort "${port}" || return 1
+    if [[ "${mode}" == independent ]]; then [[ -n "${id}" && "$(protoField "${id}" reality)" == true ]] || return 1; fi
+    profile=$(stagedRealityProfile "${id}") || return 1
+    old_sni=$(jq -r '.sni // ""' <<<"${profile}")
+    if [[ -z "${dest}" ]]; then
+        dest=$(jq -r '.dest_host // ""' <<<"${profile}")
+        [[ -n "${dest}" && "${dest}" != "${old_sni}" ]] || dest=${sni}
+    fi
+    atrTools endpoint "$(realityEndpoint "${dest}" "${port}")" >/dev/null || return 1
+    priv=$(jq -r '.private_key // ""' <<<"${profile}")
+    if [[ -z "${priv}" || "${regen}" == yes ]]; then
+        kp=$(genRealityKeypair) || return 1; priv=${kp%% *}; pub=${kp##* }
+        profile=$(jq --arg p "${priv}" --arg u "${pub}" '.private_key=$p|.public_key=$u' <<<"${profile}") || return 1
+    fi
+    sid=$(jq -r '.short_id // ""' <<<"${profile}")
+    if [[ -z "${sid}" || "${regen}" == yes ]]; then profile=$(jq --arg s "$(genShortId)" '.short_id=$s' <<<"${profile}") || return 1; fi
+    # 新配置 60 秒；已有配置缺失时保留原先关闭/ML-DSA 70 秒的有效语义。
+    if [[ -z "${old_sni}" ]]; then profile=$(jq '.max_time_diff_seconds=60' <<<"${profile}") || return 1; fi
+    profile=$(jq --arg s "${sni}" --arg d "${dest}" --argjson p "${port}" '.sni=$s|.dest_host=$d|.dest_port=$p' <<<"${profile}") || return 1
+    if [[ "${mode}" == independent ]]; then stagedEdit --arg id "${id}" --argjson r "${profile}" '.protocols[$id].reality=$r'; else stagedEdit --argjson r "${profile}" '.reality=$r'; fi
+}
+
+realityEndpoint() { if [[ "$1" == *:* ]]; then printf '[%s]:%s' "$1" "$2"; else printf '%s:%s' "$1" "$2"; fi; }
+
+realityXrayCompat() { # <dest_host> <port> [sni]，0=筛查通过 1=已知风险 2=无法判断
+    local host=$1 port=$2 sni=${3:-$1} ping block len rc=0 ip
+    [[ -x "${XRAY_BIN}" ]] || { echoContent yellow "      ? Xray 未安装，未验证目标兼容性"; return 2; }
+    local -a args=()
+    if [[ "${host}" != "${sni}" ]]; then
+        ip=$(getent ahosts "${host}" 2>/dev/null | awk 'NR==1{print $1}')
+        [[ -n "${ip}" ]] || { echoContent yellow "      ? 无法解析 dest"; return 2; }
+        args=(-ip "${ip}")
+    fi
+    ping=$(timeout 15 "${XRAY_BIN}" tls ping "${args[@]}" "${sni}:${port}" 2>&1) || rc=$?
+    block=$(awk '/^Pinging with SNI/{seen=1;next} seen{print}' <<<"${ping}")
+    len=$(awk '/Certificate chain.s total length:/{print $5;exit}' <<<"${block}")
+    if ((rc!=0)) || ! grep -q 'TLS ping finished' <<<"${block}" || ! grep -q 'Handshake succeeded' <<<"${block}" || ! grep -qE 'TLS Version: *TLS 1\.3' <<<"${block}" || ! isInt "${len}" || ((len<=0)) || ! grep -qE 'TLS Post-Quantum key exchange: *(true|false)' <<<"${block}"; then
+        echoContent yellow "      ? Xray 目标兼容性无法判断（退出码 ${rc}，输出缺失或格式未知）；未标记通过"
+        return 2
+    fi
+    if grep -q 'X25519MLKEM768' <<<"${block}" && ((len>3500)); then
+        echoContent yellow "      ! 此 Xray 版本存在长证书链(${len})与 MLKEM 组合风险；需实际认证验证，建议换目标"
+        return 1
+    fi
+    echoContent green "      ✓ Xray 目标筛查通过（证书链 ${len} 字节）；完整 Reality 认证仍需实测"
+}
+
+checkRealityTarget() { # <dest_host> [port] [core] [sni]
+    local host=$1 port=${2:-443} core=${3:-${REALITY_CORE_HINT:-}} sni=${4:-$1} out rc=0 url endpoint
+    endpoint=$(realityEndpoint "${host}" "${port}")
+    echoContent skyBlue "\n ---> 检测 dest=${endpoint}，SNI=${sni}"
+    command -v openssl >/dev/null 2>&1 || { echoContent yellow "      ? 缺少 OpenSSL，无法判断"; return 2; }
+    out=$(timeout 12 openssl s_client -connect "${endpoint}" -servername "${sni}" -tls1_3 -alpn h2 -curves X25519 -verify_hostname "${sni}" -verify_return_error </dev/null 2>&1) || rc=$?
+    if ((rc!=0)); then
+        echoContent yellow "      ? TLS 探测未成功（退出码 ${rc}），没有标记通过"
+        return 2
+    fi
+    if ! grep -q 'TLSv1.3' <<<"${out}" || ! grep -qE 'Verify return code: 0|Verification: OK' <<<"${out}"; then
+        echoContent yellow "      ? TLS 版本或证书验证结果缺失，无法判断"; return 2
+    fi
+    echoContent green "      ✓ TLS1.3 与 SNI 证书验证成功"
+    grep -qE 'ALPN protocol: *h2' <<<"${out}" || { echoContent yellow "      ! 未协商 h2，目标不推荐"; return 1; }
+    url=$(curl -q -sS --max-time 6 --connect-to "${sni}:${port}:${endpoint}" "https://${sni}:${port}/cdn-cgi/trace" 2>/dev/null) || {
+        echoContent yellow "      ? HTTP 目标特征未能检查，不能判定全部通过"; return 2;
+    }
+    if grep -q 'visit_scheme=https' <<<"${url}"; then echoContent red "      ✗ Cloudflare 代理目标不适用"; return 1; fi
+    [[ "${core}" != xray ]] || { realityXrayCompat "${host}" "${port}" "${sni}"; return $?; }
+    return 0
+}
+
+realityPickSNI() { # 兼容旧调用，另返回 PICK_DEST_HOST
+    local current=${1:-} c raw n=0 parsed rc
+    local -a list=()
+    while read -r raw; do [[ -n "${raw}" ]] && list+=("${raw}"); done <<<"${REALITY_SNI_LIST}"
+    echoContent yellow "选择 SNI，再单独确认 dest；目标必须能够正确服务该 SNI。"
+    for raw in "${list[@]:0:12}"; do n=$((n+1)); echoContent yellow "${n}.${raw}"; done
+    echoContent yellow "输入编号或域名；回车随机。当前: ${current:-无}；q 取消"
+    while :; do
+        ask c "SNI:" || return 1; [[ "${c}" == q ]] && return 1
+        [[ -n "${c}" && "${c}" != r ]] || c=$((RANDOM % ${#list[@]} + 1))
+        if isInt "${c}" && ((10#${c}>=1 && 10#${c}<=${#list[@]})); then c=${list[$((10#${c}-1))]}; fi
+        parseSniInput "${c}" || { echoContent red " ---> SNI 不合法"; continue; }
+        PICK_SNI=${SNI_HOST}; PICK_PORT=${SNI_PORT}
+        ask raw "dest [默认 ${PICK_SNI}:${PICK_PORT}，可填 IP:端口]:" "${PICK_SNI}:${PICK_PORT}" || return 1
+        parsed=$(atrTools endpoint "${raw}") || { echoContent red " ---> dest 不合法"; continue; }
+        PICK_DEST_HOST=$(jq -r .host <<<"${parsed}"); PICK_PORT=$(jq -r .port <<<"${parsed}")
+        rc=0; checkRealityTarget "${PICK_DEST_HOST}" "${PICK_PORT}" "${REALITY_CORE_HINT:-}" "${PICK_SNI}" || rc=$?
+        ((rc==0)) && return 0
+        confirm "检测未通过或无法判断，仍明确使用此目标？" n && return 0
+    done
+}
+
+configureRealityForInstall() {
+    local core=$1 id existing c anchor r src choice rc
+    shift
+    realityPerProtocol || return 1
+    for id in "$@"; do
+        [[ "$(protoField "${id}" reality)" == true ]] || continue
+        existing=$(stagedGet --arg id "${id}" '.protocols[$id].reality.sni // ""')
+        if [[ -n "${existing}" ]]; then
+            echoContent yellow " ---> $(protoName "${id}") 已有参数，默认保留（修改请使用 Reality 管理）"
+            continue
+        fi
+        echoContent skyBlue "\n配置 $(protoName "${id}") 的 Reality 参数"
+        src=$(stagedGet --arg id "${id}" '.protocols|to_entries[]|select(.key!=$id and (.value.reality.sni // "")!="")|.key')
+        choice=3
+        if [[ -n "${src}" ]]; then
+            while read -r anchor; do
+                r=$(stagedRealityProfile "${anchor}")
+                printRaw yellow "[$(jq -r .label <<<"${r}")] $(protoName "${anchor}") dest=$(jq -r '.dest_host // .sni' <<<"${r}"):$(jq -r '.dest_port // 443' <<<"${r}") SNI=$(jq -r .sni <<<"${r}") 公钥指纹=$(jq -r .public_key <<<"${r}" | sha256sum | cut -c1-12)"
+            done <<<"${src}"
+            echoContent yellow "1.复制所选整套参数  2.仅复制 dest+SNI，生成独立密钥/Short ID  3.全新配置（默认）"
+            ask choice "请选择:" 3 || return 1
+        fi
+        case "${choice}" in
+        1|2)
+            ask c "来源标签（如 A；复制后不联动修改）:" || return 1
+            anchor=$(stagedGet --arg t "${c^^}" '.protocols|to_entries[]|select(.value.reality.label==$t)|.key')
+            [[ -n "${anchor}" && "${anchor}" != "${id}" ]] || return 1
+            r=$(stagedRealityProfile "${anchor}") || return 1
+            r=$(jq 'del(.label)' <<<"${r}")
+            if [[ "${choice}" == 2 ]]; then r=$(jq '{sni,dest_host:(.dest_host // .sni),dest_port:(.dest_port // 443),max_time_diff_seconds:60}' <<<"${r}"); fi
+            rc=0; checkRealityTarget "$(jq -r '.dest_host // .sni' <<<"${r}")" "$(jq -r '.dest_port // 443' <<<"${r}")" "${core}" "$(jq -r .sni <<<"${r}")" || rc=$?
+            if ((rc)); then confirm "该核心的目标检测未通过/无法判断，仍继续复制？" n || return 1; fi
+            stagedEdit --arg id "${id}" --argjson r "${r}" '.protocols[$id].reality=$r' || return 1
+            stagedSetReality "$(jq -r .sni <<<"${r}")" "$(jq -r '.dest_port // 443' <<<"${r}")" no "${id}" "$(jq -r '.dest_host // .sni' <<<"${r}")" || return 1
+            ;;
+        3)
+            REALITY_CORE_HINT=${core}
+            realityPickSNI || return 1
+            stagedEdit --arg id "${id}" '.protocols[$id].reality={}' || return 1
+            stagedSetReality "${PICK_SNI}" "${PICK_PORT}" no "${id}" "${PICK_DEST_HOST:-${PICK_SNI}}" "${PICK_DEST_HOST}" || return 1
+            ;;
+        *) return 1 ;;
+        esac
+        realityNewLabel "${id}" || return 1
+    done
+}
+
+realitySetTimeMenu() {
+    local id seconds profile
+    pickRealityProtocol || return 1; id=${PICK_REALITY_ID}
+    echoContent yellow "握手允许时间偏差：新节点默认 60 秒；0 关闭。不会限制已建立连接的时长。客户端也需校准时间。"
+    if ! timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes; then
+        echoContent yellow " ---> 系统时间同步未确认；可检查 chrony/ntpd。不会自动修改系统时间。"
+    fi
+    ask seconds "请输入 0-86400 秒:" 60 || return 1
+    [[ "${seconds}" =~ ^(0|[1-9][0-9]{0,4})$ ]] && ((seconds<=86400)) || return 1
+    confirm "为 $(protoName "${id}") 设置 ${seconds} 秒？旧参数仅在本次确认后修改。" n || return 0
+    stagedBegin; realityPerProtocol || return 1
+    stagedEdit --arg id "${id}" --argjson t "${seconds}" '.protocols[$id].reality.max_time_diff_seconds=$t' || return 1
+    if applyStaged "Reality 时间差"; then selfCheckProtocol "${id}"; else stagedDiscard; return 1; fi
+}
+
+realityStatusExtras() {
+    stateExists || return 0
+    local id r t core
+    while read -r id; do
+        r=$(realityProfile "${id}");core=$(S --arg id "${id}" '.protocols[$id].core')
+        t=$(jq -r --arg c "${core}" '.max_time_diff_seconds // (if $c=="xray" and (.mldsa_seed // "")!="" then 70 else 0 end)' <<<"${r}")
+        printRaw yellow "[$(jq -r '.label // "旧配置"' <<<"${r}")] ${id}: dest=$(jq -r '.dest_host // .sni' <<<"${r}"):$(jq -r '.dest_port // 443' <<<"${r}") SNI=$(jq -r .sni <<<"${r}") 时间差=$([[ "${t}" == 0 ]] && echo 关闭 || echo "${t} 秒")"
+    done < <(installedRealityProtocols)
+}
+
+# v1.3.2 HY2：标准 HTTP/3 与 obfs 明确择一；新装默认检测远端站点。
+hy2Explain() {
+    echoContent yellow "HY2 默认使用标准 HTTP/3。仅当网络针对 QUIC/HTTP/3 封锁、但放行其他 UDP 时才考虑混淆。"
+    echoContent yellow "启用 obfs 将不兼容标准 QUIC，普通浏览器无法访问 HTTP/3 伪装；保存的伪装配置会标记为未生效。"
+}
+
+configureHY2Transport() {
+    local c
+    hy2Explain
+    echoContent yellow "1.标准 HTTP/3 + 选择反代站点（默认）  2.UDP 混淆模式"
+    ask c "请选择:" 1 || return 1
+    case "${c}" in
+    1) stagedEdit 'del(.protocols.hysteria2.obfs)' || return 1; hy2ChooseProxy ;;
+    2) configureHY2ObfsPassword ;;
+    *) return 1 ;;
+    esac
+}
+
+configureHY2ObfsPassword() {
+    local secret
+    IFS= read -r -s -p "Salamander 密码（回车随机生成）:" secret || return 1; echo
+    [[ -n "${secret}" ]] || secret=$(openssl rand -hex 24) || return 1
+    jq -ne --arg p "${secret}" '$p|length>=8 and length<=256 and (test("[[:cntrl:]]")|not)' >/dev/null || return 1
+    stagedEdit --arg p "${secret}" '.protocols.hysteria2.obfs={type:"salamander",password:$p}'
+}
+
+configureHY2Obfs() {
+    local c
+    hy2Explain
+    echoContent yellow "1.关闭混淆，使用标准 HTTP/3（默认）  2.开启 Salamander"
+    ask c "请选择:" 1 || return 1
+    case "${c}" in
+    1) stagedEdit 'del(.protocols.hysteria2.obfs)' ;;
+    2) confirm "确认失去标准 HTTP/3 伪装能力？" n || return 0; configureHY2ObfsPassword ;;
+    *) return 1 ;;
+    esac
+}
+
+hy2ChooseProxy() {
+    local c url report rc p assets
+    echoContent yellow "目标选择原则："
+    echoContent yellow "1.避免 Cloudflare 等 CDN/托管平台标识出现在非对应网络的 VPS 上。"
+    echoContent yellow "2.目标应稳定、无跳转、不需登录、不屏蔽当前机房 IP；故障可能产生错误页。"
+    echoContent yellow "3.页面内容应匹配你的域名语义，脚本无法替你判断。"
+    echoContent yellow "首页优先 <10 KiB，建议 <50 KiB；无 Cookie/挑战页。CSP 会分析，不一律否决。"
+    echoContent yellow "只代理首页和限量同源静态资源，不镜像下载站或任意路径；全局 HTTP 限流不等于整台 VPS 流量上限。"
+    while :; do
+        echoContent yellow "1.SQLite https://www.sqlite.org/  2.Lua https://www.lua.org/  3.OpenBSD https://www.openbsd.org/  4.自定义  q.取消"
+        ask c "请选择（默认 SQLite，仍需检测与确认）:" 1 || return 1
+        case "${c}" in
+        1) url=https://www.sqlite.org/ ;;
+        2) url=https://www.lua.org/ ;;
+        3) url=https://www.openbsd.org/ ;;
+        4) ask url "请输入 HTTP/HTTPS 网址:" || return 1 ;;
+        q) return 1 ;;
+        *) echoContent red " ---> 选择错误"; continue ;;
+        esac
+        hy2URLValid "${url}" || { echoContent red " ---> 网址格式不合法"; continue; }
+        report=$(atrTools site-check "${url}") || { echoContent yellow " ---> 检测器失败，不能视为通过"; continue; }
+        atrTools site-show <<<"${report}" || return 1
+        rc=$(jq -r .status <<<"${report}")
+        echoContent yellow "长期稳定性、域名语义和低滥用价值需人工确认；没有 CDN 头不能证明完全没有 CDN。"
+        if [[ "${rc}" != acceptable_sample ]]; then echoContent yellow " ---> 此目标不推荐或无法判断；继续代表明确接受上述风险。"; fi
+        confirm "是否继续使用这个网址？（否则重新选择）" n || continue
+        p=$(stagedGet '.protocols.hysteria2.masquerade.gateway_port // 0')
+        if [[ "${p}" == 0 ]]; then
+            p=8080
+            if portInUse "${p}" tcp || stagedUsedPorts | grep -qx "tcp ${p}"; then p=$(randomFreePort) || return 1; fi
+        fi
+        assets=$(jq -c '.assets // []' <<<"${report}")
+        stagedEdit --arg u "${url}" --argjson p "${p}" --argjson a "${assets}" --arg status "${rc}" \
+          '.protocols.hysteria2.masquerade={mode:"proxy",url:$u,gateway_port:$p,assets:$a,assessment:$status}' || return 1
+        echoContent yellow " ---> 使用独立本地 Nginx 网关：全局请求/并发限流、robots.txt 与故障小页面。当前核心不支持可信真实 IP 传递，不宣称按客户端 IP 限流。"
+        return 0
+    done
+}
+
+configureHY2Masquerade() {
+    local c url dir file content
+    hy2Explain
+    if [[ -n "$(stagedGet '.protocols.hysteria2.obfs.type // ""')" ]]; then
+        confirm "当前开启混淆。关闭混淆并启用标准 HTTP/3 伪装？" n || return 0
+        stagedEdit 'del(.protocols.hysteria2.obfs)' || return 1
+    fi
+    echoContent yellow "1.默认 404  2.302 跳转（高级）  3.检测并选择反代站点（推荐）  4.本地文件（自行准备）  5.固定内容"
+    ask c "请选择:" 3 || return 1
+    case "${c}" in
+    1) stagedEdit 'del(.protocols.hysteria2.masquerade)' ;;
+    2)
+        ask url "跳转网址:" || return 1; hy2URLValid "${url}" || return 1
+        stagedEdit --arg u "${url}" '.protocols.hysteria2.masquerade={mode:"redirect",url:$u}' ;;
+    3) hy2ChooseProxy ;;
+    4)
+        echoContent yellow "使用核心原生 file；目录内全部内容必须可公开，准备 index.html 与 robots.txt。暂不推荐模板，不自动配置按 IP 限流。"
+        ask dir "公开目录绝对路径:" || return 1
+        stagedEdit --arg d "${dir}" '.protocols.hysteria2.masquerade={mode:"file",directory:$d}' || return 1
+        atrTools validate <<<"${NEW_STATE}" ;;
+    5)
+        ask file "UTF-8 固定内容文件（不超过 50 KiB）:" || return 1
+        [[ -f "${file}" && "$(wc -c <"${file}")" -le 51200 ]] || return 1
+        content=$(cat -- "${file}") || return 1
+        stagedEdit --arg c "${content}" '.protocols.hysteria2.masquerade={mode:"string",content:$c}' ;;
+    *) return 1 ;;
+    esac
+}
+
+hy2URLValid() { atrTools endpoint-url "$1" >/dev/null 2>&1; }
+
+stateNeedsHY2Gateway() {
+    jq -e '(.protocols.hysteria2 // {}) as $h | ($h.obfs.type // "")=="" and ($h.masquerade.mode // "")=="proxy" and ($h.masquerade.gateway_port // 0)>0' "$1" >/dev/null
+}
+
+renderHY2Gateway() {
+    stateNeedsHY2Gateway "$1" || return 0
+    local ca
+    for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do [[ -s "${ca}" ]] && break; done
+    ATR_TOOLS_NGX_HOME="${NGX_DIR}" ATR_TOOLS_NGX_LOG="${NGX_DIR}/hy2-access.log" atrTools nginx --ca "${ca}" <"$1" >"$2/atr_hy2_masq.conf"
+}
+
+configureAnyTLSPadding() {
+    local id=$1 c file line data='[]'
+    echoContent yellow "AnyTLS 填充：省略字段使用核心默认，并非关闭。自定义不保证更难识别，可能增加开销。"
+    echoContent yellow "1.沿用当前（默认）  2.核心默认  3.查看默认参考与当前值  4.从 UTF-8 文件导入  5.多行输入，单独一行 END 结束"
+    ask c "请选择:" 1 || return 1
+    case "${c}" in
+    1) return 0 ;;
+    2) stagedEdit --arg id "${id}" 'del(.protocols[$id].padding_scheme)' ;;
+    3)
+        echoContent yellow "默认参考（sing-anytls v0.0.11；未配置时以实际核心版本为准）:"
+        printf '%s\n' 'stop=8' '0=30-30' '1=100-400' '2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000' '3=9-9,500-1000' '4=500-1000' '5=500-1000' '6=500-1000' '7=500-1000'
+        stagedGet --arg id "${id}" '.protocols[$id].padding_scheme // "核心默认"'
+        [[ ! -x "${SB_BIN}" ]] || "${SB_BIN}" version | head -n 1
+        configureAnyTLSPadding "${id}" ;;
+    4)
+        ask file "策略文件路径:" || return 1; [[ -f "${file}" && "$(wc -c <"${file}")" -le 32768 ]] || return 1
+        data=$(jq -Rs 'split("\n")|map(rtrimstr("\r"))|map(select(length>0))' "${file}") || return 1
+        atrTools padding <<<"${data}" || return 1
+        stagedEdit --arg id "${id}" --argjson p "${data}" '.protocols[$id].padding_scheme=$p' ;;
+    5)
+        while IFS= read -r line; do
+            [[ "${line}" == END ]] && break
+            data=$(jq --arg l "${line}" '.+[$l]' <<<"${data}") || return 1
+            [[ "$(jq length <<<"${data}")" -le 65 ]] || return 1
+        done
+        [[ "${line}" == END ]] || return 1
+        atrTools padding <<<"${data}" || return 1
+        stagedEdit --arg id "${id}" --argjson p "${data}" '.protocols[$id].padding_scheme=$p' ;;
+    *) return 1 ;;
+    esac
+}
+
+manageAnyTLSPadding() {
+    local id
+    echoContent yellow "选择 AnyTLS 协议 ID：anytls_reality / anytls_tls"
+    ask id "协议 ID:" anytls_reality || return 1
+    [[ "${id}" == anytls_reality || "${id}" == anytls_tls ]] && protoInstalled "${id}" || return 1
+    stagedBegin; configureAnyTLSPadding "${id}" || { stagedDiscard; return 1; }
+    if applyStaged "AnyTLS 填充策略"; then postChangeShow "" "填充策略已更新；新会话由服务端协商下发"; selfCheckProtocol "${id}"; else stagedDiscard; return 1; fi
+}
+
+configureRealityClientChecks() {
+    if [[ "$1" == anytls_reality ]]; then
+        echoContent yellow "AnyTLS+Reality 使用 sing-box 原生验收；当前导出中 Xray、mihomo 客户端不适用此组合。"
+        stagedEdit --arg id "$1" '.protocols[$id].test_clients=[]'
+        return $?
+    fi
+    local id=$1 c
+    echoContent yellow "$(protoName "${id}") 客户端验收：1.仅同核心（默认）  2.还要 sing-box  3.还要 mihomo  4.两者都测。缺核心显示未验证，不自动下载。"
+    ask c "请选择:" 1 || return 1
+    case "${c}" in
+    1) stagedEdit --arg id "${id}" '.protocols[$id].test_clients=[]' ;;
+    2) stagedEdit --arg id "${id}" '.protocols[$id].test_clients=["sing-box"]' ;;
+    3) stagedEdit --arg id "${id}" '.protocols[$id].test_clients=["mihomo"]' ;;
+    4) stagedEdit --arg id "${id}" '.protocols[$id].test_clients=["sing-box","mihomo"]' ;;
+    *) return 1 ;;
+    esac
+}
+
+clientProbe() { # <id> <client> [loopback|server-return] [binary]
+    local id=$1 client=$2 scope=${3:-loopback} bin=${4:-} node rc=0 result
+    [[ "${client}" == sing-box || "${client}" == xray || "${client}" == mihomo ]] || return 2
+    if [[ -z "${bin}" ]]; then
+        case "${client}" in sing-box) bin=${SB_BIN} ;; xray) bin=${XRAY_BIN} ;; mihomo) bin=$(command -v mihomo || true) ;; esac
+    fi
+    node=$(nodeViews "$(userNames | head -n 1)" | jq -ce --arg id "${id}" '[.[]|select(.proto==$id)][0]') || return 2
+    result=$(atrTools probe --core "${client}" --binary "${bin}" --scope "${scope}" <<<"${node}") || rc=$?
+    printf '%s\n' "${result}"
+    return "${rc}"
+}
+
+selfCheckSelectedClients() { # [仅此服务端核心]
+    local core=${1:-} id client rc fail=0
+    while read -r id client; do
+        [[ -n "${client}" ]] || continue
+        echoContent yellow " ---> 指定客户端组合 ${client} → $(S --arg id "${id}" '.protocols[$id].core') / ${id}"
+        rc=0; clientProbe "${id}" "${client}" || rc=$?
+        ((rc==0)) || fail=1
+    done < <(jq -r --arg c "${core}" '.protocols|to_entries[]|select($c=="" or .value.core==$c)|.key as $id|(.value.test_clients // [])[]|"\($id) \(.)"' "${ATR_STATE}")
+    ((fail==0)) || echoContent yellow " ---> 指定客户端验收失败或未完成；不等同于服务端损坏。"
+    return "${fail}"
+}
+
+selfCheckCLI() {
+    if [[ $# == 0 ]]; then selfCheckAll; return $?; fi
+    local id="" client="" scope=loopback bin=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        --protocol) [[ $# -ge 2 ]] || return 1; id=$2; shift 2 ;;
+        --client) [[ $# -ge 2 ]] || return 1; client=$2; shift 2 ;;
+        --binary) [[ $# -ge 2 ]] || return 1; bin=$2; shift 2 ;;
+        --endpoint) scope=server-return; shift ;;
+        *) return 1 ;;
+        esac
+    done
+    [[ -n "${id}" && -n "${client}" ]] && protoInstalled "${id}" || return 1
+    clientProbe "${id}" "${client}" "${scope}" "${bin}"
+}
+
+clientTestCLI() { # 外部主机使用导出的 node JSON；不会安装别名/迁移配置
+    local file="" client="" bin="" scope=server-return address=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        --node) [[ $# -ge 2 ]] || return 2; file=$2; shift 2 ;;
+        --client) [[ $# -ge 2 ]] || return 2; client=$2; shift 2 ;;
+        --binary) [[ $# -ge 2 ]] || return 2; bin=$2; shift 2 ;;
+        --external) scope=external; shift ;;
+        --address) [[ $# -ge 2 ]] || return 2; address=$2; shift 2 ;;
+        *) return 2 ;;
+        esac
+    done
+    [[ -s "${file}" && -n "${client}" && -n "${bin}" ]] || { echo '用法: client-test --node node.json --client sing-box|xray|mihomo --binary 核心路径 [--external]'; return 2; }
+    atrTools probe --core "${client}" --binary "${bin}" --scope "${scope}" ${address:+--address "$address"} <"${file}"
+}
+
+externalProbeExport() {
+    local id path user
+    pickRealityProtocol || return 1; id=${PICK_REALITY_ID}; user=$(userNames | head -n 1)
+    path="${CLIENT_DIR}/${user}/probe-${id}.json"
+    nodeViews "${user}" | jq --arg id "${id}" '[.[]|select(.proto==$id)][0]' | atomicWrite "${path}" 600 || return 1
+    echoContent yellow " ---> 已生成 ${path}（含客户端凭据，勿公开）。复制到另一网络主机，然后运行："
+    printRaw yellow "bash anytls-reality.sh client-test --node probe-${id}.json --client sing-box --binary /path/to/sing-box --external"
+    echoContent yellow "外部主机需 Python3、curl 和选定核心；--external 是执行者声明，脚本不凭该标志伪造已验证位置。"
+}
+
+showAnyTLSExport() {
+    local user file
+    user=$(userNames | head -n 1);file="${CLIENT_DIR}/${user}/anytls-reality.json"
+    [[ -s "${file}" ]] || regenClients || return 1
+    [[ -s "${file}" ]] || { echoContent yellow " ---> 未安装 AnyTLS+Reality"; return 1; }
+    echoContent yellow "这是 sing-box JSON 导入文件，不是通用 AnyTLS URI。"
+    printRaw green "${file}"
+    confirm "显示配置内容？（含凭据）" n && cat "${file}"
+    return 0
+}
+
+monitorSample() {
+    local report
+    lockAcquire || return 1
+    report=$(atrTools monitor --home "${ATR_HOME}" <"${ATR_STATE}") || { lockRelease; return 1; }
+    printf '%s\n' "${report}"
+    if [[ "$(jq -r .alert <<<"${report}")" == true ]]; then atrLog "流量阈值告警: ${report}"; fi
+    lockRelease
+}
+
+
+cliSetSNI() { # sni host[:port] [--dest host:port] [--protocol id] [--force]
+    local target=${1:-} force=no id="" dest="" host port parsed
+    [[ $# -gt 0 ]] && shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        --force) force=yes; shift ;;
+        --protocol) [[ $# -ge 2 ]] || return 1; id=$2; shift 2 ;;
+        --dest) [[ $# -ge 2 ]] || return 1; dest=$2; shift 2 ;;
+        *) return 1 ;;
+        esac
+    done
+    requireInstalled || return 1
+    parseSniInput "${target}" || return 1; host=${SNI_HOST};port=${SNI_PORT}
+    if [[ "$(realityMode)" == independent ]]; then
+        [[ -n "${id}" ]] && installedRealityProtocols | grep -Fxq "${id}" || { echoContent red " ---> 按协议配置必须指定 --protocol"; return 1; }
+    elif [[ -n "${id}" ]]; then
+        echoContent red " ---> 旧共享模式：请先 reality-mode independent，再修改单个协议"; return 1
+    fi
+    if [[ -n "${dest}" ]]; then
+        parsed=$(atrTools endpoint "${dest}") || return 1
+        dest=$(jq -r .host <<<"${parsed}");port=$(jq -r .port <<<"${parsed}")
+    else dest=${host}; fi
+    REALITY_CORE_HINT=$(realityCoreHint "" "${id}")
+    if ! checkRealityTarget "${dest}" "${port}" "${REALITY_CORE_HINT}" "${host}" && [[ "${force}" != yes ]]; then
+        echoContent red " ---> 检测未通过/无法判断；未修改，可明确使用 --force"; return 1
+    fi
+    stagedBegin; stagedSetReality "${host}" "${port}" no "${id}" "${dest}" || return 1
+    if applyStaged "修改 Reality 目标 ${id}"; then postChangeShow "" "目标已更新，客户端需同步 SNI"; selfCheckAll; else stagedDiscard; return 1; fi
+}
+
+reconcileMonitor() { # state，各文件纳入配置事务。仅日志告警，无外发或自动停服。
+    local st=$1
+    if [[ "$(jq -r '.monitor.enabled // false' "${st}")" == true ]]; then
+        _writeUnitFile atr-monitor <<EOF
+[Unit]
+Description=AnyTLS-Reality host traffic sample (local log only)
+[Service]
+Type=oneshot
+ExecStart=${ATR_SCRIPT_PATH} monitor-sample
+EOF
+        [[ $? == 0 ]] || return 1
+        local timer
+        timer=$(cat <<'EOF'
+[Unit]
+Description=AnyTLS-Reality periodic traffic sample
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=atr-monitor.service
+[Install]
+WantedBy=timers.target
+EOF
+)
+        printf '%s\n' "${timer}" | atomicWrite "${ATR_SYSTEMD_DIR}/atr-monitor.timer" 644 || return 1
+        systemctl daemon-reload && systemctl enable --now atr-monitor.timer || return 1
+    elif [[ -f "${ATR_SYSTEMD_DIR}/atr-monitor.timer" ]] || systemctl is-active --quiet atr-monitor.timer; then
+        systemctl disable --now atr-monitor.timer || return 1
+        rm -f "${ATR_SYSTEMD_DIR}/atr-monitor.timer" "${ATR_SYSTEMD_DIR}/atr-monitor.service" || return 1
+        systemctl daemon-reload || return 1
+    fi
+}
+
+monitorMenu() {
+    local c threshold
+    echoContent yellow "宿主网卡采样包含其他服务；无法用用户流量 API 代替未认证 HTTP/3 流量统计。"
+    echoContent yellow "1.采样  2.设置每分钟采样与本机日志阈值告警  3.停止采样  4.查看日志"
+    ask c "请选择:" 1 || return 1
+    case "${c}" in
+    1) monitorSample ;;
+    2)
+        ask threshold "单方向阈值 Mbps:" 100 || return 1
+        [[ "${threshold}" =~ ^[1-9][0-9]{0,6}$ ]] && ((threshold<=1000000)) || return 1
+        stagedBegin; stagedEdit --argjson t "${threshold}" '.monitor={enabled:true,threshold_mbps:$t}' || return 1
+        if applyStaged "本机流量阈值日志"; then echoContent yellow " ---> 每分钟采样并写本机日志；未配置外发渠道，不自动停代理。"; else stagedDiscard; return 1; fi ;;
+    3)
+        stagedBegin; stagedEdit '.monitor.enabled=false' || return 1
+        if ! applyStaged "停止采样"; then stagedDiscard; return 1; fi ;;
+    4) tail -n 30 "${ATR_HOME}/atr.log"; tail -n 20 "${NGX_DIR}/hy2-access.log" 2>/dev/null ;;
+    *) return 1 ;;
+    esac
+}
+
 # ----------------------------- 单个协议的参数 ---------------------------------
 # configureProtocol <core> <id>  —— 询问端口/参数并写入候选状态
 configureProtocol() {
@@ -6170,7 +6896,8 @@ configureProtocol() {
     hysteria2)
         askPort port "${id}" "${name} (UDP) " udp || return 1
         stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]=((.protocols[$id] // {})+{core:$c,port:$p})' || return 1
-        configureHY2Bandwidth
+        configureHY2Bandwidth || return 1
+        if ! protoInstalled hysteria2; then configureHY2Transport || return 1; fi
         ;;
     *)
         local net=tcp
@@ -6317,6 +7044,11 @@ installProtocols() {
         }
     done
 
+    for id in "${ids[@]}"; do
+        if [[ "${id}" == anytls_reality || "${id}" == anytls_tls ]]; then configureAnyTLSPadding "${id}" || { stagedDiscard; return 1; }; fi
+        if [[ "$(protoField "${id}" reality)" == true ]]; then configureRealityClientChecks "${id}" || { stagedDiscard; return 1; }; fi
+    done
+
     # --- 伪装站 (nginx 回落) ---
     if ((needNginx)); then
         n=$((n + 1))
@@ -6381,10 +7113,11 @@ installOneClickFlow() {
 
 # 非交互入口: atr install-anytls-reality [--port N] [--sni host[:port]] [--user name]
 cliInstallAnyTLSReality() {
-    local port="" sni="" user="" egress="" mode="" a profile
+    local port="" sni="" user="" egress="" mode="" a profile dest="" parsed
     while [[ $# -gt 0 ]]; do
         a=$1
         case "${a}" in
+        --dest) [[ $# -ge 2 ]] || return 1; dest=$2; shift ;;
         --reality-mode) [[ $# -ge 2 ]] || return 1; mode=$2; shift ;;
         --port)
             port=$2
@@ -6435,7 +7168,7 @@ cliInstallAnyTLSReality() {
     ensureCore sing-box 2 5 || return 1
     stateInit
     stagedBegin
-    [[ -z "${mode}" ]] || stagedRealityMode "${mode}" || return 1
+    if [[ -z "${mode}" ]]; then realityPerProtocol || return 1; else stagedRealityMode "${mode}" || return 1; fi
     # 未指定时：已经选过就沿用，否则默认公网出口（更安全的一侧）
     [[ -z "${egress}" ]] && egress=$(stagedGet '.egress.mode // ""')
     stagedEdit --arg m "${egress:-public}" '.egress.mode=$m' || return 1
@@ -6447,13 +7180,18 @@ cliInstallAnyTLSReality() {
         SNI_PORT=$(jq -r '.dest_port // 443' <<<"${profile}")
         [[ -n "${SNI_HOST}" ]] || SNI_HOST=www.microsoft.com
     fi
+    if [[ -n "${dest}" ]]; then
+        parsed=$(atrTools endpoint "${dest}") || return 1
+        dest=$(jq -r .host <<<"${parsed}"); SNI_PORT=$(jq -r .port <<<"${parsed}")
+    else dest=$(stagedGet '.protocols.anytls_reality.reality.dest_host // .reality.dest_host // empty'); [[ -n "${dest}" ]] || dest=${SNI_HOST}; fi
     step 3 5 "检测 Reality 目标 ${SNI_HOST}:${SNI_PORT}"
     REALITY_CORE_HINT=$(realityCoreHint sing-box anytls_reality)
-    checkRealityTarget "${SNI_HOST}" "${SNI_PORT}" || {
+    checkRealityTarget "${dest}" "${SNI_PORT}" sing-box "${SNI_HOST}" || {
         echoContent red " ---> 目标未通过检测，请换一个 --sni"
         return 1
     }
-    stagedSetReality "${SNI_HOST}" "${SNI_PORT}" no anytls_reality || return 1
+    stagedSetReality "${SNI_HOST}" "${SNI_PORT}" no anytls_reality "${dest}" || return 1
+    if [[ "$(stagedGet '.reality_mode // "shared"')" == independent && -z "$(stagedGet '.protocols.anytls_reality.reality.label // ""')" ]]; then realityNewLabel anytls_reality || return 1; fi
     if [[ "$(stagedGet '.users|length')" == "0" ]]; then
         stagedUserAdd "${user:-$(randHex 6)}" || return 1
     fi
@@ -6767,7 +7505,7 @@ def fetch_reference(tmp):
     # Direct verified HTTPS; no download proxies or unverified override.
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
     def get(url,limit):
-        req=urllib.request.Request(url,headers={'User-Agent':'AnyTLS-Reality-capability-probe/1.3.1','Accept':'application/vnd.github+json'})
+        req=urllib.request.Request(url,headers={'User-Agent':'AnyTLS-Reality-capability-probe/1.3.2','Accept':'application/vnd.github+json'})
         deadline=time.monotonic()+60; data=bytearray()
         with opener.open(req,timeout=15) as r:
             while True:
@@ -6811,14 +7549,14 @@ class Fixture:
         self.port=self.server.server_address[1]
     def close(self): self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=1)
 
-def tunnel_case(sb,xr,tmp,kp,fixture,sni,target_port,timeout,reference=False):
+def tunnel_case(sb,xr,tmp,kp,fixture,sni,target_port,timeout,reference=False,dest_host=None):
     sp=free_port(); cp=free_port(); sid=secrets.token_hex(8); user=str(uuid.uuid4()); server=None; client=None; tap=None
-    target_host='127.0.0.1' if sni=='localhost' else sni
+    target_host=dest_host or ('127.0.0.1' if sni=='localhost' else sni)
     try:
         if reference:
             cfg={'log':{'loglevel':'none'},'inbounds':[{'listen':'127.0.0.1','port':sp,'protocol':'vless',
                  'settings':{'clients':[{'id':user,'flow':'xtls-rprx-vision'}],'decryption':'none'},
-                 'streamSettings':{'network':'tcp','security':'reality','realitySettings':{'target':target_host+':'+str(target_port),'serverNames':[sni],'privateKey':kp[0],'shortIds':[sid]}}}],
+                 'streamSettings':{'network':'tcp','security':'reality','realitySettings':{'target':(('['+target_host+']') if ':' in target_host else target_host)+':'+str(target_port),'serverNames':[sni],'privateKey':kp[0],'shortIds':[sid]}}}],
                  'outbounds':[{'protocol':'freedom','settings':{'finalRules':[{'action':'allow','network':'tcp','port':str(fixture.port),'ip':['127.0.0.1/32']}]}}]}
             server=start(xr,cfg,tmp/'reference-server.json',[sp])
         else:
@@ -6872,8 +7610,8 @@ def configured_targets(statefile):
         for ident,p in st.get('protocols',{}).items():
             if p.get('core')!='sing-box' or ident not in ('anytls_reality','vless_reality_vision','vless_reality_grpc'): continue
             r=p.get('reality',{}) if st.get('reality_mode','shared')=='independent' else st.get('reality',{})
-            host=r.get('sni',''); port=r.get('dest_port',443)
-            if valid_target(host,port) and (host,port) not in [(t['sni'],t['port']) for t in out]: out.append({'sni':host,'port':port,'source_protocol':ident})
+            host=r.get('sni',''); dest=r.get('dest_host',host); port=r.get('dest_port',443)
+            if valid_target(host,port) and isinstance(dest,str) and dest and (host,dest,port) not in [(t['sni'],t.get('dest_host',t['sni']),t['port']) for t in out]: out.append({'sni':host,'dest_host':dest,'port':port,'source_protocol':ident})
         return out[:4]
     except (OSError,ValueError,TypeError,AttributeError): return []
 def valid_target(host,port): return isinstance(host,str) and re.fullmatch(r'(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9-]{2,63}',host) is not None and type(port) is int and 1<=port<=65535
@@ -6896,7 +7634,7 @@ def server_probes(sb,xr,tmp,kp,targets,timeout):
             result.update(status='hybrid_test_failed',reason='混合测试失败，经典与混合参考对照通过；仅适用于本次版本/探针组合，不推断所有实现均不支持')
         else: result['reason']='对照不完整或结果不一致，不能判定为不支持'
         for target in targets:
-            test=tunnel_case(sb,xr,tmp,kp,fixture,target['sni'],target['port'],timeout)
+            test=tunnel_case(sb,xr,tmp,kp,fixture,target['sni'],target['port'],timeout,dest_host=target.get('dest_host'))
             result['current_targets'].append({**target,**test,'scope':'当前 SNI/目标配置的临时实例；使用参考客户端与一次性密钥，并非生产连接抓包'})
     except (OSError,ProbeError,subprocess.TimeoutExpired) as e: result['reason']=str(e)[:180]
     finally: stop(target_process); fixture.close()
@@ -6959,7 +7697,7 @@ def main(argv=None):
                 protected.extend([str(binary),str(binary.parent/'conf/config.json'),str(binary.parent.parent/'state.json'),str(binary.parent.parent/'anytls-reality.sh')])
         dest=pathlib.Path(a.output).resolve()
         if any(p and dest==pathlib.Path(p).resolve() for p in protected): ap.error('报告路径不能覆盖状态文件、核心、核心配置或管理脚本')
-    r={'schema':1,'script_version':os.environ.get('ATR_PROBE_VERSION','1.3.1'),'time_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    r={'schema':1,'script_version':os.environ.get('ATR_PROBE_VERSION','1.3.2'),'time_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
        'sing_box':metadata(sb),'reference':{'available':False},'client_tests':[],
        'server':{'status':'unknown','reason':'未执行'},
        'authentication':{'status':'not_verified','conclusion':'本探针未验证 ML-DSA 等额外抗量子身份认证；混合密钥交换不等于完整抗量子认证'},
@@ -7021,7 +7759,6 @@ if __name__=='__main__':
     except KeyboardInterrupt: print('检测已中止；临时探针正在清理',file=sys.stderr); sys.exit(130)
     except (OSError,ValueError,ProbeError) as e: print('检测未能完成: '+type(e).__name__,file=sys.stderr); sys.exit(2)
     finally: cleanup()
-
 ATR_REALITY_PROBE_PY
 }
 
@@ -7030,6 +7767,7 @@ realityShowParams() {
     echoContent skyBlue "\n---------------- 当前 Reality 参数 ----------------"
     echoContent yellow "配置方式: $(realityMode)"
     local id profile
+    realityStatusExtras
     while read -r id; do
         [[ -n "${id}" ]] || continue
         profile=$(realityProfile "${id}")
@@ -7051,6 +7789,8 @@ manageReality() {
     echoContent yellow "5.按各自核心自检"
     echoContent yellow "6.切换共享 / 独立配置"
     echoContent yellow "7.REALITY 能力与协商检测（MLKEM / 指纹 / 服务端）"
+    echoContent yellow "8.指定客户端组合自检  9.时间差限制  10.AnyTLS 填充策略"
+    echoContent yellow "11.AnyTLS JSON 导入文件  12.导出外部实连探针"
     local c id="" profile port scope="全部 Reality 协议"
     ask c "请选择:" || return 1
     case "${c}" in
@@ -7066,7 +7806,7 @@ manageReality() {
             echoContent yellow "影响范围: ${scope}；已有客户端需同步 SNI"
             realityPickSNI "$(jq -r '.sni' <<<"${profile}"):$(jq -r '.dest_port // 443' <<<"${profile}")" || return 1
             stagedBegin
-            stagedSetReality "${PICK_SNI}" "${PICK_PORT}" no "${id}" || return 1
+            stagedSetReality "${PICK_SNI}" "${PICK_PORT}" no "${id}" "${PICK_DEST_HOST:-${PICK_SNI}}" || return 1
         else
             confirm "重置 ${scope} 的密钥和 Short ID？相关客户端必须更新，失败自动回滚。" n || return 0
             stagedBegin
@@ -7088,6 +7828,15 @@ manageReality() {
         if applyStaged "切换 Reality 配置方式"; then postChangeShow "" "Reality 配置方式已更新"; selfCheckAll; else stagedDiscard; return 1; fi
         ;;
     7) realityCapabilities ;;
+    8)
+        pickRealityProtocol || return 1
+        local client
+        ask client "客户端核心（sing-box / mihomo / xray）:" sing-box || return 1
+        clientProbe "${PICK_REALITY_ID}" "${client}" ;;
+    9) realitySetTimeMenu ;;
+    10) manageAnyTLSPadding ;;
+    11) showAnyTLSExport ;;
+    12) externalProbeExport ;;
     *) echoContent red " ---> 选择错误"; return 1 ;;
     esac
 }
@@ -7417,6 +8166,7 @@ manageUDPProtocol() { # manageUDPProtocol <hysteria2|tuic>
             echoContent yellow "5.obfs 混淆"
             echoContent yellow "6.未认证 HTTP/3 伪装"
             echoContent yellow "7.导出配置实连（保留 DNS / TLS / 跳跃范围）"
+            echoContent yellow "8.宿主流量采样与本机阈值告警"
         fi
     else
         echoContent yellow "依赖 sing-box 内核与域名证书\n"
@@ -7451,6 +8201,7 @@ manageUDPProtocol() { # manageUDPProtocol <hysteria2|tuic>
     5) [[ "${id}" == hysteria2 ]] && manageHY2Option obfs ;;
     6) [[ "${id}" == hysteria2 ]] && manageHY2Option masquerade ;;
     7) [[ "${id}" == hysteria2 ]] && selfCheckHY2Endpoint ;;
+    8) [[ "${id}" == hysteria2 ]] && monitorMenu ;;
     *) echoContent red " ---> 选择错误" ;;
     esac
 }
@@ -8951,6 +9702,10 @@ showInstallStatus() {
 showStatusCLI() {
     showInstallStatus
     stateExists || return 0
+    realityStatusExtras
+    if protoInstalled hysteria2; then
+        echoContent yellow "HY2: $(S 'if (.protocols.hysteria2.obfs.type // "")!="" then "混淆模式；HTTP/3 伪装未生效" else "标准 HTTP/3，页面模式: "+(.protocols.hysteria2.masquerade.mode // "默认404") end')"
+    fi
     local proto port
     echoContent skyBlue "\n监听检查:"
     while read -r proto port; do
@@ -9110,6 +9865,8 @@ uninstallAll() {
         echoContent red " ---> 跳跃规则未能回收，已保留安装目录与规则恢复记录；排除防火墙故障后重试卸载。"
         return 1
     fi
+    systemctl disable --now atr-monitor.timer >/dev/null 2>&1 || true
+    rm -f "${ATR_SYSTEMD_DIR}/atr-monitor.timer" "${ATR_SYSTEMD_DIR}/atr-monitor.service"
     local u
     for u in "${SB_UNIT}" "${XRAY_UNIT}" "${NGX_UNIT}" "${HOP_UNIT}" "${TLS_RECOVERY_UNIT}"; do
         serviceActive "${u}" && serviceStop "${u}"
@@ -9142,6 +9899,7 @@ uninstallAll() {
 # =============================================================================
 
 usage() {
+    echo "诊断: site-check URL；selfcheck --protocol ID --client sing-box|mihomo|xray [--endpoint]；client-test --node FILE --client CORE --binary PATH [--external]"
     cat <<EOF
 ${ATR_PROJECT_NAME} ${ATR_VERSION} —— sing-box / Xray 管理脚本 (AnyTLS+Reality)
 
@@ -9215,38 +9973,6 @@ cliRealityMode() { # reality-mode shared|independent [--from protocol]
     else stagedDiscard; return 1; fi
 }
 
-cliSetSNI() { # sni <host[:port]> [--protocol id] [--force]
-    local target=${1:-} force=no id=""
-    [[ $# -gt 0 ]] && shift
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-        --force) force=yes; shift ;;
-        --protocol) [[ $# -ge 2 ]] || return 1; id=$2; shift 2 ;;
-        *) echoContent red " ---> 未知参数: $1"; return 1 ;;
-        esac
-    done
-    requireInstalled || return 1
-    [[ -n "$(installedRealityProtocols)" ]] || { echoContent red " ---> 未安装 Reality 类协议"; return 1; }
-    if [[ "$(realityMode)" == independent ]]; then
-        [[ -n "${id}" ]] && installedRealityProtocols | grep -Fxq "${id}" || { echoContent red " ---> 独立模式必须使用 --protocol 指定已安装的 Reality 协议"; return 1; }
-    elif [[ -n "${id}" ]]; then
-        echoContent red " ---> 共享模式会影响全部 Reality 协议；请去掉 --protocol，或先切换独立模式"
-        return 1
-    fi
-    parseSniInput "${target}" || { echoContent red " ---> SNI 不合法: ${target}"; return 1; }
-    REALITY_CORE_HINT=$(realityCoreHint "" "${id}")
-    if ! checkRealityTarget "${SNI_HOST}" "${SNI_PORT}" && [[ "${force}" != yes ]]; then
-        echoContent red " ---> 目标未通过检测（加 --force 可强制使用）"; return 1
-    fi
-    stagedBegin
-    stagedSetReality "${SNI_HOST}" "${SNI_PORT}" no "${id}" || return 1
-    if applyStaged "修改 Reality SNI ${id}"; then
-        local rc=0
-        postChangeShow "" "Reality 目标域名已改为 ${SNI_HOST}:${SNI_PORT}" || rc=1
-        selfCheckAll || rc=1
-        return "${rc}"
-    else stagedDiscard; return 1; fi
-}
 
 
 # 命令行参数会出现在 ps 与 shell 历史里。密码参数写成 "-" 表示改从标准输入读取一行
@@ -9425,6 +10151,9 @@ main() {
         usage
         return 0
         ;;
+    client-test) shift; clientTestCLI "$@"; return $? ;;
+    site-check) shift; atrTools site-check "$@"; return $? ;;
+    monitor-sample) stateExists || return 1; [[ "$(S '.monitor.enabled // false')" == true ]] || return 0; monitorSample; return $? ;;
     reality-capabilities)
         shift
         realityCapabilities "$@"
@@ -9501,7 +10230,7 @@ main() {
         ;;
     show) showAccounts "${1:-}" "${2:-0}" ;;
     sub) showSubscriptionLinks "${1:-}" ;;
-    selfcheck) selfCheckAll ;;
+    selfcheck) selfCheckCLI "$@" ;;
     sni) cliSetSNI "$@" ;;
     reality-mode) cliRealityMode "$@" ;;
     passwd) cliPasswd "$@" ;;
