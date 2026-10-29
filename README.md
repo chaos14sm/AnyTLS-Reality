@@ -1,12 +1,58 @@
 # AnyTLS-Reality
 
-> 本目录是尚未发布到 GitHub 的 v1.3.0 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
+> 本目录是尚未发布到 GitHub 的 v1.3.1 本地版本包。请上传本包的 `anytls-reality.sh` 到 VPS 后执行 `bash ./anytls-reality.sh`；下方 GitHub 下载命令对应仓库已发布版本。
 
 sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
 界面、菜单编号和操作习惯参考并派生自 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent)（v2ray-agent 目前没有 AnyTLS + Reality 这个组合），安装后直接输入 `atr` 进入管理菜单。本项目是独立的派生作品，与 v2ray-agent 官方无关联。
 
 > **项目状态**：开发期间在隔离沙箱中，用真实的 sing-box / Xray / mihomo / nginx 二进制做过端到端验证（包括 AnyTLS + Reality 的回环握手）。2026-10-25 又在一台全新的 Debian 13 VPS（systemd 257、nginx 1.26）上做过一次完整的实机审计（v1.2.5）：真实 systemd 服务管理与沙箱、nginx 降权到 `atr-nginx`、真实 iptables 端口跳跃、各协议的真实数据转发（含 Windows 上的 sing-box 客户端经公网连接、官方 NaiveProxy 客户端、Xray 原生 XHTTP 客户端）、事务回滚与恢复、订阅撤销、DNS rebinding 对照实验，以及用 `strace` 核对凭据不出现在命令行上；v1.2.6 增加了相关修复；v1.2.7 进一步修复证书崩溃恢复和防火墙事务边界；v1.2.8 增加同核心自检与 Reality 共享/独立配置，并在原 Debian 13 VPS 上重新回归。详见 CHANGELOG.md 和随版本提供的测试报告。**仍未在真实服务器上验证**的：acme.sh 真实签发与 DNS API、WARP 注册、IPv6 专属流程与 NAT64、RHEL 系 + SELinux、arm64、BBR/DD、长时间压力测试。建议先在测试机上试用，遇到问题请到 Issues 反馈。
+
+## v1.3.1 — HY2 配置与验收修复（2026-10-29）
+
+在 `atr` 主菜单 → `4. Hysteria2` 中：
+
+| 入口 | 功能 |
+|---|---|
+| 1 | 安装或重新配置端口、带宽模式 |
+| 3 | 端口跳跃管理 |
+| 4 | 切换固定带宽 / BBR 自适应 |
+| 5 | 关闭 / 开启 Salamander obfs，设置或随机生成混淆密码 |
+| 6 | 未认证 HTTP/3 伪装：关闭 / 302 跳转 / 反向代理 |
+| 7 | 使用导出配置实连，保留域名、证书校验和跳跃范围 |
+
+### 带宽与升级
+
+新装 HY2 默认 BBR 自适应，服务端、sing-box 和 mihomo 客户端不再写入默认 100/50 Mbps；服务端设置 `ignore_client_bandwidth: true`。已有明确上/下行数值的旧状态按固定模式解释，升级不会偷偷改变现有策略。需要解除原来的默认限制，请在菜单 4 选择自适应并重新导入客户端配置。固定模式中的数值始终按客户端视角；输入 0 会切换到自适应，错误输入会重新询问。
+
+### 链接与端口跳跃
+
+分享链接改为官方格式 `hysteria2://密码@主机:主端口,30000-31000/?sni=...&insecure=0`，不再依赖 `mport` 扩展。sing-box `server_ports` 使用冒号范围（包括 `主端口:主端口`），不同时输出 `server_port`；mihomo 使用 `ports`。URI 标准没有携带固定带宽的字段，需要准确保留该设置时请导入 JSON/YAML。
+
+用户目录额外生成 `hy2-single-port.txt`（默认 `/etc/anytls-reality/clients/<用户名>/`）。它明确放弃端口跳跃，用于无法导入标准多端口 URI 的客户端；不会把同一节点重复塞进订阅。移动客户端对多端口 URI 的支持仍需各自确认，不能据此承诺全部客户端兼容。
+
+跳跃规则增量应用、失败返回非零；先添加新范围，再移除旧范围。firewalld 分别处理运行时与永久规则，IPv4 使用 forward-port，IPv6 使用 rich rule，不全局 reload、不额外开启全局 masquerade。记录规则所属 zone；保留管理员预先创建的相同规则和无关规则。旧 `hop_firewalld.list` 可自动迁移，旧版本曾开启的全局 masquerade 不会擅自关闭。
+
+修改前将撤销操作写入 `hop.pending` 并同步磁盘；失败时撤销，进程崩溃后下次应用或清理跳跃规则时重放。回滚失败保留记录并报错，卸载无法清理跳跃规则时保留安装目录。请排除防火墙故障后执行 `atr apply-hop`（或重试原操作），不要直接删掉恢复记录。
+
+### obfs 与伪装
+
+两项默认均关闭。Salamander 密码由该 HY2 入站的所有用户共用，独立于各用户的认证密码；修改后会更新分享链接、sing-box 和 mihomo 配置。
+
+伪装可选默认 404、固定 302 Location 跳转、固定目标反向代理（重写 Host）。URL 仅接受 HTTP/HTTPS，不接受用户密码、空格和控制字符。302 会使访问者离开 VPS；反代由 VPS 获取目标内容，不能保证目标站的资源、登录、Cookie 或 CSP 都适合镜像。
+
+这只处理未认证的 **HTTP/3** 请求，不会额外部署 TCP 网站或修改 nginx。开启 obfs 后，普通 HTTP/3 浏览器无法解码，通常看不到伪装页面；保留两个独立开关供用户选择。
+
+### 自检与回退
+
+`atr selfcheck` 仍是同核心回环认证/转发测试，并明确显示绕过 DNS、证书验证、跳跃范围的覆盖边界。菜单 7 使用导出节点实连，保留 DNS、TLS 验证和范围；从服务端发起只代表回连采样，不能证明外部 UDP 入口可达或全部跳跃端口可达。公网验收仍需另一网络上的客户端。
+
+替换脚本后执行 `atr restart` 以应用渲染和跳跃规则，再确认客户端文件生成成功。旧固定带宽保留；新增开关默认关闭。回退旧脚本前，应先用本版关闭混淆、伪装和端口跳跃，并选择旧版理解的固定带宽；或者恢复完整备份。旧脚本不理解本版 firewalld 规则账本与自适应模式。
+
+本包尚未发布到 GitHub。测试结果见 `TEST-REPORT.md`；本轮没有在测试 VPS 安装生产服务。
+
+参考：[sing-box 服务端配置](https://sing-box.sagernet.org/configuration/inbound/hysteria2/)、[客户端配置](https://sing-box.sagernet.org/configuration/outbound/hysteria2/)、[Hysteria URI 规范](https://v2.hysteria.network/docs/developers/URI-Scheme/)、[firewalld 手册](https://firewalld.org/documentation/man-pages/firewall-cmd.html)。
+
 
 ## 特性
 
@@ -321,7 +367,7 @@ nginx 是脚本自带的独立实例（配置在 `/etc/anytls-reality/nginx/`，
 - 从 v1.2.4 升级到 v1.2.5：不需要手动处理。升级后第一次运行 `atr` 时，如果已发布的订阅不完整（例如 v1.2.4 在开机任务里撤下了旧布局、之后一直没有重新发布），会自动补发一次。
 - 从 v1.2.2 升级到 v1.2.4：安装和升级内核需要能直连 `api.github.com`（见「安全模型」的「内核下载」）。有未完成的事务时只读命令仍可用，新增 `atr recover [--abandon]`。安装和换内核时，Naive、XHTTP 等无法自动验证的协议不算失败，只列出来（v1.2.3 曾把它们当作验收失败，这类节点的内核因此无法升级或回退；`ATR_ALLOW_UNTESTED_CORE` 已取消）。如果订阅还是 v1.2.1 及更早的 `peer/<密钥>/` 布局，第一次运行任何 `atr` 命令时就会按新布局重新发布一次（nginx 重启一次）；对其他机器的接口不变。
 - 从 v1.2.1 升级到 v1.2.2：升级后第一次发布订阅时，如果订阅的 nginx 配置还是旧格式，会先按当前 state 重新应用一次配置（nginx 会重启一次），然后按新的目录布局（`peer/<用户名>/`）发布，旧布局 `peer/<密钥>/` 随旧目录一起消失。对等分享对其他机器的接口（`/s/peer/<密钥>/<用户>/<类型>`）没有变化，对方不需要改动。`/etc/anytls-reality/nginx/conf.d/atr_subscribe.conf` 现在是 600 权限（里面有对等密钥）。选了「公网出口」的 Xray 节点，DNS 与直连出站的写法改变了（见上面「出口访问模式」）。HTTP 明文订阅的两处提示现在明确写出「令牌和全部节点凭据会明文经过网络」。
-- **Xray 26.10.21 与 sing-box 1.14.x 客户端握手失败**：26.10.21 于 2026-10-21 发布，2026-10-24 用 GitHub API 核对，它是正式发布（`prerelease` 为 false），也是 API 的 latest，所以正式发布核对拦不住它。我在沙箱里用该版本做 VLESS+Reality+Vision 回环自检（客户端是 sing-box 1.14.2），对所有目标都是 `reality verification failed`；同样的测试用 Xray 26.3.27 全部通过。发布说明里没有提到 Reality 的改动（这是一次紧急的根证书更新，用 Go 1.27.3 编译，作者说月底再发 stable），原因我没有追到上游；2026-10-25 的实机审计在 sing-box 1.14.4 上也复现了同样的失败。v1.2.6 起，选到这个版本时（安装、升级、回退）会先提示这个已知问题；自检失败的提示里也会说明可能是内核版本组合的问题。新装 Xray 节点建议固定版本：`ATR_XRAY_VERSION=v26.3.27 bash anytls-reality.sh`。已经在用 26.3.27 的节点升级到 26.10.21 时，换内核后的互通检查会握手失败并自动恢复旧内核（前提是本机有 sing-box 可以作自检客户端；纯 Xray 节点会提示「无法自动验证」，这时请不要确认升级）。已经装上 26.10.21 的，用菜单 16（core 管理）→ 2（回退）退到 26.3.27，或者先只用 sing-box 作服务端。
+- **REALITY 跨核心兼容性**：旧测试在 Xray 26.10.21 服务端与 sing-box 1.14.x 客户端间复现过握手失败。v1.2.8 起按节点所属核心自检，Xray 节点用 Xray 客户端，sing-box 节点用 sing-box 客户端；同核心自检通过不保证第三方客户端兼容。请用实际客户端测试后选择核心组合，无需仅因跨核心探针失败就统一降级。可以使用 `atr reality-capabilities` 获取当前核心与目标的实测证据。
 - 已在沙箱里用多个并发进程、故障注入（文件复制 / `base64` / `mktemp` / `mv` / `find` 失败、磁盘写满、渲染失败、令牌写入失败；事务里分别让 state 写入、备份、事务标记、核心配置写入失败，让恢复也失败，让写入「成功」但内容被悄悄写坏）测试过上述行为，并用真实的 nginx 核对撤销后旧链接/旧对等密钥确实返回 404；没有在真实多用户 VPS、真实 systemd 和 nginx 降权下验证。
 - 从 v1.1.0 升级到 v1.2.0：老安装第一次打开菜单时会被问一次出口访问模式，回车 = 保持现状（允许内网访问），所以不选也不会改变任何行为；已经选过就不再问。控制接口的 `secret` 是新生成的，旧的客户端完整配置需要重新导入。对等订阅里的 HTTP 条目不再生效。
 

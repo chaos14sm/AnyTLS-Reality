@@ -42,8 +42,8 @@ export LANG=en_US.UTF-8
 # - 核心单元 ProtectSystem=strict + RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK：连不上 systemd/D-Bus，写不了系统目录。
 # - 公网出口模式也禁止本机的 NAT 公网地址（探测 + 手动补充）；Socks5 来源白名单排在嗅探和 DNS 劫持之前。
 # - 防火墙: 放行失败回滚、没有防火墙不提示、nftables 默认拒绝给出手动命令；证书导入原子化；订阅完整性检查覆盖全部类型。
-ATR_VERSION="v1.3.0"
-# v1.3.0：独立 REALITY 能力检测，实际捕获 KeyShare、受控协商及认证后转发。
+ATR_VERSION="v1.3.1"
+# v1.3.1：HY2 自适应带宽、标准多端口链接、跳跃规则事务、混淆与 HTTP/3 伪装。
 # v1.2.9：补齐 ACME / 卸载防火墙提示；状态显示 Reality 与订阅配置。
 # v1.2.8：按节点所属核心自检；Reality 支持共享/按协议独立配置。
 # v1.2.7：证书导入增加持久撤销日志与开机预恢复；防火墙撤销按后端/地址族记录，
@@ -1079,6 +1079,21 @@ def netof($id): if (udp_ids | index($id)) != null then "udp" else "tcp" end;
     ($ports[] | select((.port | type) != "number" or .port < 1 or .port > 65535) | "端口不合法: \(.who)=\(.port)"),
     # 端口冲突（同协议类型下端口不得重复）
     ($ports | group_by([.net, .port])[] | select(length > 1) | "端口冲突: \(map(.who) | join(", ")) 同时使用 \(.[0].net)/\(.[0].port)"),
+    # HY2 bandwidth / obfs / masquerade
+    ($P.hysteria2 // {} | . as $h
+      | (if (["auto","fixed"]|index($h.bandwidth_mode // "auto"))==null then "HY2 带宽模式不合法" else empty end),
+        ([.up_mbps,.down_mbps][] | select(.!=null) | select(type!="number" or .<1 or .>1000000 or floor!=.) | "HY2 固定带宽需为 1-1000000 的整数"),
+        (if (.obfs // null)!=null and ((.obfs.type!="salamander") or (.obfs.password|type)!="string" or (.obfs.password|length)<8 or (.obfs.password|length)>256 or (.obfs.password|test("[[:cntrl:]]"))) then "HY2 混淆参数不合法" else empty end),
+        (if (["off","redirect","proxy"]|index($h.masquerade.mode // "off"))==null then "HY2 伪装模式不合法" else empty end)),
+    # 跳跃范围必须互不重叠，不能覆盖任何 UDP 主端口（包括自身）
+    ($P|to_entries[]|select((.value.hop // "")!="")|. as $x
+      | if (["tuic","hysteria2"]|index($x.key))==null or (.value.hop|type)!="string" or (.value.hop|test("^[0-9]{5}-[0-9]{5}$")|not)
+        then "跳跃范围格式不合法"
+        else (.value.hop|split("-")|map(tonumber)) as $r
+          | (if $r[0]<30000 or $r[1]>40000 or $r[0]>=$r[1] then "跳跃范围应为 30000-40000 且起点小于终点" else empty end),
+            ($ports[]|select(.net=="udp" and .port>=$r[0] and .port<=$r[1])|"跳跃范围覆盖 UDP 主端口"),
+            ($P|to_entries[]|select(.key!=$x.key and (.value.hop // "")!="")|(.value.hop|split("-")|map(tonumber?)) as $q
+             |select(($q|length)==2 and $q[0]<=$r[1] and $q[1]>=$r[0])|"跳跃范围相互重叠") end),
     # 至少一个用户
     (if ($P | length) > 0 and ($U | length) == 0 then "没有用户" else empty end),
     # 用户名唯一
@@ -1138,6 +1153,13 @@ validateState() { # stdin: 候选状态 JSON
         elif [[ -n "${d}" && ( ! -s "${TLS_DIR}/${d}.crt" || ! -s "${TLS_DIR}/${d}.key" ) ]]; then
             echo "证书文件不存在: ${TLS_DIR}/${d}.crt|.key"
         fi
+    fi
+    local hy2 mode url
+    hy2=$(jq -c '.protocols.hysteria2 // {}' <<<"${st}")
+    mode=$(jq -r '.masquerade.mode // "off"' <<<"${hy2}")
+    if [[ "${mode}" == redirect || "${mode}" == proxy ]]; then
+        url=$(jq -r '.masquerade.url // ""' <<<"${hy2}")
+        hy2URLValid "${url}" || echo "HY2 伪装目标 URL 不合法"
     fi
     return 0
 }
@@ -2563,7 +2585,12 @@ read -r -d '' JQ_SINGBOX <<'EOF'
     elif $id == "anytls_reality" then {type: "anytls", tag: "anytls-reality", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsReality($id)}
     elif $id == "tuic" then {type: "tuic", tag: "tuic", listen: $listen, listen_port: $c.port, users: users($id), congestion_control: ($c.congestion // "bbr"), tls: (tlsCert + {alpn: ["h3"]})}
     elif $id == "hysteria2" then {type: "hysteria2", tag: "hysteria2", listen: $listen, listen_port: $c.port, users: users($id),
-        up_mbps: ($c.down_mbps // 100), down_mbps: ($c.up_mbps // 50), tls: (tlsCert + {alpn: ["h3"]})}
+        tls: (tlsCert + {alpn: ["h3"]})}
+        + (if ($c.bandwidth_mode // (if ($c.up_mbps // 0)>0 or ($c.down_mbps // 0)>0 then "fixed" else "auto" end)) == "fixed"
+           then {up_mbps: ($c.down_mbps // 100), down_mbps: ($c.up_mbps // 50)} else {ignore_client_bandwidth:true} end)
+        + (if ($c.obfs.type // "") != "" then {obfs:$c.obfs} else {} end)
+        + (if ($c.masquerade.mode // "off") == "redirect" then {masquerade:{type:"string",status_code:302,headers:{Location:[$c.masquerade.url],"Content-Type":["text/plain; charset=utf-8"]},content:"Redirecting."}}
+           elif ($c.masquerade.mode // "off") == "proxy" then {masquerade:{type:"proxy",url:$c.masquerade.url,rewrite_host:true}} else {} end)
     elif $id == "naive" then {type: "naive", tag: "naive", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert}
     elif $id == "vless_vision_tls" then {type: "vless", tag: "vless-vision-tls", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert}
     elif $id == "vless_ws" then {type: "vless", tag: "vless-ws", listen: $listen, listen_port: $c.port, users: users($id), tls: tlsCert,
@@ -3588,6 +3615,7 @@ _txnFiles() {
     echo "${ATR_SYSTEMD_DIR}/${XRAY_UNIT}.service"
     echo "${ATR_SYSTEMD_DIR}/${NGX_UNIT}.service"
     echo "${ATR_SYSTEMD_DIR}/${TLS_RECOVERY_UNIT}.service"
+    echo "${ATR_SYSTEMD_DIR}/atr-hop.service"
     echo "${NGX_CONF}"
     local f
     for f in "${NGX_CONFD}"/atr_*.conf; do [[ -e "${f}" ]] && echo "${f}"; done
@@ -4558,7 +4586,8 @@ read -r -d '' JQ_NODES <<'EOF'
      uuid: $u.uuid, password: $u.password, server: $server, port: portof($id; $c),
      sni: "", host: "", path: "", pbk: ($RE.public_key // ""), sid: ($RE.short_id // ""),
      pqv: (if $c.core == "xray" then ($RE.mldsa_verify // "") else "" end), cc: ($c.congestion // "bbr"),
-     up: ($c.up_mbps // 50), down: ($c.down_mbps // 100), hop: ($c.hop // "")};
+     bandwidth_mode: ($c.bandwidth_mode // (if ($c.up_mbps // 0)>0 or ($c.down_mbps // 0)>0 then "fixed" else "auto" end)),
+     up: ($c.up_mbps // 50), down: ($c.down_mbps // 100), hop: ($c.hop // ""), obfs: ($c.obfs // {})};
   def withReality: . + {sni: (realityOf(.proto) | .sni // "")};
   def withTLS: . + {sni: $D, host: $D};
   def nodeOf($u; $id; $c; $server; $suffix):
@@ -4591,7 +4620,7 @@ read -r -d '' JQ_NODES <<'EOF'
     elif $n.proto == "trojan" then
       "trojan://\($n.password|e)@\(hostp($n.server)):\($n.port)?" + q([["security","tls"],["peer",($n.sni|e)],["sni",($n.sni|e)],["fp","chrome"],["alpn","http%2F1.1"],["type","tcp"]]) + "#" + ($n.name|e)
     elif $n.proto == "hysteria2" then
-      "hysteria2://\($n.password|e)@\(hostp($n.server)):\($n.port)?" + q((if $n.hop != "" then [["mport",$n.hop]] else [] end) + [["peer",($n.sni|e)],["insecure","0"],["sni",($n.sni|e)],["alpn","h3"]]) + "#" + ($n.name|e)
+      "hysteria2://\($n.password|e)@\(hostp($n.server)):\($n.port)\(if $n.hop!="" then ","+$n.hop else "" end)/?" + q([["sni",($n.sni|e)],["insecure","0"]] + (if ($n.obfs.type // "")!="" then [["obfs",$n.obfs.type],["obfs-password",($n.obfs.password|e)]] else [] end)) + "#" + ($n.name|e)
     elif $n.proto == "tuic" then
       "tuic://\($n.uuid):\($n.password|e)@\(hostp($n.server)):\($n.port)?" + q([["congestion_control",$n.cc],["alpn","h3"],["sni",($n.sni|e)],["udp_relay_mode","quic"],["allow_insecure","0"]]) + "#" + ($n.name|e)
     elif $n.proto == "naive" then
@@ -4624,8 +4653,10 @@ read -r -d '' JQ_NODES <<'EOF'
       elif $n.proto == "trojan" then
         $b + {type: "trojan", password: $n.password, tls: (tlsSB($n) + {alpn: ["http/1.1"], utls: utls})}
       elif $n.proto == "hysteria2" then
-        $b + {type: "hysteria2", password: $n.password, up_mbps: $n.up, down_mbps: $n.down, tls: (tlsSB($n) + {alpn: ["h3"]})}
-        + (if $n.hop != "" then {server_ports: [($n.hop | split("-") | join(":"))]} else {} end)
+        ($b | if $n.hop!="" then del(.server_port)+{server_ports:[(($n.port|tostring)+":"+($n.port|tostring)),($n.hop|split("-")|join(":"))]} else . end)
+        + {type:"hysteria2",password:$n.password,tls:(tlsSB($n)+{alpn:["h3"]})}
+        + (if $n.bandwidth_mode=="fixed" then {up_mbps:$n.up,down_mbps:$n.down} else {} end)
+        + (if ($n.obfs.type // "")!="" then {obfs:$n.obfs} else {} end)
       elif $n.proto == "tuic" then
         $b + {type: "tuic", uuid: $n.uuid, password: $n.password, congestion_control: $n.cc, tls: (tlsSB($n) + {alpn: ["h3"]})}
       elif $n.proto == "anytls_tls" then
@@ -4659,8 +4690,10 @@ read -r -d '' JQ_NODES <<'EOF'
       elif $n.proto == "trojan" then
         $b + {type: "trojan", password: $n.password, "client-fingerprint": "chrome", udp: true, sni: $n.sni, alpn: ["http/1.1"]}
       elif $n.proto == "hysteria2" then
-        ($b | if $n.hop != "" then del(.port) + {ports: $n.hop} else . end)
-        + {type: "hysteria2", password: $n.password, alpn: ["h3"], sni: $n.sni, up: "\($n.up) Mbps", down: "\($n.down) Mbps"}
+        ($b | if $n.hop!="" then .+{ports:(( $n.port|tostring)+","+$n.hop)} else . end)
+        + {type:"hysteria2",password:$n.password,alpn:["h3"],sni:$n.sni}
+        + (if $n.bandwidth_mode=="fixed" then {up:"\($n.up) Mbps",down:"\($n.down) Mbps"} else {} end)
+        + (if ($n.obfs.type // "")!="" then {obfs:$n.obfs.type,"obfs-password":$n.obfs.password} else {} end)
       elif $n.proto == "tuic" then
         $b + {type: "tuic", uuid: $n.uuid, password: $n.password, alpn: ["h3"], "congestion-controller": $n.cc, "udp-relay-mode": "native", sni: $n.sni}
       elif $n.proto == "anytls_tls" then
@@ -4678,7 +4711,7 @@ read -r -d '' JQ_NODES <<'EOF'
     elif $n.proto == "vmess_httpupgrade" then "协议类型:VMess HTTPUpgrade TLS，地址:\($n.server)，端口:\($n.port)，用户ID:\($n.uuid)，伪装域名/SNI:\($n.sni)，路径:\($n.path)"
     elif $n.proto == "vless_xhttp_tls" then "协议类型:VLESS XHTTP TLS，地址:\($n.server)，端口:\($n.port)，用户ID:\($n.uuid)，SNI:\($n.sni)，路径:\($n.path)，模式:auto"
     elif $n.proto == "trojan" then "协议类型:Trojan TLS，地址:\($n.server)，端口:\($n.port)，密码:\($n.password)，SNI:\($n.sni)，alpn:http/1.1"
-    elif $n.proto == "hysteria2" then "协议类型:Hysteria2，地址:\($n.server)，端口:\($n.port)\(if $n.hop != "" then "(端口跳跃 \($n.hop))" else "" end)，密码:\($n.password)，SNI:\($n.sni)，alpn:h3，上行:\($n.up)Mbps，下行:\($n.down)Mbps"
+    elif $n.proto == "hysteria2" then "协议类型:Hysteria2，地址:\($n.server)，端口:\($n.port)\(if $n.hop != "" then "(端口跳跃 \($n.hop))" else "" end)，密码:\($n.password)，SNI:\($n.sni)，alpn:h3，带宽:\(if $n.bandwidth_mode=="auto" then "BBR 自适应" else "上行 \($n.up) / 下行 \($n.down) Mbps" end)，混淆:\($n.obfs.type // "关闭")"
     elif $n.proto == "tuic" then "协议类型:Tuic，地址:\($n.server)，端口:\($n.port)，uuid:\($n.uuid)，password:\($n.password)，congestion-controller:\($n.cc)，alpn:h3，SNI:\($n.sni)"
     elif $n.proto == "naive" then "协议类型:Naive，地址:\($n.server)，端口:\($n.port)，用户名:\($n.user)，密码:\($n.password)"
     elif $n.proto == "anytls_tls" then "协议类型:AnyTLS TLS，地址:\($n.server)，端口:\($n.port)，密码:\($n.password)，SNI:\($n.sni)"
@@ -4691,7 +4724,7 @@ read -r -d '' JQ_NODES <<'EOF'
     | ( [nodeOf($u; $id; $c; (if isReality($id) then $ip else $D end); "")]
         + (if cdnCapable($id) and ($D != "") then [ range(0; $cdns | length) as $i | nodeOf($u; $id; $c; $cdns[$i]; "_cdn\($i + 1)") ] else [] end) )[]
     | . as $n
-    | $n + {uri: uri($n), singbox: singbox($n), mihomo: mihomo($n), naive: naiveClient($n), plain: plain($n)}
+    | $n + {uri: uri($n), uri_single: (if $n.proto=="hysteria2" and $n.hop!="" then uri($n+{hop:""}) else null end), singbox: singbox($n), mihomo: mihomo($n), naive: naiveClient($n), plain: plain($n)}
   ]
 EOF
 
@@ -4987,12 +5020,15 @@ _generateClientFilesLocked() { # _generateClientFilesLocked [用户名]
             problems+=("${u}: 无法创建目录")
             continue
         fi
-        rm -f "${dir}"/links.txt "${dir}"/sing-box*.json "${dir}"/mihomo*.yaml "${dir}"/naive-client.json
+        rm -f "${dir}"/links.txt "${dir}"/hy2-single-port.txt "${dir}"/sing-box*.json "${dir}"/mihomo*.yaml "${dir}"/naive-client.json
         views=$(nodeViews "${u}") || {
             problems+=("${u}: 无法生成节点信息")
             continue
         }
         jq -r '.[]|select(.uri!=null)|.uri' <<<"${views}" >"${dir}/links.txt" || problems+=("${u}: links.txt 写入失败")
+        if [[ "$(jq '[.[]|select(.uri_single!=null)]|length' <<<"${views}")" != 0 ]]; then
+            jq -r '.[]|select(.uri_single!=null)|.uri_single' <<<"${views}" >"${dir}/hy2-single-port.txt" || problems+=("${u}: 单端口备用链接生成失败")
+        fi
         sbouts=$(jq -c '[.[]|select(.singbox!=null)|.singbox]' <<<"${views}")
         mhprox=$(jq -c '[.[]|select(.mihomo!=null)|.mihomo]' <<<"${views}")
         if [[ "$(jq 'length' <<<"${sbouts}")" != "0" ]]; then
@@ -5531,6 +5567,9 @@ selfCheckProtocol() { # 0 通过；1 失败；2 无法自动验证
     *) echoContent red "  ✗ ${title}: 自检失败（节点配置生成异常）"; return 1 ;;
     esac
     node=$(nodeViews "${user}" | jq -ce --arg p "${id}" '[.[]|select(.proto==$p and (.name|test("_cdn[0-9]+$")|not))][0]') || return 1
+    if [[ "${id}" == hysteria2 ]]; then
+        echoContent yellow "      覆盖范围: 本机认证与转发；绕过 DNS、证书校验和跳跃范围，不证明公网 UDP 可达。"
+    fi
     cp=$(randomFreePort) || return 1
     cfg="${ATR_TMP}/selfcheck.${id}.json"; log="${ATR_TMP}/selfcheck.${id}.log"
     if [[ "${core}" == xray ]]; then
@@ -5539,8 +5578,8 @@ selfCheckProtocol() { # 0 通过；1 失败；2 无法自动验证
         "${bin}" run -test -c "${cfg}" >"${log}" 2>&1 || { echoContent red "  ✗ ${title}: Xray 自检配置校验失败"; return 1; }
     else
         bin=${SB_BIN}
-        jq -n --argjson n "$(jq -c '.singbox' <<<"${node}")" --argjson cp "${cp}" '
-          ($n | .server="127.0.0.1" | del(.server_ports) | if .tls.reality==null then .tls.insecure=true else . end) as $o
+        jq -n --argjson n "$(jq -c '.singbox' <<<"${node}")" --argjson cp "${cp}" --argjson sp "$(jq .port <<<"${node}")" '
+          ($n | .server="127.0.0.1" | .server_port=$sp | del(.server_ports) | if .tls.reality==null then .tls.insecure=true else . end) as $o
           | {log:{level:"warn"},inbounds:[{type:"mixed",listen:"127.0.0.1",listen_port:$cp}],outbounds:[$o],route:{final:$o.tag}}' >"${cfg}" || return 1
         "${bin}" check -c "${cfg}" >"${log}" 2>&1 || { echoContent red "  ✗ ${title}: sing-box 自检配置校验失败"; return 1; }
     fi
@@ -5585,6 +5624,7 @@ selfCheckAll() { # 返回 1 = 至少一个协议握手失败；无法自动验�
     done < <(installedProtocols)
     echoContent yellow " ---> 自检结果: 通过 ${pass}，失败 ${fail}，未自动验证 ${skip}"
     ((skip == 0)) || echoContent yellow "      未自动验证的协议只确认了服务启动与端口监听，请用对应客户端确认"
+    echoContent yellow "      回环通过不等于部署验收；DNS、可信证书、公网入口及跳跃范围仍需外部客户端验证。"
     ((fail == 0))
 }
 
@@ -5994,10 +6034,115 @@ askPort() {
     printf -v "${__v}" '%s' "${p}"
 }
 
+# ----------------------------- HY2 参数 --------------------------------------
+configureHY2Bandwidth() { # 只编辑候选状态，调用方负责事务
+    local c current down up
+    current=$(stagedGet '.protocols.hysteria2 | .bandwidth_mode // (if (.up_mbps // 0)>0 or (.down_mbps // 0)>0 then "fixed" else "auto" end)')
+    echoContent yellow "1.BBR 自适应（新安装默认；不填写固定带宽）  2.固定带宽（客户端视角 Mbps）"
+    ask c "带宽模式 [当前 ${current}，回车保留]:" "${current}" || return 1
+    case "${c}" in
+    1|auto|0) stagedEdit '.protocols.hysteria2 |= (. + {bandwidth_mode:"auto"} | del(.up_mbps,.down_mbps))' ;;
+    2|fixed)
+        while :; do
+            ask down "客户端下载 Mbps（0 切换自适应）:" "$(stagedGet '.protocols.hysteria2.down_mbps // 100')" || return 1
+            [[ "${down}" == 0 ]] && { stagedEdit '.protocols.hysteria2 |= (. + {bandwidth_mode:"auto"} | del(.up_mbps,.down_mbps))'; return $?; }
+            [[ "${down}" =~ ^[1-9][0-9]{0,6}$ ]] && ((down <= 1000000)) && break
+            echoContent red " ---> 请输入 1-1000000 的整数，或 0 选择自适应"
+        done
+        while :; do
+            ask up "客户端上传 Mbps（0 切换自适应）:" "$(stagedGet '.protocols.hysteria2.up_mbps // 50')" || return 1
+            [[ "${up}" == 0 ]] && { stagedEdit '.protocols.hysteria2 |= (. + {bandwidth_mode:"auto"} | del(.up_mbps,.down_mbps))'; return $?; }
+            [[ "${up}" =~ ^[1-9][0-9]{0,6}$ ]] && ((up <= 1000000)) && break
+            echoContent red " ---> 请输入 1-1000000 的整数，或 0 选择自适应"
+        done
+        stagedEdit --argjson u "${up}" --argjson d "${down}" '.protocols.hysteria2 += {bandwidth_mode:"fixed",up_mbps:$u,down_mbps:$d}'
+        ;;
+    *) echoContent red " ---> 带宽模式不合法"; return 1 ;;
+    esac
+}
+
+configureHY2Obfs() {
+    local c secret
+    echoContent yellow "1.关闭（默认）  2.Salamander 混淆"
+    echoContent yellow "混淆密码由全部 HY2 用户共用；修改后需要更新客户端。混淆开启时普通 HTTP/3 浏览器无法显示伪装页面。"
+    ask c "请选择:" || return 1
+    case "${c}" in
+    1) stagedEdit 'del(.protocols.hysteria2.obfs)' ;;
+    2)
+        # 不回显密码；通过已有 jq 包装器从文件传递秘密，避免出现在进程参数中。
+        IFS= read -r -s -p "混淆密码（回车生成随机密码）:" secret || return 1
+        echo
+        [[ -n "${secret}" ]] || secret=$(openssl rand -hex 24) || return 1
+        if ! jq -ne --arg p "${secret}" '$p|length>=8 and length<=256 and (test("[[:cntrl:]]")|not)' >/dev/null; then
+            echoContent red " ---> 混淆密码需 8-256 字符且不含控制字符"; return 1
+        fi
+        stagedEdit --arg p "${secret}" '.protocols.hysteria2.obfs={type:"salamander",password:$p}'
+        ;;
+    *) return 1 ;;
+    esac
+}
+
+configureHY2Masquerade() {
+    local c mode url
+    echoContent yellow "1.关闭（默认 404）  2.302 跳转  3.反向代理展示目标站"
+    echoContent yellow "仅响应未认证 HTTP/3 请求，不会另开 TCP 网站。302 使浏览器离开 VPS；反代由 VPS 访问目标，资源和登录页面未必完整可用。"
+    echoContent yellow "开启 obfs 后，普通 HTTP/3 浏览器无法解码，通常看不到伪装页面。"
+    ask c "请选择:" || return 1
+    case "${c}" in
+    1) stagedEdit 'del(.protocols.hysteria2.masquerade)'; return $? ;;
+    2) mode=redirect ;;
+    3) mode=proxy ;;
+    *) return 1 ;;
+    esac
+    ask url "目标网址（http:// 或 https://）:" || return 1
+    hy2URLValid "${url}" || { echoContent red " ---> 网址不合法（需要主机名或 IP，不允许用户名密码、空格、控制字符）"; return 1; }
+    stagedEdit --arg m "${mode}" --arg u "${url}" '.protocols.hysteria2.masquerade={mode:$m,url:$u}'
+}
+
+hy2URLValid() {
+    jq -ne --arg u "$1" '$u | test("^https?://(\\[[0-9A-Fa-f:]+\\]|[A-Za-z0-9][A-Za-z0-9.-]*)(:[0-9]{1,5})?([/?#][^[:space:][:cntrl:]\\\\]*)?$") and (test("[[:space:][:cntrl:]]")|not)' >/dev/null 2>&1
+}
+
+manageHY2Option() {
+    stagedBegin || return 1
+    case "$1" in
+    bandwidth) configureHY2Bandwidth ;;
+    obfs) configureHY2Obfs ;;
+    masquerade) configureHY2Masquerade ;;
+    esac || { stagedDiscard; return 1; }
+    if applyStaged "修改 HY2 $1"; then postChangeShow "" "HY2 参数已修改"; else stagedDiscard; return 1; fi
+}
+
+# 使用导出节点的 DNS、证书验证和端口范围；从服务端发起仍不能证明外部 UDP 可达。
+selfCheckHY2Endpoint() {
+    stateExists && protoInstalled hysteria2 || return 1
+    local user node cp cfg log pid code rc=1
+    user=$(userNames | head -n 1)
+    node=$(nodeViews "${user}" | jq -ce '[.[]|select(.proto=="hysteria2")][0]') || return 1
+    cp=$(randomFreePort) || return 1
+    cfg="${ATR_TMP}/hy2-endpoint.json"; log="${ATR_TMP}/hy2-endpoint.log"
+    echoContent yellow " ---> 导出配置实连：保留域名解析、证书验证及跳跃范围；本机发起，只采样部分端口，不能证明外部客户端可达。"
+    jq -n --argjson o "$(jq .singbox <<<"${node}")" --argjson cp "${cp}" \
+       '{log:{level:"warn"},inbounds:[{type:"mixed",listen:"127.0.0.1",listen_port:$cp}],outbounds:[$o],route:{final:$o.tag}}' >"${cfg}" || return 1
+    "${SB_BIN}" check -c "${cfg}" >"${log}" 2>&1 || { echoContent red " ---> 导出实连配置未通过核心校验"; return 1; }
+    "${SB_BIN}" run -c "${cfg}" >>"${log}" 2>&1 & pid=$!
+    sleep 2
+    code=$(curl -sS -m 20 -x "socks5h://127.0.0.1:${cp}" -o /dev/null -w '%{http_code}' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    kill "${pid}" 2>/dev/null; wait "${pid}" 2>/dev/null
+    if [[ "${code}" == 200 ]]; then
+        echoContent green " ---> 导出配置实连采样通过（HTTP ${code}）；公网外部入口与全部跳跃端口：未验证。"; rc=0
+    else
+        echoContent red " ---> 导出配置实连未通过（HTTP ${code}），请检查 DNS、证书链及 UDP/跳跃规则。"
+        echoContent yellow "      本机回连失败也可能来自 NAT 回流限制；请再从外部客户端测试。"
+    fi
+    return "${rc}"
+}
+
+
 # ----------------------------- 单个协议的参数 ---------------------------------
 # configureProtocol <core> <id>  —— 询问端口/参数并写入候选状态
 configureProtocol() {
-    local core=$1 id=$2 name port c up down cc
+    local core=$1 id=$2 name port c cc
     name=$(protoName "${id}")
     echoContent yellow "\n===================== 配置 ${name} ====================="
     case "${id}" in
@@ -6024,17 +6169,8 @@ configureProtocol() {
         ;;
     hysteria2)
         askPort port "${id}" "${name} (UDP) " udp || return 1
-        echoContent yellow "请输入本地带宽峰值的下行速度（默认 100，单位 Mbps）"
-        ask down "下行速度:" || return 1
-        isInt "${down}" && ((down > 0)) || down=100
-        echoContent yellow "请输入本地带宽峰值的上行速度（默认 50，单位 Mbps）"
-        ask up "上行速度:" || return 1
-        isInt "${up}" && ((up > 0)) || up=50
-        # 保留已设置的端口跳跃
-        local hop=""
-        hop=$(S '.protocols.hysteria2.hop // ""')
-        stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" --argjson d "${down}" --argjson u "${up}" --arg hop "${hop}" \
-            '.protocols[$id]={core:$c,port:$p,down_mbps:$d,up_mbps:$u,hop:$hop}'
+        stagedEdit --arg id "${id}" --arg c "${core}" --argjson p "${port}" '.protocols[$id]=((.protocols[$id] // {})+{core:$c,port:$p})' || return 1
+        configureHY2Bandwidth
         ;;
     *)
         local net=tcp
@@ -6631,7 +6767,7 @@ def fetch_reference(tmp):
     # Direct verified HTTPS; no download proxies or unverified override.
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
     def get(url,limit):
-        req=urllib.request.Request(url,headers={'User-Agent':'AnyTLS-Reality-capability-probe/1.3.0','Accept':'application/vnd.github+json'})
+        req=urllib.request.Request(url,headers={'User-Agent':'AnyTLS-Reality-capability-probe/1.3.1','Accept':'application/vnd.github+json'})
         deadline=time.monotonic()+60; data=bytearray()
         with opener.open(req,timeout=15) as r:
             while True:
@@ -6823,7 +6959,7 @@ def main(argv=None):
                 protected.extend([str(binary),str(binary.parent/'conf/config.json'),str(binary.parent.parent/'state.json'),str(binary.parent.parent/'anytls-reality.sh')])
         dest=pathlib.Path(a.output).resolve()
         if any(p and dest==pathlib.Path(p).resolve() for p in protected): ap.error('报告路径不能覆盖状态文件、核心、核心配置或管理脚本')
-    r={'schema':1,'script_version':os.environ.get('ATR_PROBE_VERSION','1.3.0'),'time_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    r={'schema':1,'script_version':os.environ.get('ATR_PROBE_VERSION','1.3.1'),'time_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
        'sing_box':metadata(sb),'reference':{'available':False},'client_tests':[],
        'server':{'status':'unknown','reason':'未执行'},
        'authentication':{'status':'not_verified','conclusion':'本探针未验证 ML-DSA 等额外抗量子身份认证；混合密钥交换不等于完整抗量子认证'},
@@ -6960,57 +7096,232 @@ manageReality() {
 # ----------------------------- 端口跳跃 (Hysteria2 / Tuic) --------------------
 HOP_UNIT="atr-hop"
 
-hopSupported() { command -v iptables >/dev/null 2>&1 || { command -v firewall-cmd >/dev/null 2>&1 && [[ "$(firewall-cmd --state 2>/dev/null)" == "running" ]]; }; }
+hopSupported() { command -v iptables >/dev/null 2>&1 || { command -v firewall-cmd >/dev/null 2>&1 && [[ "$(firewall-cmd --state 2>/dev/null)" == running ]]; }; }
 
-# 删除本脚本创建的全部跳跃规则
-hopRulesRemoveAll() {
-    local ipt r
+# 记录采用固定字段，绝不 eval 防火墙输出。firewalld 分别管理运行时和永久配置，不全局 reload。
+_hopExists() { # 0=存在；1=不存在；2=查询失败
+    local kind=$1 part=$2 range=$3 port=${4:-} rc
+    case "${kind}" in
+    iptables|ip6tables)
+        "${kind}" -w 5 -t nat -C PREROUTING -p udp --dport "${range/-/:}" -m comment --comment "atr_hop_${part}" -j REDIRECT --to-ports "${port}" >/dev/null 2>&1; rc=$?
+        ;;
+    firewalld|firewalld6)
+        local -a opts=()
+        [[ "${part%%@*}" == permanent ]] && opts+=(--permanent)
+        [[ "${part}" != *@* ]] || opts+=("--zone=${part#*@}")
+        local query=--query-forward-port
+        if [[ "${kind}" == firewalld6 ]]; then
+            local r=${range#port=} p=${range##*:toport=}
+            r=${r%%:proto=*}
+            range="rule family=\"ipv6\" forward-port port=\"${r}\" protocol=\"udp\" to-port=\"${p}\""
+            query=--query-rich-rule
+        fi
+        firewall-cmd "${opts[@]}" "${query}=${range}" >/dev/null 2>&1; rc=$?
+        ;;
+    *) return 2 ;;
+    esac
+    case "${rc}" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+
+_hopChange() { # add|del kind part range [port]，调用前已记录逆操作
+    local action=$1 kind=$2 part=$3 range=$4 port=${5:-} rc flag
+    _hopExists "${kind}" "${part}" "${range}" "${port}"; rc=$?
+    ((rc<2)) || return 1
+    if [[ "${action}" == add && ${rc} == 0 || "${action}" == del && ${rc} == 1 ]]; then return 0; fi
+    case "${kind}" in
+    iptables|ip6tables)
+        flag=-A; [[ "${action}" == del ]] && flag=-D
+        "${kind}" -w 5 -t nat "${flag}" PREROUTING -p udp --dport "${range/-/:}" -m comment --comment "atr_hop_${part}" -j REDIRECT --to-ports "${port}" >/dev/null 2>&1 || return 1
+        ;;
+    firewalld|firewalld6)
+        local -a opts=()
+        [[ "${part%%@*}" == permanent ]] && opts+=(--permanent)
+        [[ "${part}" != *@* ]] || opts+=("--zone=${part#*@}")
+        local value=${range}
+        flag=--add-forward-port; [[ "${action}" == del ]] && flag=--remove-forward-port
+        if [[ "${kind}" == firewalld6 ]]; then
+            local r=${range#port=} p=${range##*:toport=}
+            r=${r%%:proto=*}
+            value="rule family=\"ipv6\" forward-port port=\"${r}\" protocol=\"udp\" to-port=\"${p}\""
+            flag=--add-rich-rule; [[ "${action}" == del ]] && flag=--remove-rich-rule
+        fi
+        firewall-cmd "${opts[@]}" "${flag}=${value}" >/dev/null 2>&1 || return 1
+        ;;
+    *) return 1 ;;
+    esac
+    _hopExists "${kind}" "${part}" "${range}" "${port}"; rc=$?
+    if [[ "${action}" == add ]]; then ((rc==0)); else ((rc==1)); fi
+}
+
+_hopSnapshot() { # stdout: 本脚本拥有的实际规则
+    local ipt out line part range port scope spec rc kind zone
+    local -a fields
     for ipt in iptables ip6tables; do
         command -v "${ipt}" >/dev/null 2>&1 || continue
-        "${ipt}" -t nat -S PREROUTING 2>/dev/null | grep -- 'atr_hop_' | sed 's/^-A /-D /' | while read -r r; do
-            # shellcheck disable=SC2086
-            "${ipt}" -t nat ${r} 2>/dev/null
-        done
+        out=$("${ipt}" -w 5 -t nat -S PREROUTING 2>/dev/null) || return 1
+        while IFS= read -r line; do
+            [[ "${line}" == *atr_hop_* ]] || continue
+            # 只接受脚本的规范规则；未知带标签规则不冒险删除。
+            line=${line//\"/}
+            read -r -a fields <<<"${line}"
+            [[ ${#fields[@]} == 16 && ${fields[0]} == -A && ${fields[1]} == PREROUTING && ${fields[2]} == -p && ${fields[3]} == udp && ${fields[4]} == -m && ${fields[5]} == udp && ${fields[6]} == --dport && ${fields[8]} == -m && ${fields[9]} == comment && ${fields[10]} == --comment && ${fields[12]} == -j && ${fields[13]} == REDIRECT && ${fields[14]} == --to-ports ]] || {
+                echoContent red " ---> 无法识别已有跳跃规则: ${ipt}" >&2; return 1;
+            }
+            part=${fields[11]#atr_hop_}; range=${fields[7]/:/-}; port=${fields[15]}
+            [[ "${part}" == tuic || "${part}" == hysteria2 ]] && [[ "${range}" =~ ^[0-9]+-[0-9]+$ && "${port}" =~ ^[0-9]+$ ]] || return 1
+            printf '%s %s %s %s\n' "${ipt}" "${part}" "${range}" "${port}"
+        done <<<"${out}"
     done
-    if [[ -s "${ATR_HOME}/hop_firewalld.list" ]] && command -v firewall-cmd >/dev/null 2>&1; then
-        while read -r r; do
-            firewall-cmd --permanent --remove-forward-port="${r}" >/dev/null 2>&1
+    if [[ -s "${ATR_HOME}/hop_firewalld.list" ]]; then
+        command -v firewall-cmd >/dev/null 2>&1 || return 1
+        while read -r scope spec; do
+            [[ -n "${scope}" ]] || continue
+            if [[ "${scope}" == port=* ]]; then spec=${scope}; scope=legacy; fi
+            kind=firewalld
+            if [[ "${scope}" == ipv6-* ]]; then kind=firewalld6; scope=${scope#ipv6-}; fi
+            [[ "${scope}" =~ ^(runtime|permanent)(@[A-Za-z0-9_-]+)?$ || "${scope}" == legacy ]] || return 1
+            [[ "${spec}" =~ ^port=[0-9]+-[0-9]+:proto=udp:toport=[0-9]+$ ]] || return 1
+            for part in runtime permanent; do
+                [[ "${scope}" == legacy || "${scope%%@*}" == "${part}" ]] || continue
+                if [[ "${scope}" == *@* ]]; then zone=${scope#*@}; else zone=$(firewall-cmd --get-default-zone 2>/dev/null) || return 1; fi
+                [[ "${zone}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+                _hopExists "${kind}" "${part}@${zone}" "${spec}"; rc=$?
+                ((rc<2)) || return 1
+                ((rc!=0)) || printf '%s %s@%s %s\n' "${kind}" "${part}" "${zone}" "${spec}"
+            done
         done <"${ATR_HOME}/hop_firewalld.list"
-        firewall-cmd --reload >/dev/null 2>&1
-        : >"${ATR_HOME}/hop_firewalld.list"
     fi
 }
 
-# hopRuleAdd <协议id> <a-b> <目标端口>
-hopRuleAdd() {
-    local id=$1 range=${2/-/:} port=$3 ipt spec
-    if command -v firewall-cmd >/dev/null 2>&1 && [[ "$(firewall-cmd --state 2>/dev/null)" == "running" ]]; then
-        spec="port=${2}:proto=udp:toport=${port}"
-        firewall-cmd --permanent --add-masquerade >/dev/null 2>&1
-        firewall-cmd --permanent --add-forward-port="${spec}" >/dev/null 2>&1 && echo "${spec}" >>"${ATR_HOME}/hop_firewalld.list"
-        firewall-cmd --reload >/dev/null 2>&1
-        return 0
+_hopRecover() {
+    local journal="${ATR_HOME}/hop.pending" action kind part range port rc=0
+    [[ -d "${journal}" ]] || return 0
+    [[ -f "${journal}/ready" ]] || { rm -f "${journal}/ledger" "${journal}/ops"; rmdir "${journal}"; return $?; }
+    while read -r action kind part range port; do
+        [[ -n "${kind}" ]] || continue
+        if [[ "${action}" == add ]]; then action=del; else action=add; fi
+        _hopChange "${action}" "${kind}" "${part}" "${range}" "${port}" || rc=1
+    done < <(tac "${journal}/ops")
+    if ((rc==0)); then
+        cp "${journal}/ledger" "${ATR_HOME}/hop_firewalld.list" || return 1
+        rm -f "${journal}/ready" "${journal}/ops" "${journal}/ledger"
+        rmdir "${journal}" || return 1
+    else
+        echoContent red " ---> 跳跃规则回滚未完成，已保留 ${journal}；排除防火墙故障后重试。" >&2
     fi
-    for ipt in iptables ip6tables; do
-        command -v "${ipt}" >/dev/null 2>&1 || continue
-        "${ipt}" -t nat -A PREROUTING -p udp --dport "${range}" -m comment --comment "atr_hop_${id}" -j REDIRECT --to-ports "${port}" 2>/dev/null
-    done
+    return "${rc}"
 }
 
-# 以 state 为准重建全部跳跃规则（幂等），并维护开机恢复单元
-reconcileHopRules() { # reconcileHopRules <state.json>
-    local st=$1 id range port any=0
-    hopRulesRemoveAll
+_hopDesired() {
+    local st=$1 id range port ipt backend=iptables zone
+    if command -v firewall-cmd >/dev/null 2>&1 && [[ "$(firewall-cmd --state 2>/dev/null)" == running ]]; then backend=firewalld; fi
+    local rows
+    rows=$(jq -er '.protocols // {} | to_entries | map(select((.value.hop // "")!="")) | .[]? | "\(.key) \(.value.hop) \(.value.port)"' "${st}"); local rc=$?
+    [[ ${rc} == 0 || ${rc} == 4 ]] || return 1
     while read -r id range port; do
-        [[ -z "${range}" ]] && continue
-        hopRuleAdd "${id}" "${range}" "${port}"
-        any=1
-    done < <(jq -r '.protocols|to_entries[]|select((.value.hop // "") != "")|"\(.key) \(.value.hop) \(.value.port)"' "${st}" 2>/dev/null)
-    if ((any)); then
-        _writeUnitFile "${HOP_UNIT}" <<EOF
+        [[ -n "${id}" ]] || continue
+        [[ "${id}" == hysteria2 || "${id}" == tuic ]] && [[ "${range}" =~ ^[0-9]{5}-[0-9]{5}$ ]] && isPort "${port}" || return 1
+        local a=${range%-*} b=${range#*-}
+        ((a>=30000 && b<=40000 && a<b)) || return 1
+        if [[ "${backend}" == firewalld ]]; then
+            zone=$(firewall-cmd --get-default-zone 2>/dev/null) || return 1
+            [[ "${zone}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+            local kind part
+            for kind in firewalld firewalld6; do
+                for part in runtime permanent; do
+                    printf '%s %s@%s port=%s:proto=udp:toport=%s\n' "${kind}" "${part}" "${zone}" "${range}" "${port}"
+                done
+            done
+        else
+            command -v iptables >/dev/null 2>&1 || return 1
+            for ipt in iptables ip6tables; do
+                command -v "${ipt}" >/dev/null 2>&1 && printf '%s %s %s %s\n' "${ipt}" "${id}" "${range}" "${port}"
+            done
+        fi
+    done <<<"${rows}"
+    return 0
+}
+
+_hopSync() { # 调用方持锁；每次写规则前先持久记录逆操作
+    local st=$1 journal="${ATR_HOME}/hop.pending" tmp action kind part range port rc line
+    _hopRecover || return 1
+    tmp=$(mktemp -d "${ATR_TMP}/hop.XXXXXX") || return 1
+    if ! _hopSnapshot >"${tmp}/old" || ! _hopDesired "${st}" >"${tmp}/desired"; then
+        rm -f "${tmp}/old" "${tmp}/desired"; rmdir "${tmp}"
+        echoContent red " ---> 跳跃规则查询或参数检查失败，未改动规则" >&2; return 1
+    fi
+    sort -u "${tmp}/old" -o "${tmp}/old" && sort -u "${tmp}/desired" -o "${tmp}/desired" || return 1
+    mkdir -m 700 "${journal}" || return 1
+    if [[ -f "${ATR_HOME}/hop_firewalld.list" ]]; then cp "${ATR_HOME}/hop_firewalld.list" "${journal}/ledger" || return 1; else : >"${journal}/ledger" || return 1; fi
+    if [[ ! -f "${journal}/ledger" ]] || ! : >"${journal}/ops" || ! touch "${journal}/ready" || ! sync -f "${journal}"; then return 1; fi
+    : >"${tmp}/ledger" || { _hopRecover; return 1; }
+    # 先添加新范围，成功后才删旧范围；从不接管管理员原有的相同 firewalld 规则。
+    rc=0
+    while read -r kind part range port; do
+        [[ -n "${kind}" ]] || continue
+        line="${kind} ${part} ${range}${port:+ ${port}}"
+        _hopExists "${kind}" "${part}" "${range}" "${port}"; action=$?
+        if ((action==2)); then rc=1; break; fi
+        if ((action==1)); then
+            printf 'add %s\n' "${line}" >>"${journal}/ops" && sync -f "${journal}/ops" && _hopChange add "${kind}" "${part}" "${range}" "${port}" || { rc=1; break; }
+            [[ "${kind}" != firewalld* ]] || printf '%s%s %s\n' "$( [[ "${kind}" == firewalld6 ]] && printf 'ipv6-' )" "${part}" "${range}" >>"${tmp}/ledger" || { rc=1; break; }
+        elif [[ "${kind}" == firewalld* ]] && grep -Fxq "${line}" "${tmp}/old"; then
+            printf '%s%s %s\n' "$( [[ "${kind}" == firewalld6 ]] && printf 'ipv6-' )" "${part}" "${range}" >>"${tmp}/ledger" || { rc=1; break; }
+        fi
+    done <"${tmp}/desired"
+    if ((rc==0)); then
+        while read -r kind part range port; do
+            [[ -n "${kind}" ]] || continue
+            line="${kind} ${part} ${range}${port:+ ${port}}"
+            printf 'del %s\n' "${line}" >>"${journal}/ops" && sync -f "${journal}/ops" && _hopChange del "${kind}" "${part}" "${range}" "${port}" || { rc=1; break; }
+        done < <(comm -23 "${tmp}/old" "${tmp}/desired")
+    fi
+    if ((rc==0)); then
+        chmod 600 "${tmp}/ledger" && mv -f "${tmp}/ledger" "${ATR_HOME}/hop_firewalld.list" && sync -f "${ATR_HOME}/hop_firewalld.list" || rc=1
+    fi
+    if ((rc)); then
+        echoContent red " ---> 跳跃规则应用失败，正在撤销本次变更；配置不会报告成功。" >&2
+        _hopRecover || true
+    else
+        rm -f "${journal}/ready" "${journal}/ops" "${journal}/ledger"; rmdir "${journal}" || rc=1
+    fi
+    rm -f "${tmp}/old" "${tmp}/desired" "${tmp}/ledger"; rmdir "${tmp}"
+    return "${rc}"
+}
+
+hopRulesRemoveAll() {
+    lockAcquire || return 1
+    local st rc
+    st=$(mktemp "${ATR_TMP}/hop-empty.XXXXXX") || { lockRelease; return 1; }
+    printf '{"protocols":{}}\n' >"${st}"
+    _hopSync "${st}"; rc=$?
+    rm -f "${st}"
+    lockRelease
+    return "${rc}"
+}
+
+# 兼容独立调用；整批规则由 reconcileHopRules 统一提交。
+hopRuleAdd() {
+    local id=$1 range=$2 port=$3 st rc
+    lockAcquire || return 1
+    st=$(mktemp "${ATR_TMP}/hop-add.XXXXXX") || { lockRelease; return 1; }
+    if stateExists; then cp "${ATR_STATE}" "${st}"; else printf '{"protocols":{}}\n' >"${st}"; fi
+    jq --arg id "${id}" --arg range "${range}" --argjson p "${port}" '.protocols[$id] += {hop:$range,port:$p}' "${st}" >"${st}.new" && mv "${st}.new" "${st}" && _hopSync "${st}"; rc=$?
+    rm -f "${st}" "${st}.new"; lockRelease
+    return "${rc}"
+}
+
+reconcileHopRules() {
+    lockAcquire || return 1
+    local st=$1 rc=0 any
+    _hopSync "${st}" || rc=1
+    if ((rc==0)); then
+        any=$(jq '[.protocols[]?|select((.hop // "")!="")]|length' "${st}") || rc=1
+        if ((rc==0 && any>0)); then
+            _writeUnitFile "${HOP_UNIT}" <<EOF
 [Unit]
 Description=Re-apply UDP port-hopping rules (${ATR_PROJECT_NAME})
-After=network-online.target
+After=network-online.target firewalld.service
 
 [Service]
 Type=oneshot
@@ -7020,14 +7331,15 @@ ExecStart=${ATR_SCRIPT_PATH} apply-hop
 [Install]
 WantedBy=multi-user.target
 EOF
-        serviceEnable "${HOP_UNIT}"
-    elif [[ -f "${ATR_SYSTEMD_DIR}/${HOP_UNIT}.service" ]]; then
-        serviceDisable "${HOP_UNIT}"
-        rm -f "${ATR_SYSTEMD_DIR}/${HOP_UNIT}.service"
-        systemctl daemon-reload >/dev/null 2>&1
+            [[ $? == 0 ]] && serviceEnable "${HOP_UNIT}" || rc=1
+        elif [[ -f "${ATR_SYSTEMD_DIR}/${HOP_UNIT}.service" ]]; then
+            serviceDisable "${HOP_UNIT}" && rm -f "${ATR_SYSTEMD_DIR}/${HOP_UNIT}.service" && systemctl daemon-reload >/dev/null 2>&1 || rc=1
+        fi
     fi
-    return 0
+    lockRelease
+    return "${rc}"
 }
+
 
 portHoppingMenu() { # portHoppingMenu <hysteria2|tuic>
     local id=$1 c range a b port other
@@ -7068,7 +7380,7 @@ portHoppingMenu() { # portHoppingMenu <hysteria2|tuic>
         stagedEdit --arg id "${id}" --arg r "${a}-${b}" '.protocols[$id].hop=$r' || return 1
         if applyStaged "端口跳跃 ${a}-${b}"; then
             postChangeShow "" "已开启端口跳跃 ${a}-${b} -> ${port}"
-        else stagedDiscard; fi
+        else stagedDiscard; return 1; fi
         ;;
     2)
         [[ -n "$(S --arg i "${id}" '.protocols[$i].hop // ""')" ]] || {
@@ -7079,7 +7391,7 @@ portHoppingMenu() { # portHoppingMenu <hysteria2|tuic>
         stagedEdit --arg id "${id}" '.protocols[$id].hop=""' || return 1
         if applyStaged "删除端口跳跃"; then
             postChangeShow "" "端口跳跃已删除"
-        else stagedDiscard; fi
+        else stagedDiscard; return 1; fi
         ;;
     3)
         range=$(S --arg i "${id}" '.protocols[$i].hop // ""')
@@ -7100,6 +7412,12 @@ manageUDPProtocol() { # manageUDPProtocol <hysteria2|tuic>
         echoContent yellow "1.重新配置(端口/参数)"
         echoContent yellow "2.卸载"
         echoContent yellow "3.端口跳跃管理"
+        if [[ "${id}" == hysteria2 ]]; then
+            echoContent yellow "4.带宽模式（固定 / BBR 自适应）"
+            echoContent yellow "5.obfs 混淆"
+            echoContent yellow "6.未认证 HTTP/3 伪装"
+            echoContent yellow "7.导出配置实连（保留 DNS / TLS / 跳跃范围）"
+        fi
     else
         echoContent yellow "依赖 sing-box 内核与域名证书\n"
         echoContent yellow "1.安装"
@@ -7117,7 +7435,7 @@ manageUDPProtocol() { # manageUDPProtocol <hysteria2|tuic>
             stagedDiscard
             return 1
         }
-        if applyStaged "重新配置 ${name}"; then postChangeShow "" "${name} 参数已修改"; else stagedDiscard; fi
+        if applyStaged "重新配置 ${name}"; then postChangeShow "" "${name} 参数已修改"; else stagedDiscard; return 1; fi
         ;;
     2)
         confirm "确认卸载 ${name} ？" n || return 0
@@ -7126,9 +7444,13 @@ manageUDPProtocol() { # manageUDPProtocol <hysteria2|tuic>
         if applyStaged "卸载 ${name}"; then
             echoContent green " ---> ${name} 已卸载"
             regenClients
-        else stagedDiscard; fi
+        else stagedDiscard; return 1; fi
         ;;
     3) portHoppingMenu "${id}" ;;
+    4) [[ "${id}" == hysteria2 ]] && manageHY2Option bandwidth ;;
+    5) [[ "${id}" == hysteria2 ]] && manageHY2Option obfs ;;
+    6) [[ "${id}" == hysteria2 ]] && manageHY2Option masquerade ;;
+    7) [[ "${id}" == hysteria2 ]] && selfCheckHY2Endpoint ;;
     *) echoContent red " ---> 选择错误" ;;
     esac
 }
@@ -8784,7 +9106,10 @@ uninstallAll() {
         # 回收防火墙放行
         fwApplyList close < <(desiredFirewallPorts "${ATR_STATE}") || fwCleanupRC=1
     fi
-    hopRulesRemoveAll
+    if ! hopRulesRemoveAll; then
+        echoContent red " ---> 跳跃规则未能回收，已保留安装目录与规则恢复记录；排除防火墙故障后重试卸载。"
+        return 1
+    fi
     local u
     for u in "${SB_UNIT}" "${XRAY_UNIT}" "${NGX_UNIT}" "${HOP_UNIT}" "${TLS_RECOVERY_UNIT}"; do
         serviceActive "${u}" && serviceStop "${u}"
