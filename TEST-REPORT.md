@@ -1,36 +1,33 @@
-# AnyTLS-Reality v1.4.1 测试报告
+# AnyTLS-Reality v1.4.2 测试报告
 
-日期：2026-10-29。基线：已交付的 v1.4.0。脚本 SHA256：`e92f0ce7f381766a4781e19a5fea986e50df08f6bafdaab31d2c4b755547a474`。
+日期：2026-11-04。基线：已交付的 v1.4.1。脚本 SHA256：`809a827b9d90729ec33fe98c973e38506e6e1edfc8f58fdca7e44d7ca03f66d1`。
 
-## 结果
+## 结果与范围
 
-本轮 **64 项 VPS 针对性检查及 3 项 Windows PNG 解码检查全部通过**。Bash 语法、ShellCheck 0.10.0 warning 级、所有 Python AST、三段内嵌 Python 与 tools 源码一致性、发布补丁应用及 ZIP 校验通过。
+本轮 **89 项 VPS 隔离回归、7 项 Windows PNG 解码/YAML 检查、5 项维护刷新检查、4 项真实部署只读比对，共 105 项针对性检查全部通过**。另通过 Bash 语法、ShellCheck 0.10.0 warning 级、所有 Python AST、四段内嵌 Python 与工具源码一致性、发布补丁应用/逐文件比较、离线重建和 ZIP 校验。没有把历史版本检查或重复运行次数计入本次总数。
 
-此前用户在同一 VPS 节点上已实机确认 Exclave、Shadowrocket 二维码可正常使用。本轮在内存中将 v1.4.1 的两种载荷与该已验证样本比较：除节点显示名称外，Exclave 的连接字段与 Shadowrocket 的地址、认证、查询参数完全一致。生产凭据和实际节点二维码不包含在发布包内。Stash 尚无用户实机验证，本版未加入。
+用户已在 Stash 实机确认三协议配置和本版采用的完整分流方案可用。当前生成器与该已验证配置的规则数组逐条一致，当前 VPS 三个协议的连接字段在内存中比对完全一致；名称由脚本统一生成。Exclave、Shadowrocket 两种载荷与 v1.4.1 逐字一致。未新增手机 GUI 自动化，也未宣称所有协议均完成 Stash 真机网络测试。
 
-## 本版覆盖
+## 验证内容
 
-- Exclave：精简单个 sing-box AnyTLS outbound 的 JSON；保留 Reality、公钥、Short ID、SNI，不关闭身份验证。
-- Shadowrocket：已验证的 anytls URI 形式，包含 peer/sni、security=reality、pbk/sid、fp、tls=1、insecure=0、udp=1；密码、IPv6、中文/特殊字符名称正确编码。
-- 仅为 AnyTLS+Reality 新增两种专用格式，通用 URI 仍为 null；VLESS 等原有通用二维码载荷保持不变，未为无可用格式的协议制造假二维码。
-- 本地生成真实 PNG，注册表仅记录摘要和元数据，不保存明文载荷；qrencode 通过 stdin 接收凭据。原始 PNG/注册表 0600、用户图片目录 0700；web 副本仅供 Nginx 工作组读取。
-- 兼容 v1.4.0 没有 client 字段的通用图片记录；同凭据不同节点名也使用不同图片，避免覆盖。重复生成可复用未变资源，CLI regenerate 则撤销并更换 ID。
-- 实际 Bash 客户端生成入口覆盖 AnyTLS+Reality、Xray VLESS+Reality+Vision、HY2 混合部署。账号输出、终端二维码及 CLI 分别标注客户端；无可信 HTTPS 条件时不打印下载网址。
-- 同一用户撤销同时删除两种客户端的本地/web 图片，保留其他用户；全局撤销覆盖全部。真实 _commitLive 状态提交边界删除旧图，不变状态保留图片。第二张图片编码中途失败时清除旧图和部分新图，不留下“生成成功”的残余资源。
-- 原生 Nginx、真实非 root 工作进程、仅回环 TLS 监听：两种 PNG 都能通过签名获取；缺签名/缺期限/篡改期限返回 403，合法但过期签名返回 410；撤销后两种链接均为 404，无需重载 Nginx。
-- 下载响应包含 no-store/no-referrer/noindex/nosniff，目录和本地原图路径不能通过该入口访问；签名图片路径不写入访问日志。两种网址使用独立图片 ID、300 秒期限，不含节点 URI 或密码。
-- Windows 使用固定版本 zxing-cpp 2.3.0 对 VPS 生成的 Exclave、Shadowrocket、原通用三张 PNG 真正解码，结果分别与原载荷逐字一致。测试依赖仅放在本地工作目录，没有安装到生产 VPS。
+- 默认构建真实联网获取 release 最新引用，固定到 `24dd572ab5c2ba577bb96723d7cf3d9d3eb0af76`；原文件 SHA256 `fbe280180e01ea34e96d7bb29306a5e3eebd562aac84c6cec23ffdd30ab04375`。原 53,206 条规则，经绕过/明确域名保证转换为 53,262 条；原文件、编译 JSON、运行时压缩模板三者相符，保留 CC BY-SA 4.0 署名。
+- 国内网站、Apple 国内外、Google/YouTube/Facebook、JD 广告域名、国内 GeoIP 及最终代理样例符合用户验证的策略；广告优先、全部原规则顺序和单一 PROXY 组保留。无远程规则下载依赖、不启用 MitM。
+- 12 种可表达协议的映射覆盖 TLS/Reality、公钥、端口、SNI；HY2 auth / 自动与固定带宽 / 跳跃 / obfs，TUIC v5，Xray Reality 混合交换标志。Naive/HTTPUpgrade 明确排除，不制造不可用节点。
+- 实际 Bash 生成入口处理 AnyTLS+Reality、HY2、Xray VLESS+Reality+Vision 的混合部署。超过 2 MB 的配置经 stdin 传递，避免 argv 长度限制。无 HTTPS 时只显示本地 YAML；旧 v1.4.1 只有 PNG 路由时不输出 Stash 链接；运行中端点检查失败清除新图片、不发布网址。
+- 配置/注册表及本地 PNG 为 0600，用户目录 0700；web 副本只供 Nginx 组读取。注册表只保存摘要、资源标识和非敏感元数据，无节点密码/公钥正文。节点 QR 更新保留 Stash 资源，用户撤销不影响其他用户，配置内容变化删除旧 YAML/图片；状态提交边界撤销全部旧资源。
+- Stash QR 内为原始 HTTPS YAML 地址，图片网址与内含地址共用同一个 300 秒截止时间。刷新撤销前一张导入图片；不承诺撤销已下载 YAML、截图或手机内已保存的节点。
+- 使用真实 Nginx 非 root 工作进程、随机回环 TLS 入口和显式信任的临时测试证书：完整 gzip YAML 下载与源字节一致，PNG 可下载；缺签名/篡改 403、合法过期 410、撤销后 YAML/PNG 立即 404，POST 405，目录/本地原件不能访问。响应包含 no-store/no-referrer/noindex/nosniff；签名路径不写访问日志。实际 Bash HEAD 端点探测也通过。
+- Windows 使用 zxing-cpp 2.3.0 真正解码 Stash、Exclave、Shadowrocket 三张 PNG，内容分别与原载荷完全一致；使用 PyYAML 6.0.2 解析完整 YAML，核对三节点、单一组、规则数、HY2 auth 及 Reality 严格验证。
+- 维护工具模拟最新引用变化/固定 SHA 下载、网络故障、未知语法和第二次文件替换失败；错误停止并保留/恢复原模板，未悄悄沿用旧规则冒充新快照。
 
-## 环境与隔离
+## 隔离与清理
 
-VPS：Debian GNU/Linux 13.7 amd64，Python 3.13.5，sing-box 1.14.4、Xray 26.10.21、系统 Nginx 和 qrencode。测试目录为 `/root/anytls-audit-v141`，使用合成测试凭据；HTTPS 使用 `/tmp` 临时目录、回环随机端口和显式信任的测试 CA，不向系统安装根证书。
+VPS：Debian 13.7 amd64、Python 3.13.5、系统 Nginx 1.26.3、qrencode，已有 sing-box 1.14.4 / Xray 26.10.21。本轮回归目录 `/root/anytls-audit-v142`；纯合成凭据，临时 Nginx 只监听回环地址。ShellCheck 下载解包在私有审计目录，未安装或升级系统包；测试 CA 没有加入系统信任。
 
-ShellCheck 下载并解包在私有审计目录中运行，未通过包管理器安装或升级系统软件。已有服务始终保持运行。核对正式安装的 state.json、脚本及核心配置未被本轮测试改写；正式脚本仍为 v1.4.0，没有代替用户执行升级。此前仅供 Stash 实机测试的临时 HTTPS 配置入口已删除，网站配置字节恢复至测试前备份；正式三项服务保持 active，临时 Nginx 测试进程均已退出。
+正式脚本仍为 v1.4.1，state.json 及核心配置未修改、三项服务保持 active。此前供用户扫码的临时 Stash HTTPS 入口已移除，网站配置字节恢复为测试前备份；临时 Nginx 测试进程已退出。发布包不包含真实节点 YAML、真实二维码、生产密钥或临时有效网址。
 
-## 范围与限制
+## 使用限制与升级
 
-本轮未重新执行 v1.4.0 的完整 386 项历史回归，也未把历史检查重复计入本版 67 项。发布包保留原有测试源码；这些历史测试需要各自声明的隔离夹具环境。未新增手机 GUI 自动化或重新测试所有客户端版本；用户实机确认与本轮格式一致性检查分别记录，不把扫码解析当成新的手机网络验收。
+新旧路由变更需应用后才能使用 Stash HTTPS：备份并替换脚本，有受管理可信 HTTPS 时执行 `atr restart`，再 `atr qr stash [用户]`；这会重载受管理服务，未代替用户执行生产升级。没有可信 HTTPS 时可 SSH 下载本地 YAML，完整规则无法塞入离线二维码，脚本不新增明文入口。
 
-没有部署新的公网 QR 服务、申请证书或更改防火墙。原生 HTTPS 请求验收位于回环测试入口，可信公网证书/直连 DNS 等资格判断逻辑沿用 v1.4.0。AnyTLS+Reality 专用 URI 不保证被 Exclave/Shadowrocket 之外的客户端识别；v2rayNG 仍不支持。已下载图片或已导入节点不能通过撤销图片链接收回，需更换节点凭据才能撤销其连接权限。
-
-升级：备份并替换安装目录中的脚本后，执行 `atr qr regenerate [用户]`，即可为现有 AnyTLS+Reality 生成两种 PNG 及符合条件时的 5 分钟图片链接，无需重启代理服务、重装节点或轮换端口/密钥。
+短期配置 URL 只用于导入，应关闭该配置自动更新；以后重新生成、重新导入。新增其他协议的 Stash 映射只做字段/结构检查，未重新跑全部代理公网吞吐、不同移动客户端版本、IPv6/RHEL/arm64、ACME 真签发和历史所有协议回归。原有客户端专用格式不等于通用 URI。

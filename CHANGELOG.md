@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.2 — 2026-11-04
+
+- 将用户实机验证的 Stash 分流配置内置为无节点凭据的压缩模板，生成时注入当前用户全部可导出节点；同一 VPS 的多个协议共用单个 PROXY 选择组。
+- 重新获取 Johnshall release 最新提交 24dd572，保留原规则和广告拦截；规范大小写、IPv6、兜底规则、DNS/绕过和重写，补充指定的国内/国外域名保证，共 53,262 条规则。保持更具体广告规则优先，不启用 MitM。
+- 新增菜单 7 → 8 → 4、atr qr stash [用户]、完整私有 YAML 及直接 HTTPS 配置地址二维码；图片和配置网址共用 300 秒截止时间。无可信 HTTPS/新路由时只提供本地 YAML。
+- 将 YAML 和导入图片纳入原有注册表、权限、签名、撤销及节点变更清理；刷新导入图片即删除旧图，配置内容改变删除旧配置资源。发布前实际检查本机 HTTPS 入口；失败不打印可用链接。
+- 兼容已部署 AnyTLS+Reality、HY2、Xray VLESS+Reality+Vision 的用户验证字段；按 Stash 文档映射其余可表达协议，未确认格式明确跳过。
+- Exclave、Shadowrocket 的专用节点 QR 载荷与 v1.4.1 一致；不为它们附加分流模板。
+- 新增默认联网刷新模板的构建工具、提交/SHA256/规则数量溯源、异常回滚与未知语法停止；后续每次维护刷新约定写入 AGENTS.md / MAINTENANCE.md。模板数据单独保留 CC BY-SA 4.0 许可及 Moshel / Johnshall 署名。
+- 升级后已有 HTTPS 用户需执行 atr restart 应用 YAML 路由，再生成 Stash 入口；未对既有 VPS 执行脚本替换或生产节点升级。
+
+
 ## v1.4.1（2026-10-29）
 
 - AnyTLS+Reality 新增 Exclave 与 Shadowrocket 专用二维码，沿用用户已实机验证的格式；Exclave 为精简单节点 JSON，Shadowrocket 为带完整 Reality 参数的客户端链接。保持通用分享 URI 为空，不把专用格式宣传为跨客户端标准；Stash 暂不加入。

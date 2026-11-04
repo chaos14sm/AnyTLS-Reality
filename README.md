@@ -7,6 +7,35 @@ sing-box / Xray-core 一键管理脚本，**支持 AnyTLS + Reality**。
 
 > **项目状态**：开发期间在隔离沙箱中，用真实的 sing-box / Xray / mihomo / nginx 二进制做过端到端验证（包括 AnyTLS + Reality 的回环握手）。2026-10-25 又在一台全新的 Debian 13 VPS（systemd 257、nginx 1.26）上做过一次完整的实机审计（v1.2.5）：真实 systemd 服务管理与沙箱、nginx 降权到 `atr-nginx`、真实 iptables 端口跳跃、各协议的真实数据转发（含 Windows 上的 sing-box 客户端经公网连接、官方 NaiveProxy 客户端、Xray 原生 XHTTP 客户端）、事务回滚与恢复、订阅撤销、DNS rebinding 对照实验，以及用 `strace` 核对凭据不出现在命令行上；v1.2.6 增加了相关修复；v1.2.7 进一步修复证书崩溃恢复和防火墙事务边界；v1.2.8 增加同核心自检与 Reality 共享/独立配置，并在原 Debian 13 VPS 上重新回归。详见 CHANGELOG.md 和随版本提供的测试报告。**仍未在真实服务器上验证**的：acme.sh 真实签发与 DNS API、WARP 注册、IPv6 专属流程与 NAT64、RHEL 系 + SELinux、arm64、BBR/DD、长时间压力测试。建议先在测试机上试用，遇到问题请到 Issues 反馈。
 
+## v1.4.2 — Stash 完整分流模板与私有导入二维码（2026-11-04）
+
+Stash 现在可以直接生成包含本机已部署且有已确认导出格式的协议的**完整 YAML**，采用用户实机验证过的国内直连、境外统一代理、广告拦截方案。多个协议只是同一 VPS 的不同接入方式，全部位于一个 `PROXY` 手动选择组，不按聊天、视频等应用分配不同节点。默认包含全部可导出的协议；不会因为输出安装结果时只展示本次新增协议而漏掉其他已部署节点。
+
+分流来自 [Moshel / Johnshall 的 sr_cnip_ad.conf](https://github.com/Johnshall/Shadowrocket-ADBlock-Rules-Forever/blob/release/sr_cnip_ad.conf)，本次刷新固定到 `24dd572ab5c2ba577bb96723d7cf3d9d3eb0af76`，源构建时间为 UTC 2026-11-03 23:02:57。保留全部原规则及顺序、广告拦截、国内 GeoIP 直连和最终代理；转换为 Stash 格式，并在 GeoIP 兜底前明确补充 apple.com.cn / taobao.com / jd.com 直连，apple.com / Google / YouTube / Facebook 等走 PROXY。原有更具体的广告规则优先，最终共 53,262 条规则。模板保留原 DNS、IPv6 关闭及 Google.cn 重写；原 MitM 域名仅作注释，不启用解密或安装 CA。HTTPS 重写需客户端另行信任本地 CA。
+
+模板直接压缩内嵌于 `anytls-reality.sh`，VPS 运行不需要下载额外规则文件或安装 Python YAML 包；规则不依赖过期的下载地址。模板数据按 **CC BY-SA 4.0** 保留来源、署名和改动说明，程序代码继续原有 AGPL-3.0。见 `templates/SOURCE-LICENSE.txt` 和 `templates/stash-source.json`。
+
+### 使用入口
+
+- 菜单 **7 → 8 → 4：Stash 完整分流配置与二维码**。
+- `atr qr stash [用户]`：生成/刷新 Stash 配置和扫码入口，省略用户处理所有用户。
+- 安装后的客户端生成、账号展示、`atr qr regenerate [用户]` 也会包含 Stash 输出；`atr qr links [用户]` 保持原节点二维码查看逻辑，并刷新 Stash 的短期入口。
+- `atr qr revoke [用户]`：同时撤销该用户所有节点二维码、Stash YAML 下载及 Stash 图片，并删除对应本地原件；重新生成可恢复。
+
+本地 YAML 保存在 `qr/local/<用户>/stash-<随机ID>.yaml`，可经 SSH 下载导入，权限 0600。支持脚本中有对应 Stash 表达方式的 AnyTLS（Reality/TLS）、HY2、TUIC v5、VLESS Reality（Vision/gRPC/XHTTP）、VLESS TLS（Vision/WS/XHTTP）、VMess WS、Trojan。Naive、VMess HTTPUpgrade 不擅自转换，会提示跳过。HY2 使用 Stash 的 `auth`、`ports`、`up-speed/down-speed` 字段，自适应模式省略带宽；Xray VLESS Reality 保留 `support-x25519mlkem768: true`。其他协议输出仍需以实际 Stash 版本和网络环境验收，新增协议字段按 [Stash 官方文档](https://stash.wiki/en/proxy-protocols/proxy-types) 对照；此次用户实机已确认的是 AnyTLS+Reality、HY2、Xray VLESS+Reality+Vision。
+
+**Stash 在应用内扫描直接 HTTPS 配置地址**，不使用 `stash://`。具备原有可信直连 HTTPS 条件、已应用的新签名路由及 qrencode 时，脚本先检查本机运行中的 HTTPS 配置入口，再生成本地导入 PNG、终端二维码和受保护的 PNG 下载网址。PNG 里是配置 YAML 下载地址，**两种网址共用同一个 300 秒截止时间**。刷新入口会撤销上次 Stash 图片；变更模板/节点内容会删除旧 YAML 和导入图片，节点状态提交沿用全局二维码撤销机制。
+
+**短期地址仅用于首次导入，请关闭此配置的自动更新**；过期不影响手机中已保存的配置。以后更新节点或规则，重新生成入口再导入。已下载的配置和已导入的凭据不能通过撤销下载网址收回。
+
+没有可信 HTTPS 或缺少新路由时，只生成本地 YAML，明确提示条件；完整配置超过二维码容量，不会生成假二维码，也不会开放明文 HTTP。Exclave、Shadowrocket **继续沿用 v1.4.1 的纯节点二维码载荷**，不加入 Stash 分流模板，其他通用节点二维码不变。
+
+### 从 v1.4.1 升级
+
+保留完整备份，替换已保存的管理脚本后，如果已有受管理 HTTPS 网站，先执行 `atr restart` 应用新增的签名 YAML 路由，再执行 `atr qr stash [用户]`；前一命令会重载受管理服务，应安排合适时机。无需重装节点或更换端口/密钥。只有 Reality 节点且没有可信 HTTPS 网站时仍可使用本地 YAML，脚本不会单独开一个网站来发布配置。
+
+后续每次维护/发布默认重新拉取上游最新规则、固定提交并更新内嵌模板，这项约定已写入 `AGENTS.md`；不是让每台用户 VPS 在运行时自动追踪上游。维护步骤及可复现构建见 [MAINTENANCE.md](MAINTENANCE.md)，本次验证范围见 [TEST-REPORT.md](TEST-REPORT.md)。
+
 ## v1.4.1 — AnyTLS+Reality 客户端专用二维码（2026-10-29）
 
 AnyTLS+Reality 现在自动生成 **Exclave** 和 **Shadowrocket** 两张专用二维码，采用用户已实机验证的导入格式：Exclave 使用单节点精简 JSON，Shadowrocket 使用带 SNI、Reality 公钥、Short ID 和指纹的 AnyTLS 链接。在对应应用内扫码；Shadowrocket 格式不是通用 AnyTLS URI，不表示其他客户端也能使用。Stash 未完成实机验证，本版不加入；v2rayNG 不支持此协议组合。
